@@ -1,4 +1,6 @@
 aiogram==3.6.0
+pydantic==2.7.4
+typing-extensions==4.12.2
 SQLAlchemy==2.0.32
 psycopg2-binary==2.9.9
 ccxt==4.3.81
