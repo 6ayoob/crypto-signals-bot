@@ -2,7 +2,10 @@ aiogram==3.6.0
 SQLAlchemy==2.0.32
 psycopg2-binary==2.9.9
 ccxt==4.3.81
-pandas==2.2.2
+requests==2.32.3
 pytz==2024.1
 python-dotenv==1.0.1
-requests==2.32.3
+
+# مهم لتفادي البناء من السورس
+numpy==1.26.4
+pandas==2.2.3
