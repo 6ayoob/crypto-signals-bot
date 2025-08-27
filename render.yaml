@@ -1,0 +1,30 @@
+services:
+  - type: worker
+    name: crypto-signals-bot
+    env: python
+    plan: starter  # اختر خطة مدفوعة
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        value: "-1002800980577"
+      - key: ADMIN_USER_IDS
+        value: "658712542"
+      - key: USDT_TRC20_WALLET
+        value: "TJC9gbV1AJ2Y9S8uq8gj1xcd3hs2T53VpD"
+      - key: DATABASE_URL
+        sync: false
+      - key: TIMEZONE
+        value: "Asia/Riyadh"
+      - key: DAILY_REPORT_HOUR_LOCAL
+        value: "9"
+      - key: MAX_OPEN_TRADES
+        value: "8"
+      - key: PRICE_2_WEEKS_USD
+        value: "30"
+      - key: PRICE_4_WEEKS_USD
+        value: "60"
+      - key: TRIAL_DAYS
+        value: "2"
