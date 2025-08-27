@@ -1,0 +1,4 @@
+python-telegram-bot==13.15
+psycopg2-binary==2.9.9
+ccxt==3.0.122
+pandas==2.2.3
