@@ -1,4 +1,7 @@
-python-telegram-bot==13.15
+aiogram==3.6.0
+SQLAlchemy==2.0.32
 psycopg2-binary==2.9.9
-ccxt==3.0.122
-pandas==2.2.3
+ccxt==4.3.81
+pandas==2.2.2
+pytz==2024.1
+python-dotenv==1.0.1
