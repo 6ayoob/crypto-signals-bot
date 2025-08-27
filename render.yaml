@@ -2,42 +2,55 @@ services:
   - type: worker
     name: crypto-signals-bot
     env: python
-    plan: starter
+    plan: starter  # خطة مدفوعة لتعمل 24/7
     buildCommand: |
       python -m pip install -U pip setuptools wheel
-      # اجبر استخدام Wheels لـ numpy/pandas أولاً
+      # استخدم Wheels الجاهزة أولاً لتفادي بناء pandas من السورس
       pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      # ثم باقي المتطلبات
+      # ثم بقية المتطلبات
       pip install -r requirements.txt
-      # فحص استيراد سريع حتى يفشل البناء مبكراً لو في تعارض
+      # فحص سريع للاستيراد (يفشل مبكراً إذا في تعارض)
       python -c "import numpy, pandas, ccxt, aiogram, sqlalchemy, requests; print('OK build', numpy.__version__, pandas.__version__)"
     startCommand: "python bot.py"
     envVars:
+      # متغيرات حسّاسة — أدخل القيم من لوحة Render (لا تضع value هنا)
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
         sync: false
       - key: TRONGRID_API_KEY
         sync: false
+
+      # متغيرات غير حسّاسة — نضع القيم هنا مباشرة
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
         value: "658712542"
       - key: USDT_TRC20_WALLET
         value: "TJC9gbV1AJ2Y9S8uq8gj1xcd3hs2T53VpD"
+
+      # إعدادات زمنية وتشغيل
       - key: TIMEZONE
         value: "Asia/Riyadh"
       - key: DAILY_REPORT_HOUR_LOCAL
         value: "9"
       - key: MAX_OPEN_TRADES
         value: "8"
+
+      # خطط الاشتراك
       - key: PRICE_2_WEEKS_USD
         value: "30"
       - key: PRICE_4_WEEKS_USD
         value: "60"
       - key: TRIAL_DAYS
         value: "2"
+
+      # اختياري: واجهة TronGrid أو عقد USDT
       - key: TRONGRID_BASE
         value: "https://api.trongrid.io"
       - key: USDT_TRC20_CONTRACT
         value: ""
+
+      # (اختياري) يفضّل العجلات الثنائية بدل بناء السورس
+      - key: PIP_PREFER_BINARY
+        value: "1"
