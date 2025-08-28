@@ -57,6 +57,5 @@ PY
       - key: USDT_TRC20_CONTRACT
         value: ""
 
-      # يفضّل العجلات الثنائية
       - key: PIP_PREFER_BINARY
         value: "1"
