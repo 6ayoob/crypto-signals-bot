@@ -3,14 +3,14 @@ services:
     name: crypto-signals-bot
     env: python
     plan: starter
+    pythonVersion: 3.11.9   # ← أهم سطر لتفادي مشكلة pydantic-core على 3.13
 
     buildCommand: |
       set -e
       python --version
       python -m pip install -U pip setuptools wheel
-      # استخدام Wheels الجاهزة لبايثون 3.11
-      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      pip install -r requirements.txt
+      pip install --no-cache-dir --only-binary=:all: numpy==1.26.4 pandas==2.2.3
+      pip install --no-cache-dir -r requirements.txt
       python - << 'PY'
 import sys, ccxt, aiogram, pydantic, sqlalchemy, requests
 print("OK build on", sys.version)
