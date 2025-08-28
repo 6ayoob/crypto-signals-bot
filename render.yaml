@@ -5,18 +5,18 @@ services:
     pythonVersion: 3.11.9
     plan: starter
 
-    buildCommand: |
-      set -e
-      python --version
-      python -m pip install -U pip setuptools wheel
-      # ثبّت عجلات جاهزة لتفادي البناء من السورس
-      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      # ثم بقية المتطلبات من الملف
-      pip install -r requirements.txt
-      # تأكيد تثبيت ccxt صراحة (أمان إضافي)
-      pip install ccxt==4.3.81
-      # فحص مبكر للاستيراد
-      python - << 'PY'
+buildCommand: |
+  set -e
+  python -m pip install -U pip setuptools wheel
+  pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
+  pip install -r requirements.txt
+  pip install ccxt==4.3.81
+  python - << 'PY'
+import ccxt, sys
+print("✅ ccxt installed:", ccxt.__version__)
+print("Python:", sys.version)
+PY
+
 import sys, numpy, pandas, ccxt, aiogram, sqlalchemy, requests, pydantic
 print("OK build:", sys.version)
 print("numpy:", numpy.__version__, "pandas:", pandas.__version__)
