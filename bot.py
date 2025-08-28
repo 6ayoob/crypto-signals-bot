@@ -1,29 +1,4 @@
-# bot.py — مشغّل البوت كخدمة Background Worker على Render (مع Logging + Runtime Bootstrap)
-
-# ========== Runtime Bootstrap ==========
-# يضمن توفر الحزم المطلوبة حتى لو لم تُثبت في مرحلة الـ build
-import sys, subprocess
-
-def _ensure_pkg(pkg: str, version: str | None = None):
-    try:
-        __import__(pkg)
-        return
-    except ImportError:
-        v = f"=={version}" if version else ""
-        print(f"⚠️ {pkg} not found; installing at runtime...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", f"{pkg}{v}"])
-        __import__(pkg)
-        print(f"✅ {pkg} installed at runtime")
-
-# ثبّت الحزم الأساسية قبل الاستيراد
-_ensure_pkg("ccxt", "4.3.81")
-_ensure_pkg("aiogram", "3.6.0")
-# (اختياري) لو ظهر نقص لاحقًا لحزم أخرى، أضفها بنفس الطريقة:
-# _ensure_pkg("SQLAlchemy", "2.0.32")
-# _ensure_pkg("requests", "2.32.3")
-# _ensure_pkg("pytz", "2024.1")
-
-# ======================================
+# bot.py — مشغّل البوت كخدمة Background Worker على Render (مع Logging)
 
 import asyncio
 import logging
