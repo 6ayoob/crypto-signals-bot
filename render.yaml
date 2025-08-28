@@ -5,17 +5,19 @@ services:
     pythonVersion: 3.11.9
     plan: starter
 
-    buildCommand: |
-      set -e
-      python --version
-      python -m pip install -U pip setuptools wheel
-      # Wheels جاهزة لتفادي البناء
-      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      pip install -r requirements.txt
-      # فحص مبكر
-      python - << 'PY'
-import sys, ccxt
-print("OK build with", sys.version, "ccxt", ccxt.__version__)
+buildCommand: |
+  set -e
+  python --version
+  python -m pip install -U pip setuptools wheel
+  # ثبّت Wheels الجاهزة لتفادي البناء من السورس
+  pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
+  # ثم بقية المتطلبات
+  pip install -r requirements.txt
+  # فحص مبكر للاستيراد (اختياري لكنه مفيد)
+  python - << 'PY'
+import sys, ccxt, aiogram, pydantic, sqlalchemy, requests
+print("OK build on", sys.version)
+print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__, "pydantic", pydantic.__version__, "sqlalchemy", sqlalchemy.__version__)
 PY
 
     startCommand: "python bot.py"
