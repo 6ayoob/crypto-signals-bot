@@ -9,11 +9,11 @@ services:
       set -e
       python --version
       python -m pip install -U pip setuptools wheel
-      # ثبّت Wheels الجاهزة لتفادي البناء من السورس
+      # تثبيت عجلات جاهزة لتفادي البناء من السورس
       pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
       # ثم بقية المتطلبات
       pip install -r requirements.txt
-      # تأكيد تثبيت ccxt صراحة (أمان إضافي)
+      # تأكيد تثبيت ccxt صراحة (احتياط)
       pip install --only-binary=:all: ccxt==4.3.81
       # فحص مبكر للاستيراد
       python - << 'PY'
@@ -27,15 +27,15 @@ PY
     startCommand: "python bot.py"
 
     envVars:
-      # حسّاسة: أدخل القيم من لوحة Render
-      - key: 8483309506:AAEe3bA4DTrLOXXPDNJS3W3Gnttau8LEXQg
+      # هذه تترك بدون value وتضبط من لوحة Render (Secrets)
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: postgresql://crypto_signals_db_9i26_user:kjjjD4O3pQReO9z4EtoUiVngLoma5YWf@dpg-d2nljlali9vc73dqaf1g-a.oregon-postgres.render.com/crypto_signals_db_9i26
+      - key: DATABASE_URL
         sync: false
-      - key: 84f67a7f-e4b3-4145-9836-27ca546a6e5b
+      - key: TRONGRID_API_KEY
         sync: false
 
-      # غير حسّاسة
+      # الباقي غير حساس—نضع قيمه هنا
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
