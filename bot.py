@@ -1,6 +1,21 @@
 # bot.py — مشغّل البوت كخدمة Background Worker على Render (مع Logging)
 import asyncio
 import logging
+
+# --- bootstrap: ثبت ccxt في وقت التشغيل إذا لم تكن متاحة ---
+import sys, subprocess
+def _ensure_ccxt(version="4.3.81"):
+    try:
+        import ccxt  # noqa
+        return
+    except Exception:
+        print("⚠️ ccxt not found; installing at runtime...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", f"ccxt=={version}"])
+        import ccxt  # noqa
+        print("✅ ccxt installed at runtime:", ccxt.__version__)
+_ensure_ccxt()
+# --- end bootstrap ---
+
 import ccxt
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
