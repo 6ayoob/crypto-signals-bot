@@ -2,33 +2,28 @@ services:
   - type: worker
     name: crypto-signals-bot
     env: python
+    pythonVersion: 3.11.9
     plan: starter
-    pythonVersion: 3.11.9   # ← أهم سطر لتفادي مشكلة pydantic-core على 3.13
 
     buildCommand: |
-      set -e
-      python --version
       python -m pip install -U pip setuptools wheel
-      pip install --no-cache-dir --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      pip install --no-cache-dir -r requirements.txt
+      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
+      pip install -r requirements.txt
       python - << 'PY'
-import sys, ccxt, aiogram, pydantic, sqlalchemy, requests
-print("OK build on", sys.version)
-print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__, "pydantic", pydantic.__version__, "sqlalchemy", sqlalchemy.__version__)
-PY
+      import sys, ccxt, aiogram
+      print("OK build on", sys.version)
+      print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__)
+      PY
 
-    startCommand: "python bot.py"
+    startCommand: python bot.py
 
     envVars:
-      # ضع القيم الحساسة من لوحة Render (لا تكتب القيم هنا)
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
         sync: false
       - key: TRONGRID_API_KEY
         sync: false
-
-      # القيم غير الحساسة
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
