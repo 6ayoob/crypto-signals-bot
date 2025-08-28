@@ -2,28 +2,38 @@ services:
   - type: worker
     name: crypto-signals-bot
     env: python
-    pythonVersion: 3.11.9
     plan: starter
 
-    buildCommand: |
-      python -m pip install -U pip setuptools wheel
-      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      pip install -r requirements.txt
-      python - << 'PY'
-      import sys, ccxt, aiogram
-      print("OK build on", sys.version)
-      print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__)
-      PY
+    # مهم جداً: استخدم بايثون 3.11 لتفادي مشاكل pydantic-core
+    pythonVersion: 3.11.9
 
-    startCommand: python bot.py
+    buildCommand: |
+      set -e
+      python -V
+      python -m pip install -U pip setuptools wheel
+      # اختياري: تثبيت عجلات جاهزة لباقة ثقيلة قبل بقية المتطلبات
+      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3 || true
+      # بقية المتطلبات
+      pip install -r requirements.txt
+      # فحص سريع أن أهم البكجات متاحة
+      python - <<'PY'
+import sys, ccxt, aiogram
+print("Build OK on:", sys.version)
+print("ccxt:", ccxt.__version__, "aiogram:", aiogram.__version__)
+PY
+
+    startCommand: "python bot.py"
 
     envVars:
+      # أدخل القيم الحسّاسة من لوحة Render (اترك sync:false ثم عيّن القيم من الداشبورد)
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
         sync: false
       - key: TRONGRID_API_KEY
         sync: false
+
+      # غير حسّاسة
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
@@ -46,5 +56,6 @@ services:
         value: "https://api.trongrid.io"
       - key: USDT_TRC20_CONTRACT
         value: ""
+      # يفضّل لتجنّب البناء من السورس
       - key: PIP_PREFER_BINARY
         value: "1"
