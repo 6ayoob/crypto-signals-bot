@@ -1,21 +1,32 @@
-# bot.py — مشغّل البوت كخدمة Background Worker على Render (مع Logging)
+# bot.py — مشغّل البوت كخدمة Background Worker على Render (مع Logging + Runtime Bootstrap)
+
+# ========== Runtime Bootstrap ==========
+# يضمن توفر الحزم المطلوبة حتى لو لم تُثبت في مرحلة الـ build
+import sys, subprocess
+
+def _ensure_pkg(pkg: str, version: str | None = None):
+    try:
+        __import__(pkg)
+        return
+    except ImportError:
+        v = f"=={version}" if version else ""
+        print(f"⚠️ {pkg} not found; installing at runtime...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", f"{pkg}{v}"])
+        __import__(pkg)
+        print(f"✅ {pkg} installed at runtime")
+
+# ثبّت الحزم الأساسية قبل الاستيراد
+_ensure_pkg("ccxt", "4.3.81")
+_ensure_pkg("aiogram", "3.6.0")
+# (اختياري) لو ظهر نقص لاحقًا لحزم أخرى، أضفها بنفس الطريقة:
+# _ensure_pkg("SQLAlchemy", "2.0.32")
+# _ensure_pkg("requests", "2.32.3")
+# _ensure_pkg("pytz", "2024.1")
+
+# ======================================
+
 import asyncio
 import logging
-
-# --- bootstrap: ثبت ccxt في وقت التشغيل إذا لم تكن متاحة ---
-import sys, subprocess
-def _ensure_ccxt(version="4.3.81"):
-    try:
-        import ccxt  # noqa
-        return
-    except Exception:
-        print("⚠️ ccxt not found; installing at runtime...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", f"ccxt=={version}"])
-        import ccxt  # noqa
-        print("✅ ccxt installed at runtime:", ccxt.__version__)
-_ensure_ccxt()
-# --- end bootstrap ---
-
 import ccxt
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
