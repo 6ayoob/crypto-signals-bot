@@ -4,6 +4,7 @@ services:
     env: python
     pythonVersion: 3.11.9
     plan: starter
+
     buildCommand: |
       set -e
       python --version
@@ -12,6 +13,8 @@ services:
       pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
       # ثم بقية المتطلبات
       pip install -r requirements.txt
+      # تأكيد تثبيت ccxt صراحة (أمان إضافي)
+      pip install --only-binary=:all: ccxt==4.3.81
       # فحص مبكر للاستيراد
       python - << 'PY'
 import sys, numpy, pandas, ccxt, aiogram, sqlalchemy, requests, pydantic
@@ -20,9 +23,11 @@ print("numpy:", numpy.__version__, "pandas:", pandas.__version__)
 print("ccxt:", ccxt.__version__, "aiogram:", aiogram.__version__)
 print("sqlalchemy:", sqlalchemy.__version__, "requests:", requests.__version__, "pydantic:", pydantic.__version__)
 PY
+
     startCommand: "python bot.py"
+
     envVars:
-      # حسّاسة: أدخل القيم يدويًا من لوحة Render
+      # حسّاسة: أدخل القيم من لوحة Render
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
