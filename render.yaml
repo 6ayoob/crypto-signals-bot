@@ -9,12 +9,12 @@ services:
       set -e
       python --version
       python -m pip install -U pip setuptools wheel
-      # تثبيت عجلات جاهزة لتفادي البناء من السورس
+      # ثبّت عجلات جاهزة لتفادي البناء من السورس
       pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-      # ثم بقية المتطلبات
+      # ثم بقية المتطلبات من الملف
       pip install -r requirements.txt
-      # تأكيد تثبيت ccxt صراحة (احتياط)
-      pip install --only-binary=:all: ccxt==4.3.81
+      # تأكيد تثبيت ccxt صراحة (أمان إضافي)
+      pip install ccxt==4.3.81
       # فحص مبكر للاستيراد
       python - << 'PY'
 import sys, numpy, pandas, ccxt, aiogram, sqlalchemy, requests, pydantic
@@ -27,7 +27,7 @@ PY
     startCommand: "python bot.py"
 
     envVars:
-      # هذه تترك بدون value وتضبط من لوحة Render (Secrets)
+      # اترك القيم الحساسة فارغة هنا واضبطها من لوحة Render → Environment
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
@@ -35,7 +35,7 @@ PY
       - key: TRONGRID_API_KEY
         sync: false
 
-      # الباقي غير حساس—نضع قيمه هنا
+      # الباقي غير حساس
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
