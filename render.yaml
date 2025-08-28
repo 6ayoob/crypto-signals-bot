@@ -2,13 +2,13 @@ services:
   - type: worker
     name: crypto-signals-bot
     env: python
-    pythonVersion: 3.11.9  # << اجبار استخدام بايثون 3.11.9
+    pythonVersion: 3.11.9
     plan: starter
     buildCommand: |
       set -e
       python --version
       python -m pip install -U pip setuptools wheel
-      # ثبّت wheels الجاهزة لتفادي البناء من السورس
+      # ثبّت Wheels الجاهزة لتفادي البناء من السورس
       pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
       # ثم بقية المتطلبات
       pip install -r requirements.txt
@@ -22,6 +22,7 @@ print("sqlalchemy:", sqlalchemy.__version__, "requests:", requests.__version__, 
 PY
     startCommand: "python bot.py"
     envVars:
+      # حسّاسة: أدخل القيم يدويًا من لوحة Render
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
@@ -29,6 +30,7 @@ PY
       - key: TRONGRID_API_KEY
         sync: false
 
+      # غير حسّاسة
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
@@ -54,5 +56,7 @@ PY
         value: "https://api.trongrid.io"
       - key: USDT_TRC20_CONTRACT
         value: ""
+
+      # يفضّل العجلات الثنائية
       - key: PIP_PREFER_BINARY
         value: "1"
