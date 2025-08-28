@@ -28,11 +28,11 @@ PY
 
     envVars:
       # حسّاسة: أدخل القيم من لوحة Render
-      - key: TELEGRAM_BOT_TOKEN
+      - key: 8483309506:AAEe3bA4DTrLOXXPDNJS3W3Gnttau8LEXQg
         sync: false
-      - key: DATABASE_URL
+      - key: postgresql://crypto_signals_db_9i26_user:kjjjD4O3pQReO9z4EtoUiVngLoma5YWf@dpg-d2nljlali9vc73dqaf1g-a.oregon-postgres.render.com/crypto_signals_db_9i26
         sync: false
-      - key: TRONGRID_API_KEY
+      - key: 84f67a7f-e4b3-4145-9836-27ca546a6e5b
         sync: false
 
       # غير حسّاسة
