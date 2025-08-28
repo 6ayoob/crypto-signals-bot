@@ -1,34 +1,63 @@
-# config.py — إعدادات المشروع (استخدم المتغيرات البيئية على Render)
+# config.py — إعدادات المشروع (اقرأ من متغيرات البيئة على Render)
 import os
 from datetime import timedelta
 
-# توكن البوت والقناة (يفضّل وضعها كمتغيرات بيئية على Render)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8483309506:AAEe3bA4DTrLOXXPDNJS3W3Gnttau8LEXQg")
-TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "-1002800980577"))  # قناتك @crypto_AI_signals_2
+def _required(key: str) -> str:
+    """اقرأ متغيرًا ضروريًا وإلا ارفع خطأ واضح في اللوج."""
+    val = os.getenv(key)
+    if not val:
+        raise ValueError(f"Missing required environment variable: {key}")
+    return val
 
-# أدمن (أنت فقط)
-ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "658712542").split(",") if x.strip()]
+# ---------------------------
+# مفاتيح تيليجرام
+# ---------------------------
+# ⚠️ أمنيًا: لا تضع قيمة افتراضية للتوكن — يجب ضبطه من لوحة Render
+TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 
-# محفظة USDT TRC20 للدفع
+# معرف القناة بصيغة int (مثال: -1002800980577)
+TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "-1002800980577"))
+
+# قائمة الأدمن — أرقام مفصولة بفواصل
+# مثال في Render: ADMIN_USER_IDS="658712542"
+ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "658712542").split(",") if x.strip()}
+
+# ---------------------------
+# الدفع و TronGrid
+# ---------------------------
 USDT_TRC20_WALLET = os.getenv("USDT_TRC20_WALLET", "TJC9gbV1AJ2Y9S8uq8gj1xcd3hs2T53VpD")
 
-# قاعدة البيانات (Postgres على Render)
+# مفاتيح TronGrid للتحقق التلقائي (المفتاح مطلوب)
+TRONGRID_API_KEY = _required("TRONGRID_API_KEY")
+TRONGRID_BASE = os.getenv("TRONGRID_BASE", "https://api.trongrid.io")
+# عقد USDT (اختياري — يمكن تركه فارغًا لو نتحقق عبر الحدث والوجهة فقط)
+USDT_TRC20_CONTRACT = os.getenv("USDT_TRC20_CONTRACT", "").strip()
+
+# ---------------------------
+# قاعدة البيانات
+# ---------------------------
+# على Render: اضبط DATABASE_URL من خدمة Postgres
+# محليًا يمكن ترك SQLite للتجربة
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# إعدادات الزمن والتقرير اليومي
+# ---------------------------
+# الإعدادات الزمنية والتقارير
+# ---------------------------
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Riyadh")
 DAILY_REPORT_HOUR_LOCAL = int(os.getenv("DAILY_REPORT_HOUR_LOCAL", "9"))
 
-# حدود الصفقات
+# ---------------------------
+# حدود وإعدادات التداول
+# ---------------------------
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "8"))
 
-# التسعير
+# الأسعار/الخطط
 PRICE_2_WEEKS_USD = float(os.getenv("PRICE_2_WEEKS_USD", "30"))
 PRICE_4_WEEKS_USD = float(os.getenv("PRICE_4_WEEKS_USD", "60"))
 
 # التجربة المجانية
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "2"))
 
-# مدد الاشتراك
+# مدد الاشتراك (timedelta) — متوافقة مع استخدامك في bot.py
 SUB_DURATION_2W = timedelta(days=14)
 SUB_DURATION_4W = timedelta(days=28)
