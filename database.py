@@ -15,15 +15,15 @@ from config import DATABASE_URL, TRIAL_DAYS
 # -------------------------------------------------
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,         # يتعامل مع اتصالات ميتة
-    pool_size=5,                # حجم معقول للـ worker
-    max_overflow=5,             # سماح بتمدد بسيط
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=5,
     future=True
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
 
-UTCNOW = datetime.utcnow  # مرجع واحد لو أردت تبديله لاحقًا
+UTCNOW = datetime.utcnow
 
 # -------------------------------------------------
 # Models
@@ -46,7 +46,6 @@ class Subscription(Base):
     tx_hash = Column(String, nullable=True)
     user = relationship("User", back_populates="subscriptions")
 
-# فهارس مفيدة للاستعلامات
 Index("idx_subscriptions_user_end", Subscription.user_id, Subscription.end_at)
 
 
@@ -103,7 +102,6 @@ def get_or_create_user(s, tg_id: int) -> User:
 
 
 def active_until(s, tg_id: int) -> Optional[datetime]:
-    """يعيد آخر تاريخ نهاية لاشتراك نشط (إن وجد)."""
     now = UTCNOW()
     u = s.query(User).filter_by(tg_id=tg_id).first()
     if not u:
@@ -122,7 +120,6 @@ def is_active(s, tg_id: int) -> bool:
 
 
 def has_used_trial(s, tg_id: int) -> bool:
-    """تحقق ما إذا كان المستخدم قد استخدم التجربة من قبل (حتى لو انتهت)."""
     u = s.query(User).filter_by(tg_id=tg_id).first()
     if not u:
         return False
@@ -130,10 +127,7 @@ def has_used_trial(s, tg_id: int) -> bool:
 
 
 def start_trial(s, tg_id: int) -> bool:
-    """
-    يبدأ تجربة مجانية إن لم يكن لديه تجربة سابقة.
-    يعيد True إذا بدأ التجربة، False إذا كان سبق واستخدمها.
-    """
+    """يبدأ تجربة مجانية إن لم يكن لديه تجربة سابقة."""
     if has_used_trial(s, tg_id):
         return False
     u = get_or_create_user(s, tg_id)
@@ -150,11 +144,7 @@ def start_trial(s, tg_id: int) -> bool:
 
 
 def approve_paid(s, tg_id: int, plan: str, duration: timedelta, tx_hash: Optional[str] = None):
-    """
-    يضيف/يمدد اشتراك مدفوع:
-    - إن كان لديه اشتراك نشط: نمدّ من تاريخ الانتهاء.
-    - إن لم يكن نشطًا: نبدأ من الآن.
-    """
+    """يمدّد من نهاية الاشتراك النشط إن وجد، وإلّا يبدأ من الآن."""
     u = get_or_create_user(s, tg_id)
     now = UTCNOW()
     current_end = active_until(s, tg_id)
@@ -193,7 +183,6 @@ def close_trade(s, trade_id: int, reason: str, close_price: Optional[float] = No
     t.is_open = False
     t.closed_at = UTCNOW()
     if close_price is not None:
-        # يمكن لاحقًا حساب PnL وتخزينه إذا رغبت
         pass
     t.close_reason = reason
     s.flush()
