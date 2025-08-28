@@ -2,19 +2,16 @@ services:
   - type: worker
     name: crypto-signals-bot
     env: python
-    pythonVersion: 3.11.9
     plan: starter
 
-buildCommand: |
-  set -e
-  python --version
-  python -m pip install -U pip setuptools wheel
-  # ثبّت Wheels الجاهزة لتفادي البناء من السورس
-  pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
-  # ثم بقية المتطلبات
-  pip install -r requirements.txt
-  # فحص مبكر للاستيراد (اختياري لكنه مفيد)
-  python - << 'PY'
+    buildCommand: |
+      set -e
+      python --version
+      python -m pip install -U pip setuptools wheel
+      # استخدام Wheels الجاهزة لبايثون 3.11
+      pip install --only-binary=:all: numpy==1.26.4 pandas==2.2.3
+      pip install -r requirements.txt
+      python - << 'PY'
 import sys, ccxt, aiogram, pydantic, sqlalchemy, requests
 print("OK build on", sys.version)
 print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__, "pydantic", pydantic.__version__, "sqlalchemy", sqlalchemy.__version__)
@@ -23,6 +20,7 @@ PY
     startCommand: "python bot.py"
 
     envVars:
+      # ضع القيم الحساسة من لوحة Render (لا تكتب القيم هنا)
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DATABASE_URL
@@ -30,31 +28,28 @@ PY
       - key: TRONGRID_API_KEY
         sync: false
 
+      # القيم غير الحساسة
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
         value: "658712542"
       - key: USDT_TRC20_WALLET
         value: "TJC9gbV1AJ2Y9S8uq8gj1xcd3hs2T53VpD"
-
       - key: TIMEZONE
         value: "Asia/Riyadh"
       - key: DAILY_REPORT_HOUR_LOCAL
         value: "9"
       - key: MAX_OPEN_TRADES
         value: "8"
-
       - key: PRICE_2_WEEKS_USD
         value: "30"
       - key: PRICE_4_WEEKS_USD
         value: "60"
       - key: TRIAL_DAYS
         value: "2"
-
       - key: TRONGRID_BASE
         value: "https://api.trongrid.io"
       - key: USDT_TRC20_CONTRACT
         value: ""
-
       - key: PIP_PREFER_BINARY
         value: "1"
