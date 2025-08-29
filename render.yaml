@@ -4,8 +4,25 @@ services:
     env: python
     plan: starter
 
+    buildCommand: |
+      set -e
+      python --version
+      python -m pip install -U pip setuptools wheel
+      pip install -r requirements.txt
+      python - << 'PY'
+import sys, ccxt, aiogram
+print("OK build on", sys.version)
+print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__)
+PY
+
+    startCommand: "python bot.py"
+
     envVars:
-      # حساسة — ضع القيم من لوحة Render (Sync: false)
+      # اختر إصدار بايثون 3.11.9 لتجنّب مشكلة pydantic-core
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+      # أسرار تُضبط من لوحة Render (لا تكتب قيمها هنا)
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TRONGRID_API_KEY
@@ -13,7 +30,7 @@ services:
       - key: DATABASE_URL
         sync: false
 
-      # غير حساسة
+      # غير حسّاسة (عدّلها لو احتجت)
       - key: TELEGRAM_CHANNEL_ID
         value: "-1002800980577"
       - key: ADMIN_USER_IDS
@@ -31,25 +48,8 @@ services:
       - key: PRICE_4_WEEKS_USD
         value: "60"
       - key: TRIAL_DAYS
-        value: "1"   # يوم واحد
+        value: "1"    # يوم تجريبي واحد كما طلبت
       - key: TRONGRID_BASE
         value: "https://api.trongrid.io"
       - key: USDT_TRC20_CONTRACT
         value: ""
-      - key: PIP_PREFER_BINARY
-        value: "1"
-      - key: PYTHON_VERSION
-        value: "3.11.9"
-
-    buildCommand: |
-      set -e
-      python --version
-      python -m pip install -U pip setuptools wheel
-      pip install -r requirements.txt
-      python - << 'PY'
-import sys, ccxt, aiogram
-print("OK build on", sys.version)
-print("ccxt", ccxt.__version__, "aiogram", aiogram.__version__)
-PY
-
-    startCommand: "python bot.py"
