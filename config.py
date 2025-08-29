@@ -1,12 +1,12 @@
 # config.py
-TELEGRAM_BOT_TOKEN = "ضع_توكن_البوت"
-TELEGRAM_CHANNEL_ID = -1001234567890   # ID القناة
-ADMIN_USER_IDS = [123456789]           # معرفات الأدمن (int)
-USDT_TRC20_WALLET = "Txxxx..."         # محفظة USDT TRC20
+TELEGRAM_BOT_TOKEN = "8483309506:AAEe3bA4DTrLOXXPDNJS3W3Gnttau8LEXQg"
+TELEGRAM_CHANNEL_ID = -1001234567890   # ID القناة (سالب للقنوات)
+ADMIN_USER_IDS = [123456789]           # ضع معرفك كأدمن
+USDT_TRC20_WALLET = "TJC9gbV1AJ2Y9S8uq8gj1xcd3hs2T53VpD"         # محفظة USDT TRC20
 
 MAX_OPEN_TRADES = 8
 TIMEZONE = "Asia/Riyadh"
-DAILY_REPORT_HOUR_LOCAL = 9  # 9 صباحاً
+DAILY_REPORT_HOUR_LOCAL = 9  # 9 صباحاً بتوقيت السعودية
 
 PRICE_2_WEEKS_USD = 30
 PRICE_4_WEEKS_USD = 60
