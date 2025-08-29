@@ -1,6 +1,6 @@
 
 # config.py
-TELEGRAM_CHANNEL_ID = "@crypto_AI_signals_2"  # أسهل حل
+TELEGRAM_CHANNEL_ID = "-1002800980577"  # أسهل حل
 TELEGRAM_BOT_TOKEN = "7361777082:AAHBRFNLWaez0iGW0GT2nnvzXiag5T-_mIE"
 TELEGRAM_CHANNEL_ID = -1001234567890   # ID القناة (سالب للقنوات)
 ADMIN_USER_IDS = [123456789]           # ضع معرفك كأدمن
