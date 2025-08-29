@@ -17,7 +17,7 @@ from config import (
 )
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
-    Trade, count_open_trades, add_trade
+    count_open_trades, add_trade
 )
 from strategy import check_signal
 from symbols import SYMBOLS
@@ -59,7 +59,7 @@ async def welcome_text() -> str:
         f"• أسبوعان: {PRICE_2_WEEKS_USD}$\n"
         f"• 4 أسابيع: {PRICE_4_WEEKS_USD}$\n"
         f"(USDT TRC20): `{USDT_TRC20_WALLET}`\n\n"
-        "✨ جرّبنا مجانًا لمدة يومين بالضغط على الزر."
+        "✨ جرّبنا مجانًا لمدة يوم واحد بالضغط على الزر."
     )
 
 # ---------------------------
@@ -68,7 +68,7 @@ async def welcome_text() -> str:
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="ابدأ التجربة المجانية (يومين)", callback_data="start_trial")
+    kb.button(text="ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
     kb.button(text="طريقة الاشتراك", callback_data="subscribe_info")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="Markdown", reply_markup=kb.as_markup())
@@ -78,7 +78,7 @@ async def cb_trial(q: CallbackQuery):
     with get_session() as s:
         ok = start_trial(s, q.from_user.id)  # False لو سبق استخدم التجربة
     if ok:
-        await q.message.edit_text("✅ تم تفعيل التجربة المجانية لمدة يومين 🎁\nستصلك الإشارات والتقرير اليومي.")
+        await q.message.edit_text("✅ تم تفعيل التجربة المجانية لمدة يوم واحد 🎁\nستصلك الإشارات والتقرير اليومي.")
     else:
         await q.message.edit_text("ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\nيمكنك الاشتراك عبر الزر أدناه.")
     await q.answer()
