@@ -1,13 +1,16 @@
-# bot.py — مشغّل البوت (OKX + فلترة الرموز + فحص التوكن/القناة/الأدمن + أوامر مساعدة/إدارية)
+# bot.py — مشغّل البوت (OKX + MTF 5m/15m + إحصائيات يومية + أوامر إدارية + فحوص مبكرة)
+import os
 import asyncio
 import logging
-import ccxt
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from collections import defaultdict
 from datetime import datetime, timedelta
+
+import ccxt
 import pytz
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS, USDT_TRC20_WALLET,
@@ -21,6 +24,17 @@ from database import (
 from strategy import check_signal
 from symbols import SYMBOLS
 from payments_tron import find_trc20_transfer_to_me
+
+# ---------------------------
+# Sentry (اختياري) — فعّل بـ SENTRY_DSN
+# ---------------------------
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(dsn=SENTRY_DSN, traces_sample_rate=0.0)
+    except Exception:
+        pass
 
 # ---------------------------
 # Logging
@@ -45,8 +59,22 @@ ACTIVE_SYMBOLS = []  # سيتم ملؤها بالمدعوم فعلاً من OKX
 CHANNEL_TARGET = TELEGRAM_CHANNEL_ID  # قد يكون int -100... أو '@username' حسب الإعداد
 
 # ---------------------------
-# أدوات مساعدة
+# إحصائيات يومية بسيطة في الذاكرة
 # ---------------------------
+tz = pytz.timezone(TIMEZONE)
+STATS = {
+    "today": None,                 # تاريخ اليوم (بتوقيت TIMEZONE)
+    "signals": 0,                  # عدد الإشارات المرسلة اليوم
+    "per_symbol": defaultdict(int) # عدد الإشارات لكل رمز اليوم
+}
+
+def maybe_reset_stats():
+    today = datetime.now(tz).date()
+    if STATS["today"] != today:
+        STATS["today"] = today
+        STATS["signals"] = 0
+        STATS["per_symbol"].clear()
+
 def user_is_admin(user_id: int) -> bool:
     try:
         return int(user_id) in [int(x) for x in ADMIN_USER_IDS]
@@ -102,7 +130,8 @@ def help_text(is_admin: bool) -> str:
         "🛡 *أوامر الأدمن*\n"
         "*/approve <user_id> <2w|4w> [tx_hash]* — تفعيل اشتراك يدوي\n"
         "*/ping_channel* — اختبار إرسال رسالة للقناة\n"
-        "*/broadcast <النص>* — إرسال رسالة للقناة"
+        "*/broadcast <النص>* — إرسال رسالة للقناة\n"
+        "*/stats* — عرض إحصائيات اليوم"
     )
     return base + (admin if is_admin else "")
 
@@ -230,7 +259,7 @@ async def cmd_submit(m: Message):
     await m.answer("❗ لم أستطع التحقق تلقائيًا من التحويل.\nسيتم مراجعته يدويًا قريبًا.")
 
 # ---------------------------
-# أوامر الإدارة (أنت فقط)
+# أوامر الإدارة
 # ---------------------------
 @dp.message(Command("approve"))
 async def cmd_approve(m: Message):
@@ -270,8 +299,21 @@ async def broadcast(m: Message):
     await send_channel(text)
     await m.answer("تم الإرسال إلى القناة ✅")
 
+@dp.message(Command("stats"))
+async def stats(m: Message):
+    if not user_is_admin(m.from_user.id):
+        return await m.answer("غير مصرح")
+    maybe_reset_stats()
+    top = sorted(STATS["per_symbol"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+    lines = [f"📈 إحصائيات اليوم ({STATS['today']}):", f"• عدد الإشارات: {STATS['signals']}"]
+    if top:
+        lines.append("• أكثر الرموز إرسالاً:")
+        for sym, c in top:
+            lines.append(f"   - {sym}: {c}")
+    await m.answer("\n".join(lines))
+
 # ---------------------------
-# فحص الشموع/الإشارات
+# فحص الشموع/الإشارات (MTF 5m/15m)
 # ---------------------------
 async def fetch_ohlcv(symbol: str, timeframe="5m", limit=150):
     try:
@@ -280,20 +322,24 @@ async def fetch_ohlcv(symbol: str, timeframe="5m", limit=150):
             None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         )
     except Exception as e:
-        logger.warning(f"FETCH_OHLCV ERROR {symbol}: {e}")
+        logger.warning(f"FETCH_OHLCV ERROR {symbol} {timeframe}: {e}")
         return []
 
 async def scan_and_dispatch():
     """
     يفحص الرموز المدعومة، يطبق الاستراتيجية، ويرسل الإشارات فورًا للقناة.
+    يستخدم إطار 5m أساسي + 15m تأكيد (اختياري).
     """
     if not ACTIVE_SYMBOLS:
         logger.warning("No ACTIVE_SYMBOLS yet; skipping scan cycle.")
         return
 
+    maybe_reset_stats()
+
     for sym in ACTIVE_SYMBOLS:
-        data = await fetch_ohlcv(sym)
-        sig = check_signal(sym, data)
+        data5 = await fetch_ohlcv(sym, "5m", 150)
+        data15 = await fetch_ohlcv(sym, "15m", 150)  # للتأكيد متعدد الأطر
+        sig = check_signal(sym, data5, data15)
         if sig:
             with get_session() as s:
                 if count_open_trades(s) < MAX_OPEN_TRADES:
@@ -311,6 +357,8 @@ async def scan_and_dispatch():
                 "━━━━━━━━━━━━━━\n⚡️ إدارة رأس المال قبل كل صفقة."
             )
             await send_channel(text)
+            STATS["signals"] += 1
+            STATS["per_symbol"][sym] += 1
             logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']}")
         await asyncio.sleep(0.35)  # تهدئة لتجنب rate limits
 
@@ -328,9 +376,9 @@ async def loop_signals():
 # ---------------------------
 async def daily_report_loop():
     """
-    يرسل تقريرًا يوميًا بسيطًا الساعة المحددة (بتوقيت الرياض).
+    يرسل تقريرًا يوميًا بسيطًا الساعة المحددة (بتوقيت TIMEZONE).
+    يتضمن عدد الإشارات لليوم وأبرز الرموز.
     """
-    tz = pytz.timezone(TIMEZONE)
     while True:
         now = datetime.now(tz)
         target = now.replace(hour=DAILY_REPORT_HOUR_LOCAL, minute=0, second=0, microsecond=0)
@@ -339,14 +387,23 @@ async def daily_report_loop():
         delay = (target - now).total_seconds()
         logger.info(f"Next daily report at {target.isoformat()} ({TIMEZONE}) in {int(delay)}s")
         await asyncio.sleep(delay)
+
         try:
-            await send_channel(
-                "📊 تقرير الإشارات اليومي\n"
-                "━━━━━━━━━━━━━━\n"
-                "(سيتم توسيع التقرير لاحقًا لعرض أداء الصفقات)\n"
-                "━━━━━━━━━━━━━━\n"
-                f"🕘 {DAILY_REPORT_HOUR_LOCAL} صباحًا"
-            )
+            maybe_reset_stats()
+            top = sorted(STATS["per_symbol"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+            lines = [
+                "📊 تقرير الإشارات اليومي",
+                "━━━━━━━━━━━━━━",
+                f"• عدد الإشارات اليوم: {STATS['signals']}",
+            ]
+            if top:
+                lines.append("• أكثر الرموز نشاطًا:")
+                for sym, c in top:
+                    lines.append(f"   - {sym}: {c}")
+            lines.append("━━━━━━━━━━━━━━")
+            lines.append(f"🕘 {DAILY_REPORT_HOUR_LOCAL} صباحًا")
+
+            await send_channel("\n".join(lines))
             logger.info("Daily report sent.")
         except Exception as e:
             logger.exception(f"DAILY_REPORT ERROR: {e}")
@@ -362,7 +419,7 @@ async def main():
     # ✅ فحص التوكن مبكرًا
     await assert_token_ok()
 
-    # ✅ حذف الويبهوك بالطريقة الصحيحة (نستخدم polling)
+    # ✅ حذف الويبهوك — نستخدم polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
@@ -382,7 +439,7 @@ async def main():
         except Exception as e:
             logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
-    # ملاحظة: تأكد من عدم تشغيل نسخة أخرى من نفس التوكن لتفادي TelegramConflictError
+    # تشغيل المهام
     t1 = asyncio.create_task(dp.start_polling(bot))
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
