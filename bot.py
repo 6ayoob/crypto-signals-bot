@@ -1,4 +1,4 @@
-# bot.py — مشغّل البوت (OKX + فلترة الرموز المدعومة)
+# bot.py — مشغّل البوت (OKX + فلترة الرموز + فحص القناة/الأدمن + أوامر مساعدة)
 import asyncio
 import logging
 import ccxt
@@ -43,26 +43,12 @@ exchange = ccxt.okx({
 
 ACTIVE_SYMBOLS = []  # سيتم ملؤها بالمدعوم فعلاً من OKX
 
-async def init_exchange_and_symbols():
-    """
-    تحميل ماركت OKX وتصفية SYMBOLS إلى الرموز المدعومة فعلاً بصيغة CCXT الموحدة مثل BTC/USDT.
-    """
-    loop = asyncio.get_event_loop()
-    markets = await loop.run_in_executor(None, exchange.load_markets)
-    supported = set(markets.keys())
-    ok, skipped = [], []
-    for s in SYMBOLS:
-        if s in supported:
-            ok.append(s)
-        else:
-            skipped.append(s)
-    global ACTIVE_SYMBOLS
-    ACTIVE_SYMBOLS = ok
-    logger.info(f"OKX markets loaded. Using {len(ok)} symbols, skipped {len(skipped)}: {skipped[:12]}")
-
 # ---------------------------
 # أدوات مساعدة
 # ---------------------------
+def user_is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
 async def send_channel(text: str):
     """إرسال رسالة إلى قناة الإشارات"""
     try:
@@ -88,6 +74,63 @@ async def welcome_text() -> str:
         "🎁 *هدية خاصة*: تجربة مجانية لمدة *يوم واحد* — ابدأها الآن بالضغط على الزر 👇"
     )
 
+def help_text(is_admin: bool) -> str:
+    base = (
+        "📚 *دليل الأوامر*\n"
+        "━━━━━━━━━━━━━━\n"
+        "*/start* — بدء الاستخدام وعرض الترحيب\n"
+        "*/help* — عرض هذه المساعدة\n"
+        "*/status* — حالة اشتراكك\n"
+        "*/submit_tx <hash> <2w|4w>* — إرسال معاملة الدفع للتحقق\n"
+        "*/whoami* — يظهر معرفك الرقمي\n"
+    )
+    admin = (
+        "━━━━━━━━━━━━━━\n"
+        "🛡 *أوامر الأدمن*\n"
+        "*/approve <user_id> <2w|4w> [tx_hash]* — تفعيل اشتراك يدوي"
+    )
+    return base + (admin if is_admin else "")
+
+# ---------------------------
+# تهيئة الأسواق + فلترة الرموز
+# ---------------------------
+async def init_exchange_and_symbols():
+    """
+    تحميل ماركت OKX وتصفية SYMBOLS إلى الرموز المدعومة فعلاً بصيغة CCXT الموحدة مثل BTC/USDT.
+    """
+    loop = asyncio.get_event_loop()
+    markets = await loop.run_in_executor(None, exchange.load_markets)
+    supported = set(markets.keys())
+    ok, skipped = [], []
+    for s in SYMBOLS:
+        if s in supported:
+            ok.append(s)
+        else:
+            skipped.append(s)
+    global ACTIVE_SYMBOLS
+    ACTIVE_SYMBOLS = ok
+    logger.info(f"OKX markets loaded. Using {len(ok)} symbols, skipped {len(skipped)}: {skipped[:12]}")
+
+# ---------------------------
+# فحص القناة والأدمن عند الإقلاع
+# ---------------------------
+async def validate_targets():
+    # فحص القناة
+    try:
+        chat = await bot.get_chat(TELEGRAM_CHANNEL_ID)
+        await bot.send_message(chat.id, "🔧 تم الربط مع القناة بنجاح.")
+        logger.info(f"CHANNEL OK: {chat.id} / {getattr(chat, 'title', '')}")
+    except Exception as e:
+        logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
+
+    # فحص وصول رسالة للأدمن
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, "🔧 اختبار وصول الرسائل إلى الأدمن.")
+            logger.info(f"ADMIN DM OK: {admin_id}")
+        except Exception as e:
+            logger.warning(f"ADMIN DM FAILED for {admin_id}: {e} — أرسل /start للبوت في الخاص وتحقق من الـ ID.")
+
 # ---------------------------
 # أوامر عامة للمستخدم
 # ---------------------------
@@ -98,6 +141,14 @@ async def cmd_start(m: Message):
     kb.button(text="طريقة الاشتراك", callback_data="subscribe_info")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="Markdown", reply_markup=kb.as_markup())
+
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    await m.answer(help_text(user_is_admin(m.from_user.id)), parse_mode="Markdown")
+
+@dp.message(Command("whoami"))
+async def whoami(m: Message):
+    await m.answer(f"👤 user_id: `{m.from_user.id}`", parse_mode="Markdown")
 
 @dp.callback_query(F.data == "start_trial")
 async def cb_trial(q: CallbackQuery):
@@ -286,7 +337,10 @@ async def main():
     # ✅ تحميل أسواق OKX وتصفية الرموز
     await init_exchange_and_symbols()
 
-    # إشعار بدء التشغيل للأدمن
+    # ✅ التحقق من القناة والأدمن
+    await validate_targets()
+
+    # إشعار بدء التشغيل للأدمن (إن تعذر لا يوقف البوت)
     for admin_id in ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, "✅ البوت بدأ العمل على Render (polling).")
