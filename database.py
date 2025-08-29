@@ -1,102 +1,74 @@
-# database.py — SQLAlchemy models + helpers
+# database.py
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
+from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
-from typing import Optional
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, func
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship
-from contextlib import contextmanager
-from config import DATABASE_URL, TRIAL_DAYS
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+engine = create_engine("sqlite:///bot.db")
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    tg_id = Column(Integer, unique=True, index=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    subscriptions = relationship("Subscription", back_populates="user")
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    start_at = Column(DateTime, default=datetime.utcnow)
-    end_at = Column(DateTime, nullable=False)
-    plan = Column(String, nullable=False)  # trial | 2w | 4w
-    tx_hash = Column(String, nullable=True)
-    user = relationship("User", back_populates="subscriptions")
+    user_id = Column(Integer, primary_key=True)
+    end_at = Column(DateTime)
+    trial_used = Column(Boolean, default=False)
 
 class Trade(Base):
     __tablename__ = "trades"
-    id = Column(Integer, primary_key=True)
-    symbol = Column(String, index=True, nullable=False)
-    side = Column(String, nullable=False)  # BUY/SELL
-    entry = Column(Float, nullable=False)
-    sl = Column(Float, nullable=False)
-    tp1 = Column(Float, nullable=False)
-    tp2 = Column(Float, nullable=False)
-    is_open = Column(Boolean, default=True)
-    opened_at = Column(DateTime, default=datetime.utcnow)
-    closed_at = Column(DateTime, nullable=True)
-    close_reason = Column(String, nullable=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String)
+    side = Column(String)
+    entry = Column(String)
+    sl = Column(String)
+    tp1 = Column(String)
+    tp2 = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(engine)
 
-@contextmanager
 def get_session():
-    s = SessionLocal()
-    try:
-        yield s
-        s.commit()
-    except Exception:
-        s.rollback()
-        raise
-    finally:
-        s.close()
+    return SessionLocal()
 
-# Subscriptions helpers
-def get_or_create_user(s, tg_id: int) -> User:
-    u = s.query(User).filter_by(tg_id=tg_id).first()
-    if not u:
-        u = User(tg_id=tg_id)
-        s.add(u); s.flush()
-    return u
+# ---------------------------
+# عمليات الاشتراك
+# ---------------------------
+def is_active(session, user_id):
+    sub = session.get(Subscription, user_id)
+    return bool(sub and sub.end_at > datetime.utcnow())
 
-def is_active(s, tg_id: int) -> bool:
-    now = datetime.utcnow()
-    u = s.query(User).filter_by(tg_id=tg_id).first()
-    if not u: return False
-    sub = (s.query(Subscription)
-           .filter(Subscription.user_id == u.id, Subscription.end_at >= now)
-           .order_by(Subscription.end_at.desc()).first())
-    return bool(sub)
-
-def start_trial(s, tg_id: int) -> bool:
-    """يحاول تفعيل تجربة مجانية لمرة واحدة. يرجع True إذا فُعِّلت الآن، False إذا سبق استخدامها."""
-    u = get_or_create_user(s, tg_id)
-    # رفض لو سبق أخذ تجربة مجانية
-    existed = s.query(Subscription).filter(Subscription.user_id == u.id, Subscription.plan == "trial").first()
-    if existed:
+def start_trial(session, user_id):
+    sub = session.get(Subscription, user_id)
+    if sub and sub.trial_used:
         return False
-    now = datetime.utcnow()
-    s.add(Subscription(user_id=u.id, start_at=now, end_at=now + timedelta(days=TRIAL_DAYS), plan="trial"))
+    end_at = datetime.utcnow() + timedelta(days=1)
+    if not sub:
+        sub = Subscription(user_id=user_id, end_at=end_at, trial_used=True)
+        session.add(sub)
+    else:
+        sub.end_at = end_at
+        sub.trial_used = True
+    session.commit()
     return True
 
-def approve_paid(s, tg_id: int, plan: str, duration: timedelta, tx_hash: Optional[str] = None):
-    """يسجّل اشتراكًا مدفوعًا ويعيد end_at لاستخدامه في الرسائل."""
-    u = get_or_create_user(s, tg_id)
-    now = datetime.utcnow()
-    end_at = now + duration
-    s.add(Subscription(user_id=u.id, start_at=now, end_at=end_at, plan=plan, tx_hash=tx_hash))
+def approve_paid(session, user_id, plan, duration, tx_hash=None):
+    end_at = datetime.utcnow() + timedelta(days=duration)
+    sub = session.get(Subscription, user_id)
+    if not sub:
+        sub = Subscription(user_id=user_id, end_at=end_at, trial_used=True)
+        session.add(sub)
+    else:
+        sub.end_at = end_at
+    session.commit()
     return end_at
 
-# Trades helpers
-def count_open_trades(s) -> int:
-    return s.query(func.count(Trade.id)).filter(Trade.is_open == True).scalar() or 0
+# ---------------------------
+# الصفقات
+# ---------------------------
+def count_open_trades(session):
+    return session.query(Trade).count()
 
-def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> Trade:
+def add_trade(session, symbol, side, entry, sl, tp1, tp2):
     t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2)
-    s.add(t); s.flush()
-    return t
+    session.add(t)
+    session.commit()
