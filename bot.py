@@ -36,7 +36,7 @@ logging.getLogger("aiogram").setLevel(logging.INFO)
 # ---------------------------
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.okx({"enableRateLimit": True})
+exchange = ccxt.bybit({"enableRateLimit": True})
 
 # ---------------------------
 # أدوات مساعدة
