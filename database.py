@@ -1,53 +1,31 @@
-# database.py — SQLAlchemy models + helpers (محسّن لـ Render/Prod)
+# database.py — SQLAlchemy models + helpers
 from datetime import datetime, timedelta
 from typing import Optional
-from contextlib import contextmanager
-
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, DateTime, Boolean,
-    ForeignKey, func, Index
-)
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, func
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from contextlib import contextmanager
 from config import DATABASE_URL, TRIAL_DAYS
 
-# -------------------------------------------------
-# Engine & Session (إعدادات مستقرة على Render)
-# -------------------------------------------------
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=5,
-    future=True
-)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-UTCNOW = datetime.utcnow
-
-# -------------------------------------------------
-# Models
-# -------------------------------------------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     tg_id = Column(Integer, unique=True, index=True, nullable=False)
-    created_at = Column(DateTime, default=UTCNOW)
-    subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
-
+    created_at = Column(DateTime, default=datetime.utcnow)
+    subscriptions = relationship("Subscription", back_populates="user")
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    start_at = Column(DateTime, default=UTCNOW, nullable=False)
-    end_at = Column(DateTime, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    start_at = Column(DateTime, default=datetime.utcnow)
+    end_at = Column(DateTime, nullable=False)
     plan = Column(String, nullable=False)  # trial | 2w | 4w
     tx_hash = Column(String, nullable=True)
     user = relationship("User", back_populates="subscriptions")
-
-Index("idx_subscriptions_user_end", Subscription.user_id, Subscription.end_at)
-
 
 class Trade(Base):
     __tablename__ = "trades"
@@ -58,24 +36,14 @@ class Trade(Base):
     sl = Column(Float, nullable=False)
     tp1 = Column(Float, nullable=False)
     tp2 = Column(Float, nullable=False)
-    is_open = Column(Boolean, default=True, index=True)
-    opened_at = Column(DateTime, default=UTCNOW)
+    is_open = Column(Boolean, default=True)
+    opened_at = Column(DateTime, default=datetime.utcnow)
     closed_at = Column(DateTime, nullable=True)
     close_reason = Column(String, nullable=True)
 
-Index("idx_trades_opened_isopen", Trade.opened_at, Trade.is_open)
-
-
-# -------------------------------------------------
-# Schema init
-# -------------------------------------------------
 def init_db():
     Base.metadata.create_all(bind=engine)
 
-
-# -------------------------------------------------
-# Session helper
-# -------------------------------------------------
 @contextmanager
 def get_session():
     s = SessionLocal()
@@ -88,102 +56,47 @@ def get_session():
     finally:
         s.close()
 
-
-# -------------------------------------------------
-# Subscription helpers
-# -------------------------------------------------
+# Subscriptions helpers
 def get_or_create_user(s, tg_id: int) -> User:
     u = s.query(User).filter_by(tg_id=tg_id).first()
     if not u:
         u = User(tg_id=tg_id)
-        s.add(u)
-        s.flush()
+        s.add(u); s.flush()
     return u
 
-
-def active_until(s, tg_id: int) -> Optional[datetime]:
-    now = UTCNOW()
-    u = s.query(User).filter_by(tg_id=tg_id).first()
-    if not u:
-        return None
-    sub = (
-        s.query(Subscription)
-        .filter(Subscription.user_id == u.id, Subscription.end_at >= now)
-        .order_by(Subscription.end_at.desc())
-        .first()
-    )
-    return sub.end_at if sub else None
-
-
 def is_active(s, tg_id: int) -> bool:
-    return active_until(s, tg_id) is not None
-
-
-def has_used_trial(s, tg_id: int) -> bool:
+    now = datetime.utcnow()
     u = s.query(User).filter_by(tg_id=tg_id).first()
-    if not u:
-        return False
-    return s.query(Subscription).filter(Subscription.user_id == u.id, Subscription.plan == "trial").first() is not None
-
+    if not u: return False
+    sub = (s.query(Subscription)
+           .filter(Subscription.user_id == u.id, Subscription.end_at >= now)
+           .order_by(Subscription.end_at.desc()).first())
+    return bool(sub)
 
 def start_trial(s, tg_id: int) -> bool:
-    """يبدأ تجربة مجانية إن لم يكن لديه تجربة سابقة."""
-    if has_used_trial(s, tg_id):
-        return False
+    """يحاول تفعيل تجربة مجانية لمرة واحدة. يرجع True إذا فُعِّلت الآن، False إذا سبق استخدامها."""
     u = get_or_create_user(s, tg_id)
-    now = UTCNOW()
-    s.add(
-        Subscription(
-            user_id=u.id,
-            start_at=now,
-            end_at=now + timedelta(days=TRIAL_DAYS),
-            plan="trial"
-        )
-    )
+    # رفض لو سبق أخذ تجربة مجانية
+    existed = s.query(Subscription).filter(Subscription.user_id == u.id, Subscription.plan == "trial").first()
+    if existed:
+        return False
+    now = datetime.utcnow()
+    s.add(Subscription(user_id=u.id, start_at=now, end_at=now + timedelta(days=TRIAL_DAYS), plan="trial"))
     return True
 
-
 def approve_paid(s, tg_id: int, plan: str, duration: timedelta, tx_hash: Optional[str] = None):
-    """يمدّد من نهاية الاشتراك النشط إن وجد، وإلّا يبدأ من الآن."""
+    """يسجّل اشتراكًا مدفوعًا ويعيد end_at لاستخدامه في الرسائل."""
     u = get_or_create_user(s, tg_id)
-    now = UTCNOW()
-    current_end = active_until(s, tg_id)
-    start_at = now if current_end is None or current_end < now else current_end
-    end_at = start_at + duration
-    s.add(
-        Subscription(
-            user_id=u.id,
-            start_at=start_at,
-            end_at=end_at,
-            plan=plan,
-            tx_hash=tx_hash
-        )
-    )
+    now = datetime.utcnow()
+    end_at = now + duration
+    s.add(Subscription(user_id=u.id, start_at=now, end_at=end_at, plan=plan, tx_hash=tx_hash))
     return end_at
 
-
-# -------------------------------------------------
-# Trade helpers
-# -------------------------------------------------
+# Trades helpers
 def count_open_trades(s) -> int:
-    return int(s.query(func.count(Trade.id)).filter(Trade.is_open.is_(True)).scalar() or 0)
-
+    return s.query(func.count(Trade.id)).filter(Trade.is_open == True).scalar() or 0
 
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> Trade:
     t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2)
-    s.add(t)
-    s.flush()
-    return t
-
-
-def close_trade(s, trade_id: int, reason: str, close_price: Optional[float] = None) -> Optional[Trade]:
-    t = s.query(Trade).filter(Trade.id == trade_id, Trade.is_open.is_(True)).first()
-    if not t:
-        return None
-    t.is_open = False
-    t.closed_at = UTCNOW()
-    if close_price is not None:
-        pass
-    t.close_reason = reason
-    s.flush()
+    s.add(t); s.flush()
     return t
