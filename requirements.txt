@@ -1,5 +1,6 @@
-apscheduler
+aiogram==3.10.0
+ccxt==4.3.85
+SQLAlchemy==2.0.32
 pytz
-SQLAlchemy
-psycopg2-binary
-python-dotenv
+requests
+pandas
