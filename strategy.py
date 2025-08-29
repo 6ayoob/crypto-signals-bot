@@ -1,9 +1,34 @@
-# strategy.py — توليد إشارة BUY بهدفين قريبين + SL
+# strategy.py — إشارة BUY محسّنة: اتجاه + زخم + حجم + ATR + S/R + أهداف 0.6R/1.0R/2.0R
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 import pandas as pd
 
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
+# ===== إعدادات عامة =====
+EMA_FAST, EMA_SLOW, EMA_TREND = 9, 21, 50
+RSI_MIN, RSI_MAX = 50, 70
+SR_WINDOW = 50
+RESISTANCE_BUFFER = 0.005   # 0.5% تحت المقاومة نرفض الدخول
+SUPPORT_BUFFER    = 0.002   # 0.2% فوق الدعم نرفض الدخول
+VOL_MA = 20
+
+ATR_PERIOD   = 14
+ATR_SL_MULT  = 1.5
+R_MULT_TP    = 2.0
+
+# سلّم أهداف أقرب
+P1_R = 0.6      # TP1 = entry + 0.6R
+P2_R = 1.0      # TP2 = entry + 1.0R
+
+# حدود دنيا/قصوى لمسافة SL (كنسبة من الدخول)
+MIN_SL_PCT = 0.006   # 0.6% حد أدنى
+MAX_SL_PCT = 0.04    # 4%  حد أقصى — لو أكبر: نتجاهل الإشارة
+
+# لمنع إعادة الإشارة على نفس الشمعة
+_LAST_ENTRY_BAR_TS = {}
+
+# ===== مؤشرات =====
+def ema(series, period): 
+    return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
     d = series.diff()
@@ -14,54 +39,133 @@ def rsi(series, period=14):
     rs = ag / al
     return 100 - (100 / (1 + rs))
 
-def macd(df, fast=12, slow=26, signal=9):
+def macd_cols(df, fast=12, slow=26, signal=9):
     df["ema_fast"] = ema(df["close"], fast)
     df["ema_slow"] = ema(df["close"], slow)
     df["macd"] = df["ema_fast"] - df["ema_slow"]
     df["macd_signal"] = df["macd"].ewm(span=signal, adjust=False).mean()
     return df
 
-def indicators(df):
-    df["ema9"] = ema(df["close"], 9)
-    df["ema21"] = ema(df["close"], 21)
-    df["ema50"] = ema(df["close"], 50)
-    df["rsi"] = rsi(df["close"], 14)
-    return macd(df)
+def atr_series(df, period=14):
+    c = df["close"].shift(1)
+    tr = pd.concat([(df["high"]-df["low"]).abs(), (df["high"]-c).abs(), (df["low"]-c).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def get_sr(df, window=50):
-    if len(df) < 5: return None, None
-    prev = df.iloc[:-1]
-    w = min(window, len(prev))
-    res = prev["high"].rolling(w).max().iloc[-1]
-    sup = prev["low"].rolling(w).min().iloc[-1]
-    return sup, res
+def add_indicators(df):
+    df["ema9"]  = ema(df["close"], EMA_FAST)
+    df["ema21"] = ema(df["close"], EMA_SLOW)
+    df["ema50"] = ema(df["close"], EMA_TREND)
+    df["rsi"]   = rsi(df["close"], 14)
+    df["vol_ma20"] = df["volume"].rolling(VOL_MA).mean()
+    df = macd_cols(df)
+    df["atr"] = atr_series(df, ATR_PERIOD)
+    return df
 
-def check_signal(symbol: str, ohlcv: list) -> Dict | None:
-    """يعيد dict للإشارة أو None"""
-    if not ohlcv or len(ohlcv) < 60: return None
-    import pandas as pd
-    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
-    df = indicators(df)
-    last, prev = df.iloc[-1], df.iloc[-2]
-    price = float(last["close"])
+def get_sr_on_closed(df, window=50):
+    """حساب دعم/مقاومة باستخدام البيانات حتى الشمعة المغلقة (استثناء آخر صف تشكُّل)."""
+    if len(df) < window + 3:
+        return None, None
+    df_prev = df.iloc[:-1]  # استبعد الشمعة قيد التشكل
+    w = min(window, len(df_prev))
+    resistance = df_prev["high"].rolling(w).max().iloc[-1]
+    support    = df_prev["low"].rolling(w).min().iloc[-1]
+    return support, resistance
 
-    # فلاتر
-    if price < last["ema50"]: return None              # اتجاه صاعد
-    if not (50 < last["rsi"] < 70): return None        # زخم مقبول
-    sup, res = get_sr(df)
+# ===== الإشارة =====
+def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[list]] = None) -> Optional[Dict]:
+    """
+    يعيد dict بالإشارة (BUY) أو None.
+    ohlcv_5m: لائحة [ts, open, high, low, close, volume]
+    ohlcv_15m: (اختياري) لتأكيد تعدد الأطر: إغلاق > EMA50 على 15m
+    """
+    if not ohlcv_5m or len(ohlcv_5m) < 80:
+        return None
+
+    df = pd.DataFrame(ohlcv_5m, columns=["timestamp","open","high","low","close","volume"])
+    df = add_indicators(df)
+    if len(df) < 60:
+        return None
+
+    # استخدم آخر شمعة مُغلقة فقط
+    prev   = df.iloc[-3]
+    closed = df.iloc[-2]   # الشمعة المكتملة
+    last_ts_closed = int(closed["timestamp"])
+
+    # منع التكرار على نفس الشمعة
+    if _LAST_ENTRY_BAR_TS.get(symbol) == last_ts_closed:
+        return None
+
+    price = float(closed["close"])
+
+    # فلاتر الاتجاه/الزخم/الحجم
+    if price < closed["ema50"]: 
+        return None
+    if not (RSI_MIN < closed["rsi"] < RSI_MAX):
+        return None
+    if not pd.isna(closed["vol_ma20"]) and closed["volume"] < closed["vol_ma20"]:
+        return None
+    if closed["close"] <= closed["open"]:
+        return None
+
+    # دعم/مقاومة
+    sup, res = get_sr_on_closed(df, SR_WINDOW)
     if sup and res:
-        if price >= res * 0.995 or price <= sup * 1.002:  # بعيد عن مناطق ضغط
+        if price >= res * (1 - RESISTANCE_BUFFER): 
+            return None
+        if price <= sup * (1 + SUPPORT_BUFFER):    
             return None
 
-    # تقاطع + MACD
-    if prev["ema9"] < prev["ema21"] and last["ema9"] > last["ema21"] and last["macd"] > last["macd_signal"]:
-        sl = float(df["low"].rolling(10).min().iloc[-2])
-        tp1 = price + (price - sl) * 0.8   # هدف قريب 1
-        tp2 = price + (price - sl) * 1.6   # هدف قريب 2
-        return {
-            "symbol": symbol, "side": "BUY",
-            "entry": round(price, 6), "sl": round(sl, 6),
-            "tp1": round(tp1, 6), "tp2": round(tp2, 6),
-            "timestamp": datetime.utcnow().isoformat()
-        }
-    return None
+    # تقاطع EMA + MACD
+    crossed = (prev["ema9"] < prev["ema21"]) and (closed["ema9"] > closed["ema21"])
+    macd_ok = closed["macd"] > closed["macd_signal"]
+    if not (crossed and macd_ok):
+        return None
+
+    # تعدد الأطر (اختياري)
+    if ohlcv_15m:
+        df15 = pd.DataFrame(ohlcv_15m, columns=["timestamp","open","high","low","close","volume"])
+        if len(df15) >= 60:
+            df15["ema50"] = ema(df15["close"], EMA_TREND)
+            if df15.iloc[-2]["close"] < df15.iloc[-2]["ema50"]:
+                return None
+
+    # حساب ATR ووقف هجين (الأبعد)
+    atr = float(df["atr"].iloc[-2])
+    # قاع تأرجح من آخر 10 شمعات قبل الشمعة المغلقة
+    swing_low = float(df.iloc[:-1]["low"].rolling(10).min().iloc[-1])
+
+    sl_atr = price - ATR_SL_MULT * atr
+    sl_hybrid = min(sl_atr, swing_low)  # للأوامر الطويلة: الأبعد يكون أقل سعر
+
+    # حدود دنيا/قصوى لمسافة SL
+    dist_pct = (price - sl_hybrid) / max(price, 1e-9)
+    if dist_pct < MIN_SL_PCT:
+        sl_hybrid = price * (1 - MIN_SL_PCT)
+    elif dist_pct > MAX_SL_PCT:
+        return None  # الوقف بعيد جدًا — نتجنب الصفقة
+
+    sl = float(sl_hybrid)
+    R  = price - sl
+    if R <= 0:
+        return None
+
+    # أهداف
+    tp1 = price + P1_R * R
+    tp2 = price + P2_R * R
+    tp_final = price + R_MULT_TP * R  # إن أحببت استخدامه في الإدارة
+
+    # وسم الشمعة كي لا نكرر الإشارة عليها
+    _LAST_ENTRY_BAR_TS[symbol] = last_ts_closed
+
+    return {
+        "symbol": symbol,
+        "side": "BUY",
+        "entry": round(price, 6),
+        "sl":    round(sl, 6),
+        "tp1":   round(tp1, 6),
+        "tp2":   round(tp2, 6),
+        "tp_final": round(tp_final, 6),
+        "atr":   round(atr, 6),
+        "r":     round(R, 6),
+        "timestamp": datetime.utcnow().isoformat()
+    }
