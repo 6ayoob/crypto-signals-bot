@@ -66,6 +66,6 @@ def count_open_trades(session):
     return session.query(Trade).count()
 
 def add_trade(session, symbol, side, entry, sl, tp1, tp2):
-    t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2)
+    t = Trade(symbol=symbol, side=side, entry=str(entry), sl=str(sl), tp1=str(tp1), tp2=str(tp2))
     session.add(t)
     session.commit()
