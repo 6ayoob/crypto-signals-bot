@@ -1,4 +1,3 @@
-# database.py
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
@@ -30,13 +29,12 @@ def init_db():
 def get_session():
     return SessionLocal()
 
-# ---------------------------
-# عمليات الاشتراك
-# ---------------------------
+# ✅ اشتراك فعال؟
 def is_active(session, user_id):
     sub = session.get(Subscription, user_id)
     return bool(sub and sub.end_at > datetime.utcnow())
 
+# ✅ تجربة مجانية يوم واحد
 def start_trial(session, user_id):
     sub = session.get(Subscription, user_id)
     if sub and sub.trial_used:
@@ -51,6 +49,7 @@ def start_trial(session, user_id):
     session.commit()
     return True
 
+# ✅ تفعيل مدفوع
 def approve_paid(session, user_id, plan, duration, tx_hash=None):
     end_at = datetime.utcnow() + timedelta(days=duration)
     sub = session.get(Subscription, user_id)
@@ -62,9 +61,7 @@ def approve_paid(session, user_id, plan, duration, tx_hash=None):
     session.commit()
     return end_at
 
-# ---------------------------
-# الصفقات
-# ---------------------------
+# ✅ الصفقات
 def count_open_trades(session):
     return session.query(Trade).count()
 
