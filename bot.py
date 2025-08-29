@@ -1,5 +1,4 @@
-# bot.py — مشغّل البوت
-
+# bot.py — مشغّل البوت (OKX + فلترة الرموز المدعومة)
 import asyncio
 import logging
 import ccxt
@@ -9,7 +8,6 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from datetime import datetime, timedelta
 import pytz
-
 
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS, USDT_TRC20_WALLET,
@@ -36,7 +34,31 @@ logging.getLogger("aiogram").setLevel(logging.INFO)
 # ---------------------------
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-exchange = ccxt.bybit({"enableRateLimit": True})
+
+# ✅ استخدم OKX Spot وتفعيل rate limit
+exchange = ccxt.okx({
+    "enableRateLimit": True,
+    "options": {"defaultType": "spot"}
+})
+
+ACTIVE_SYMBOLS = []  # سيتم ملؤها بالمدعوم فعلاً من OKX
+
+async def init_exchange_and_symbols():
+    """
+    تحميل ماركت OKX وتصفية SYMBOLS إلى الرموز المدعومة فعلاً بصيغة CCXT الموحدة مثل BTC/USDT.
+    """
+    loop = asyncio.get_event_loop()
+    markets = await loop.run_in_executor(None, exchange.load_markets)
+    supported = set(markets.keys())
+    ok, skipped = [], []
+    for s in SYMBOLS:
+        if s in supported:
+            ok.append(s)
+        else:
+            skipped.append(s)
+    global ACTIVE_SYMBOLS
+    ACTIVE_SYMBOLS = ok
+    logger.info(f"OKX markets loaded. Using {len(ok)} symbols, skipped {len(skipped)}: {skipped[:12]}")
 
 # ---------------------------
 # أدوات مساعدة
@@ -49,18 +71,21 @@ async def send_channel(text: str):
         logger.error(f"send_channel error: {e}")
 
 async def welcome_text() -> str:
-    """نص ترحيبي مختصر"""
+    """نص ترحيبي جذاب"""
     return (
-        "👋 أهلاً بك في عالم الفرص 🚀\n\n"
-        "🔔 إشارات لحظية مدعومة باستراتيجية احترافية\n"
+        "👋 أهلاً وسهلاً بك في *بوت الإشارات الاحترافية* 🚀\n\n"
+        "💡 *ماذا ستحصل معنا؟*\n"
+        "━━━━━━━━━━━━━━\n"
+        "🔔 إشارات فورية مبنية على استراتيجية دقيقة\n"
         f"📊 تقرير يومي الساعة {DAILY_REPORT_HOUR_LOCAL} صباحًا (بتوقيت السعودية)\n"
-        f"⏱ حد أقصى {MAX_OPEN_TRADES} صفقات مفتوحة\n"
-        "💰 إدارة مخاطرة صارمة\n\n"
-        "خطط الاشتراك:\n"
-        f"• أسبوعان: {PRICE_2_WEEKS_USD}$\n"
-        f"• 4 أسابيع: {PRICE_4_WEEKS_USD}$\n"
-        f"(USDT TRC20): `{USDT_TRC20_WALLET}`\n\n"
-        "✨ جرّبنا مجانًا لمدة يوم واحد بالضغط على الزر."
+        "💰 إدارة صارمة لرأس المال وتقليل المخاطر\n"
+        "📈 فرص حقيقية مدروسة بعناية\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "💎 *خطط الاشتراك:*\n"
+        f"▫️ أسبوعان: *{PRICE_2_WEEKS_USD}$*\n"
+        f"▫️ 4 أسابيع: *{PRICE_4_WEEKS_USD}$*\n"
+        f"📥 عنوان الدفع (USDT TRC20):\n`{USDT_TRC20_WALLET}`\n\n"
+        "🎁 *هدية خاصة*: تجربة مجانية لمدة *يوم واحد* — ابدأها الآن بالضغط على الزر 👇"
     )
 
 # ---------------------------
@@ -177,10 +202,13 @@ async def fetch_ohlcv(symbol: str, timeframe="5m", limit=150):
 
 async def scan_and_dispatch():
     """
-    يفحص كل الرموز، يطبق الاستراتيجية، ويرسل الإشارات فورًا للقناة.
-    يسجل الصفقات في DB (اختياري الآن للمتابعة لاحقًا).
+    يفحص الرموز المدعومة، يطبق الاستراتيجية، ويرسل الإشارات فورًا للقناة.
     """
-    for sym in SYMBOLS:
+    if not ACTIVE_SYMBOLS:
+        logger.warning("No ACTIVE_SYMBOLS yet; skipping scan cycle.")
+        return
+
+    for sym in ACTIVE_SYMBOLS:
         data = await fetch_ohlcv(sym)
         sig = check_signal(sym, data)
         if sig:
@@ -201,8 +229,7 @@ async def scan_and_dispatch():
             )
             await send_channel(text)
             logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']}")
-
-        await asyncio.sleep(0.4)  # تهدئة لتجنب rate limits
+        await asyncio.sleep(0.35)  # تهدئة لتجنب rate limits
 
 async def loop_signals():
     """حلقة فحص الإشارات (كل 5 دقائق)."""
@@ -219,7 +246,6 @@ async def loop_signals():
 async def daily_report_loop():
     """
     يرسل تقريرًا يوميًا بسيطًا الساعة المحددة (بتوقيت الرياض).
-    يمكنك ربطه لاحقًا ببيانات الأداء/الصفقات من DB.
     """
     tz = pytz.timezone(TIMEZONE)
     while True:
@@ -250,15 +276,15 @@ async def main():
     init_db()
     logger.info("DB initialized.")
 
-    # حذف أي Webhook لأننا نستعمل polling
+    # ✅ حذف الويبهوك بالطريقة الصحيحة مع aiogram v3
     try:
-        await bot.session.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-            params={"drop_pending_updates": "true"}
-        )
+        await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
     except Exception as e:
         logger.warning(f"DELETE_WEBHOOK WARN: {e}")
+
+    # ✅ تحميل أسواق OKX وتصفية الرموز
+    await init_exchange_and_symbols()
 
     # إشعار بدء التشغيل للأدمن
     for admin_id in ADMIN_USER_IDS:
@@ -267,7 +293,7 @@ async def main():
         except Exception as e:
             logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
-    # نطلق 3 مهام متوازية:
+    # ملاحظة: تأكد من عدم تشغيل نسخة أخرى من نفس التوكن لتفادي TelegramConflictError
     t1 = asyncio.create_task(dp.start_polling(bot))
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
