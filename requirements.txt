@@ -4,3 +4,4 @@ SQLAlchemy==2.0.32
 pytz
 requests
 pandas
+psycopg2-binary==2.9.9
