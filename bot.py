@@ -1,4 +1,4 @@
-# bot.py — مشغّل البوت (OKX + فلترة الرموز + فحص القناة/الأدمن + أوامر مساعدة)
+# bot.py — مشغّل البوت (OKX + فلترة الرموز + فحص التوكن/القناة/الأدمن + أوامر مساعدة/إدارية)
 import asyncio
 import logging
 import ccxt
@@ -42,17 +42,30 @@ exchange = ccxt.okx({
 })
 
 ACTIVE_SYMBOLS = []  # سيتم ملؤها بالمدعوم فعلاً من OKX
+CHANNEL_TARGET = TELEGRAM_CHANNEL_ID  # قد يكون int -100... أو '@username' حسب الإعداد
 
 # ---------------------------
 # أدوات مساعدة
 # ---------------------------
 def user_is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
+    try:
+        return int(user_id) in [int(x) for x in ADMIN_USER_IDS]
+    except Exception:
+        return False
+
+async def assert_token_ok():
+    """فحص صحة توكن البوت مبكرًا (يعطي خطأ واضح لو غير صالح)."""
+    try:
+        me = await bot.get_me()
+        logger.info(f"BOT OK: @{me.username} (id={me.id})")
+    except Exception as e:
+        logger.critical(f"BAD BOT TOKEN (Unauthorized?): {e}")
+        raise SystemExit(1)
 
 async def send_channel(text: str):
     """إرسال رسالة إلى قناة الإشارات"""
     try:
-        await bot.send_message(TELEGRAM_CHANNEL_ID, text)
+        await bot.send_message(CHANNEL_TARGET, text)
     except Exception as e:
         logger.error(f"send_channel error: {e}")
 
@@ -87,7 +100,9 @@ def help_text(is_admin: bool) -> str:
     admin = (
         "━━━━━━━━━━━━━━\n"
         "🛡 *أوامر الأدمن*\n"
-        "*/approve <user_id> <2w|4w> [tx_hash]* — تفعيل اشتراك يدوي"
+        "*/approve <user_id> <2w|4w> [tx_hash]* — تفعيل اشتراك يدوي\n"
+        "*/ping_channel* — اختبار إرسال رسالة للقناة\n"
+        "*/broadcast <النص>* — إرسال رسالة للقناة"
     )
     return base + (admin if is_admin else "")
 
@@ -117,7 +132,7 @@ async def init_exchange_and_symbols():
 async def validate_targets():
     # فحص القناة
     try:
-        chat = await bot.get_chat(TELEGRAM_CHANNEL_ID)
+        chat = await bot.get_chat(CHANNEL_TARGET)
         await bot.send_message(chat.id, "🔧 تم الربط مع القناة بنجاح.")
         logger.info(f"CHANNEL OK: {chat.id} / {getattr(chat, 'title', '')}")
     except Exception as e:
@@ -219,7 +234,7 @@ async def cmd_submit(m: Message):
 # ---------------------------
 @dp.message(Command("approve"))
 async def cmd_approve(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
+    if not user_is_admin(m.from_user.id):
         return await m.answer("غير مصرح")
     parts = m.text.strip().split()
     if len(parts) not in (3, 4):
@@ -237,6 +252,23 @@ async def cmd_approve(m: Message):
         await bot.send_message(uid, "✅ تم تفعيل اشتراكك. مرحبًا بك!")
     except Exception as e:
         logger.warning(f"USER DM ERROR: {e}")
+
+@dp.message(Command("ping_channel"))
+async def ping_channel(m: Message):
+    if not user_is_admin(m.from_user.id):
+        return await m.answer("غير مصرح")
+    await send_channel("✅ اختبار: اتصال القناة يعمل!")
+    await m.answer("تم إرسال رسالة اختبار للقناة.")
+
+@dp.message(Command("broadcast"))
+async def broadcast(m: Message):
+    if not user_is_admin(m.from_user.id):
+        return await m.answer("غير مصرح")
+    text = m.text.partition(' ')[2].strip()
+    if not text:
+        return await m.answer("استخدم: /broadcast <النص>")
+    await send_channel(text)
+    await m.answer("تم الإرسال إلى القناة ✅")
 
 # ---------------------------
 # فحص الشموع/الإشارات
@@ -327,7 +359,10 @@ async def main():
     init_db()
     logger.info("DB initialized.")
 
-    # ✅ حذف الويبهوك بالطريقة الصحيحة مع aiogram v3
+    # ✅ فحص التوكن مبكرًا
+    await assert_token_ok()
+
+    # ✅ حذف الويبهوك بالطريقة الصحيحة (نستخدم polling)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
