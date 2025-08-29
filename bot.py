@@ -1,4 +1,4 @@
-# bot.py — مشغّل البوت كخدمة Background Worker على Render (مع Logging)
+# bot.py — مشغّل البوت
 
 import asyncio
 import logging
@@ -9,6 +9,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from datetime import datetime, timedelta
 import pytz
+
 
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS, USDT_TRC20_WALLET,
