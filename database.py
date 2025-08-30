@@ -19,7 +19,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 # ---------------------------
 def _normalize_db_url(url: str) -> str:
     if url.startswith("postgres://"):
-        # SQLAlchemy يفضّل postgresql+psycopg2
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     return url
 
@@ -40,23 +39,22 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)  # نجعلها موجودة دائمًا؛ فريدة منطقيًا
+    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)
     trial_used = Column(Boolean, default=False, nullable=False)
-    end_at = Column(DateTime, nullable=True)       # تاريخ انتهاء الاشتراك/التجربة (UTC)
-    plan = Column(String(8), nullable=True)        # "2w" | "4w"
-    last_tx_hash = Column(String(128), nullable=True)  # رقم المرجع/هاش آخر دفعة
+    end_at = Column(DateTime, nullable=True)             # UTC
+    plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w"
+    last_tx_hash = Column(String(128), nullable=True)    # رقم المرجع/Tx
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
 
 class Trade(Base):
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(20), index=True, nullable=False)
-    side = Column(String(4), nullable=False)  # "BUY"
+    side = Column(String(4), nullable=False)   # "BUY"
     entry = Column(Float, nullable=False)
-    sl = Column(Float, nullable=False)
-    tp1 = Column(Float, nullable=False)
-    tp2 = Column(Float, nullable=False)
+    sl    = Column(Float, nullable=False)
+    tp1   = Column(Float, nullable=False)
+    tp2   = Column(Float, nullable=False)
     status = Column(String(8), default="open", index=True, nullable=False)  # open | closed
     result = Column(String(8), nullable=True)  # tp1 | tp2 | sl
     opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -71,10 +69,10 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
         mapping_pg = {
             "tg_user_id": "BIGINT",
             "trial_used": "BOOLEAN DEFAULT FALSE",
-            "end_at": "TIMESTAMP",
+            "end_at": "TIMESTAMPTZ",
             "plan": "VARCHAR(8)",
             "last_tx_hash": "VARCHAR(128)",
-            "created_at": "TIMESTAMP"
+            "created_at": "TIMESTAMPTZ DEFAULT NOW()"
         }
         mapping_sq = {
             "tg_user_id": "BIGINT",
@@ -88,15 +86,20 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
     elif table == "trades":
         mapping_pg = {
             "result": "VARCHAR(8)",
-            "closed_at": "TIMESTAMP",
+            "opened_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "closed_at": "TIMESTAMPTZ",
+            "status": "VARCHAR(8) NOT NULL DEFAULT 'open'"
         }
         mapping_sq = {
             "result": "VARCHAR(8)",
+            "opened_at": "TIMESTAMP",
             "closed_at": "TIMESTAMP",
+            "status": "VARCHAR(8)"
         }
         typ = mapping_pg[col] if dialect == "postgresql" else mapping_sq[col]
     else:
         typ = "TEXT"
+
     if dialect == "postgresql":
         return f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {typ};'
     # SQLite لا يدعم IF NOT EXISTS للأعمدة
@@ -104,9 +107,9 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
 
 def _ensure_indexes(connection, dialect: str):
     if dialect == "postgresql":
-        # فهرس/فريد على tg_user_id لتسريع الاستعلام (قد يفشل إذا توجد قيم NULL كثيرة)
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
-        # عدم فرض UNIQUE لتفادي فشل الهجرة على قواعد قديمة بها صفوف بدون tg_user_id
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
 
 def _lightweight_migrate():
     insp = inspect(engine)
@@ -128,7 +131,7 @@ def _lightweight_migrate():
 
         # trades
         cols_trades = {c["name"] for c in insp.get_columns("trades")}
-        required_trades = ["result", "closed_at"]
+        required_trades = ["result", "opened_at", "closed_at", "status"]
         for c in required_trades:
             if c not in cols_trades:
                 try:
@@ -186,15 +189,10 @@ def is_active(s, tg_user_id: int) -> bool:
     return u.end_at > _utcnow()
 
 def start_trial(s, tg_user_id: int) -> bool:
-    """
-    تفعيل تجربة يوم واحد لمرة واحدة فقط.
-    إن كانت مستخدمة سابقًا يُرجع False.
-    """
     u = _get_or_create_user(s, tg_user_id)
     if u.trial_used:
         return False
     u.trial_used = True
-    # يمكن جعلها لا تمتد إن كان لديه اشتراك نشط؛ هنا نمدد يومًا من الآن أو من نهاية الاشتراك
     base = _utcnow()
     if u.end_at and u.end_at > base:
         base = u.end_at
@@ -203,10 +201,6 @@ def start_trial(s, tg_user_id: int) -> bool:
     return True
 
 def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str | None = None) -> datetime:
-    """
-    تأكيد دفع المستخدم وتمديد الاشتراك.
-    يرجع تاريخ الانتهاء الجديد (UTC).
-    """
     u = _get_or_create_user(s, tg_user_id)
     now = _utcnow()
     base = u.end_at if (u.end_at and u.end_at > now) else now
@@ -221,10 +215,7 @@ def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str
 # وظائف الصفقات
 # ---------------------------
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> int:
-    t = Trade(
-        symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-        status="open"
-    )
+    t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2, status="open")
     s.add(t)
     s.flush()
     return t.id
@@ -233,9 +224,6 @@ def count_open_trades(s) -> int:
     return s.execute(select(func.count(Trade.id)).where(Trade.status == "open")).scalar() or 0
 
 def close_trade(s, trade_id: int, result: str):
-    """
-    إغلاق صفقة وتسجيل النتيجة: 'tp1' | 'tp2' | 'sl'
-    """
     t = s.get(Trade, trade_id)
     if not t:
         return
@@ -244,11 +232,15 @@ def close_trade(s, trade_id: int, result: str):
     t.closed_at = _utcnow()
     s.flush()
 
+def list_active_user_ids(s) -> list[int]:
+    now = _utcnow()
+    rows = s.execute(select(User.tg_user_id).where(User.end_at != None, User.end_at > now)).all()
+    return [r[0] for r in rows if r[0]]
+
 # ---------------------------
 # إحصائيات التقارير
 # ---------------------------
 def _period_stats(s, since: datetime) -> dict:
-    # إشارات (عدد الصفقات المفتوحة خلال الفترة)
     signals = s.execute(
         select(func.count(Trade.id)).where(Trade.opened_at >= since)
     ).scalar() or 0
@@ -257,7 +249,6 @@ def _period_stats(s, since: datetime) -> dict:
         select(func.count(Trade.id)).where(Trade.status == "open")
     ).scalar() or 0
 
-    # نتائج مغلقة خلال الفترة
     tp1 = s.execute(
         select(func.count(Trade.id)).where(Trade.result == "tp1", Trade.closed_at >= since)
     ).scalar() or 0
@@ -268,13 +259,12 @@ def _period_stats(s, since: datetime) -> dict:
         select(func.count(Trade.id)).where(Trade.result == "sl", Trade.closed_at >= since)
     ).scalar() or 0
 
-    # حساب R المحققة تقريبيًا لكل صفقة مغلقة خلال الفترة
     r_sum = 0.0
     closed_rows = s.execute(
         select(Trade).where(Trade.status == "closed", Trade.closed_at >= since)
     ).scalars().all()
     for t in closed_rows:
-        risk = max(t.entry - t.sl, 1e-9)  # للصفقة الطويلة
+        risk = max(t.entry - t.sl, 1e-9)
         if t.result == "tp1":
             r_sum += (t.tp1 - t.entry) / risk
         elif t.result == "tp2":
