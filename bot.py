@@ -1,15 +1,12 @@
-# bot.py — مشغّل البوت (نسخة محسّنة: OKX + "رقم المرجع" + HTML + فحص قناة/أدمن)
-
+# bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + دفع TRC20 (رقم المرجع TxID) + تقارير يومية + إشعارات إغلاق الصفقات
 import asyncio
 import logging
-import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from payments_tron import extract_txid, find_trc20_transfer_to_me, REFERENCE_HINT
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -18,295 +15,145 @@ from config import (
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
     PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD, SUB_DURATION_2W, SUB_DURATION_4W
 )
+
+# قاعدة البيانات + النماذج + دوال المساعدة
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
-    count_open_trades, add_trade
+    count_open_trades, add_trade, close_trade,
+    get_stats_24h, get_stats_7d, User, Trade
 )
+
+# الاستراتيجية + الرموز
 from strategy import check_signal
 from symbols import SYMBOLS
-from payments_tron import find_trc20_transfer_to_me
+
+# الدفع TRON (رقم المرجع TxID)
+from payments_tron import extract_txid, find_trc20_transfer_to_me, REFERENCE_HINT
 
 # ---------------------------
-# Logging
+# إعدادات عامة
 # ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
-# ---------------------------
-# تهيئة البوت والتبادل (OKX)
-# ---------------------------
-bot = Bot(token=TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# سنستخدم OKX بدلاً من Binance لتجنّب القيود الجغرافية
+# استخدم OKX بدلاً من Binance (حظر جغرافي)
 exchange = ccxt.okx({"enableRateLimit": True})
-OKX_SYMBOLS: list[str] = []  # سنملؤها بعد تحميل الأسواق
+AVAILABLE_SYMBOLS: list[str] = []
+
+SIGNAL_SCAN_INTERVAL_SEC = 300  # كل 5 دقائق
+MONITOR_INTERVAL_SEC = 15       # مراقبة الصفقات المفتوحة
+TIMEFRAME = "5m"
 
 # ---------------------------
 # أدوات مساعدة
 # ---------------------------
+def _h(s: str) -> str:
+    """هروب HTML بسيط."""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 async def send_channel(text: str):
-    """إرسال رسالة إلى قناة الإشارات"""
+    """إرسال رسالة إلى قناة الإشارات (HTML)."""
     try:
-        await bot.send_message(TELEGRAM_CHANNEL_ID, text)
+        await bot.send_message(TELEGRAM_CHANNEL_ID, text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"send_channel error: {e}")
 
-def format_usdt(addr: str) -> str:
-    if not addr:
-        return "<i>(لم يتم ضبط المحفظة في الإعدادات)</i>"
-    # عرض العنوان كاملاً داخل code
-    return f"<code>{addr}</code>"
-
-async def welcome_text() -> str:
-    """نص ترحيبي جذّاب (HTML)"""
-    return (
-        "👋 <b>مرحبًا بك في عالم الفرص</b> 🚀\n\n"
-        "🔔 إشارات لحظية مبنية على استراتيجية احترافية (اتجاه + زخم + حجم + ATR + S/R)\n"
-        f"📊 <b>تقرير يومي</b> الساعة <b>{DAILY_REPORT_HOUR_LOCAL}:00</b> (بتوقيت السعودية)\n"
-        f"⏱ حد أقصى <b>{MAX_OPEN_TRADES}</b> صفقات مفتوحة + إدارة مخاطرة صارمة\n\n"
-        "💎 <b>الاشتراك</b>:\n"
-        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>\n"
-        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n\n"
-        f"ادفع USDT (TRC20) إلى:\n{format_usdt(USDT_TRC20_WALLET)}\n\n"
-        "ثم أرسل للبوت <b>رقم المرجع</b> بهذا الشكل:\n"
-        "<code>/submit_ref رقم_المرجع 2w</code>\n\n"
-        "✨ جرّب يوم مجاني الآن بالضغط على الزر أدناه."
-    )
-
-async def check_channel_and_admin_on_boot():
-    # فحص القناة
-    try:
-        msg = await bot.send_message(TELEGRAM_CHANNEL_ID, "🤖 البوت متصل بالقناة.")
-        logger.info(f"CHANNEL OK: {TELEGRAM_CHANNEL_ID} / {msg.chat.title or 'channel'}")
-    except Exception as e:
-        logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
-    # فحص تواصل الأدمن
+async def send_admins(text: str):
     for admin_id in ADMIN_USER_IDS:
         try:
-            await bot.send_message(admin_id, "✅ إشعار: البوت بدأ العمل.")
-            logger.info(f"ADMIN DM OK: {admin_id}")
+            await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"ADMIN DM FAILED for {admin_id}: {e} — أرسل /start للبوت في الخاص وتحقق من الـ ID.")
+            logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
-async def load_okx_symbols():
-    """تحميل أسواق OKX وتقييد قائمة الرموز بما هو متاح فعلاً."""
-    global OKX_SYMBOLS
+def list_active_user_ids() -> list[int]:
+    """جلب كل المشتَرِكين النشطين (لإرسال تنبيهات DM اختيارياً)."""
     try:
-        loop = asyncio.get_event_loop()
-        markets = await loop.run_in_executor(None, exchange.load_markets)
-        available = set()
-        for sym in SYMBOLS:
-            if sym in exchange.markets:
-                m = exchange.markets[sym]
-                # نضمن أن الرمز سبوت ومفعّل
-                if m.get("spot") and (m.get("active") in (True, None)):
-                    available.add(sym)
-        OKX_SYMBOLS = sorted(available)
-        skipped = sorted(set(SYMBOLS) - available)
-        logger.info(f"OKX markets loaded. Using {len(OKX_SYMBOLS)} symbols, skipped {len(skipped)}: {skipped}")
-    except Exception as e:
-        logger.exception(f"LOAD OKX MARKETS ERROR: {e}")
-        OKX_SYMBOLS = []
-
-# ---------------------------
-# أوامر عامة للمستخدم
-# ---------------------------
-@dp.message(Command("start"))
-async def cmd_start(m: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🎁 ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
-    kb.button(text="💳 طريقة الاشتراك", callback_data="subscribe_info")
-    kb.button(text="💵 دفع وإرسال المرجع", callback_data="pay_now")
-    kb.adjust(1)
-    await m.answer(await welcome_text(), reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data == "start_trial")
-async def cb_trial(q: CallbackQuery):
-    with get_session() as s:
-        ok = start_trial(s, q.from_user.id)  # False لو سبق استخدم التجربة
-    if ok:
-        await q.message.edit_text(
-            "✅ <b>تم تفعيل التجربة المجانية</b> لمدة يوم واحد 🎁\n"
-            "ستصلك الإشارات والتقرير اليومي.",
-        )
-    else:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="💳 طريقة الاشتراك", callback_data="subscribe_info")
-        kb.adjust(1)
-        await q.message.edit_text(
-            "ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\nيمكنك الاشتراك عبر الزر أدناه.",
-            reply_markup=kb.as_markup(),
-        )
-    await q.answer()
-
-@dp.callback_query(F.data == "subscribe_info")
-async def cb_sub_info(q: CallbackQuery):
-    # نعيد استخدام نص الدفع المُحسّن
-    await cmd_pay(q.message)
-    await q.answer()
-
-@dp.callback_query(F.data == "pay_now")
-async def cb_pay_now(q: CallbackQuery):
-    await cmd_pay(q.message)
-    await q.answer()
-
-@dp.message(Command("pay", "subscribe"))
-async def cmd_pay(m: Message):
-    txt = (
-        "💎 <b>الاشتراك</b>\n"
-        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>\n"
-        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n\n"
-        f"حوّل <b>USDT (TRC20)</b> إلى:\n{format_usdt(USDT_TRC20_WALLET)}\n\n"
-        "ثم أرسل للبوت <b>رقم المرجع</b> بهذا الشكل:\n"
-        "<code>/submit_ref رقم_المرجع 2w</code>\n\n"
-        "أمثلة:\n"
-        "<code>/submit_ref 9f0a...c31 2w</code>\n"
-        "<code>/تأكيد_الدفع 9f0a...c31 4w</code>\n\n"
-        "ملاحظات سريعة:\n"
-        "• تأكد أن الشبكة TRC20.\n"
-        "• الفرق في الفاصلة/الرسوم لا يؤثر إذا كان المبلغ ≥ قيمة الخطة.\n"
-        "• إن تعذّر التحقق تلقائيًا سنراجع يدويًا سريعًا."
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🎁 ابدأ التجربة المجانية", callback_data="start_trial")
-    kb.adjust(1)
-    await m.answer(txt, reply_markup=kb.as_markup())
-
-@dp.message(Command("status"))
-async def cmd_status(m: Message):
-    with get_session() as s:
-        ok = is_active(s, m.from_user.id)
-    await m.answer("✅ اشتراكك <b>نشط</b>." if ok else "❌ لا تملك اشتراكًا نشطًا.")
-
-@dp.message(Command("help"))
-async def cmd_help(m: Message):
-    # لا نعرض أوامر الأدمن في Help العام
-    await m.answer(
-        "🆘 <b>مساعدة</b>\n"
-        "الأوامر المتاحة:\n"
-        "• <code>/start</code> — بدء واختيار التجربة/الاشتراك\n"
-        "• <code>/pay</code> — طريقة الدفع وإرسال المرجع\n"
-        "• <code>/submit_ref رقم_المرجع 2w|4w</code> — تأكيد الدفع\n"
-        "• <code>/status</code> — حالة الاشتراك\n"
-        "• <code>/help</code> — عرض هذه القائمة"
-    )
-
-# ---------------------------
-# هاندلر تأكيد الدفع (رقم المرجع)
-# ---------------------------
-PLAN_ALIASES = {
-    "2w": "2w", "14": "2w", "14d": "2w", "اسبوعين": "2w",
-    "4w": "4w", "28": "4w", "28d": "4w", "4اسابيع": "4w", "4أسابيع": "4w",
-}
-
-def looks_like_txid(s: str) -> bool:
-    # TRON txid عادة 64 hex، نسمح 32–100 احتياطاً
-    return bool(re.fullmatch(r"[A-Fa-f0-9]{32,100}", s))
-
-@dp.message(Command("submit_ref", "تأكيد_الدفع", "submit_tx", "ref"))
-async def cmd_submit(m: Message):
-    """
-    الاستخدام: /submit_ref <مرجع_التحويل> <2w|4w>
-    أمثلة: /submit_ref 9f0a...c31 2w  |  /تأكيد_الدفع 9f0a...c31 4w
-    """
-    parts = m.text.strip().split()
-    if len(parts) < 2:
-        return await m.answer(
-            "استخدم: <b>/submit_ref رقم_المرجع 2w|4w</b>\n"
-            "مثال: <code>/submit_ref 9f0a...c31 2w</code>"
-        )
-
-    txh = parts[1]
-    plan_raw = parts[2] if len(parts) >= 3 else None
-
-    if not looks_like_txid(txh):
-        return await m.answer(
-            "رقم المرجع غير واضح.\n"
-            "أرسل بالشكل: <code>/submit_ref 9f0a...c31 2w</code>"
-        )
-
-    if not plan_raw:
-        return await m.answer(
-            "حدد الخطة: <b>2w</b> أو <b>4w</b>.\n"
-            "مثال: <code>/submit_ref 9f0a...c31 4w</code>"
-        )
-
-    plan_key = PLAN_ALIASES.get(plan_raw.lower())
-    if plan_key not in ("2w", "4w"):
-        return await m.answer(
-            "خطة غير معروفة. استخدم 2w أو 4w.\n"
-            "مثال: <code>/submit_ref 9f0a...c31 2w</code>"
-        )
-
-    min_amount = PRICE_2_WEEKS_USD if plan_key == "2w" else PRICE_4_WEEKS_USD
-
-    ok, info = find_trc20_transfer_to_me(txh, min_amount)
-    if ok:
         with get_session() as s:
-            dur = SUB_DURATION_2W if plan_key == "2w" else SUB_DURATION_4W
-            end_at = approve_paid(s, m.from_user.id, plan_key, dur, tx_hash=txh)
-        return await m.answer(
-            f"✅ تم التحقق من <b>رقم المرجع</b> (<b>{info} USDT</b>) وتفعيل اشتراكك.\n"
-            f"⏳ صالح حتى: <b>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</b>"
-        )
+            now = datetime.now(timezone.utc)
+            rows = s.query(User.tg_user_id).filter(User.end_at != None, User.end_at > now).all()  # noqa: E711
+            return [r[0] for r in rows if r[0]]
+    except Exception as e:
+        logger.warning(f"list_active_user_ids warn: {e}")
+        return []
 
-    # فشل التحقق التلقائي — تنبيه للأدمن
-    alert = (
-        "🔔 طلب تفعيل (فشل تحقق تلقائي)\n"
-        f"User: {m.from_user.id}\nPlan: {plan_key}\nRef: {txh}\nReason: {info}"
-    )
-    for admin_id in ADMIN_USER_IDS:
+async def notify_subscribers(text: str):
+    """إشعار المشتركين (DM) + القناة."""
+    await send_channel(text)
+    uids = list_active_user_ids()
+    for uid in uids:
         try:
-            await bot.send_message(admin_id, alert)
+            await bot.send_message(uid, text, parse_mode="HTML")
+            await asyncio.sleep(0.02)  # تهدئة بسيطة
         except Exception:
             pass
 
-    await m.answer(
-        "❗ لم أستطع التحقق تلقائيًا من <b>رقم المرجع</b>.\n"
-        "سيتم مراجعته يدويًا قريبًا."
+async def welcome_text() -> str:
+    return (
+        "👋 أهلاً بك في <b>عالم الفرص</b> 🚀\n\n"
+        "🔔 إشارات لحظية مبنية على استراتيجية احترافية\n"
+        f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n"
+        "💰 إدارة مخاطر صارمة + حد صفقات نشطة محسوب\n\n"
+        "خطط الاشتراك:\n"
+        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>\n"
+        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        f"محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
+        "✨ جرّبنا مجانًا لمدة <b>يوم واحد</b> عبر الزر.\n"
+        "💳 بعد الدفع أرسل رقم المرجع (TxID) هكذا:\n"
+        "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>"
+    )
+
+def format_signal_text(sig: dict) -> str:
+    return (
+        "🚀 <b>إشارة جديدة [BUY]</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔹 العملة: <b>{_h(sig['symbol'])}</b>\n"
+        f"💵 الدخول: <code>{sig['entry']}</code>\n"
+        f"📉 وقف الخسارة: <code>{sig['sl']}</code>\n"
+        f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
+        f"🎯 الهدف 2: <code>{sig['tp2']}</code>\n"
+        f"⏰ الوقت (UTC): <code>{_h(sig['timestamp'])}</code>\n"
+        "━━━━━━━━━━━━━━\n⚡️ <i>تذكير: إدارة رأس المال واجبة قبل كل صفقة.</i>"
+    )
+
+def format_close_text(t: Trade) -> str:
+    emoji = {"tp1": "🎯", "tp2": "🏁", "sl": "🛑"}.get(t.result or "", "ℹ️")
+    result_label = {"tp1": "تحقق الهدف 1", "tp2": "تحقق الهدف 2", "sl": "ضرب وقف الخسارة"}.get(t.result or "", "إغلاق")
+    return (
+        f"{emoji} <b>تم إغلاق الصفقة</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔹 العملة: <b>{_h(t.symbol)}</b>\n"
+        f"💵 الدخول: <code>{t.entry}</code>\n"
+        f"📉 الوقف: <code>{t.sl}</code>\n"
+        f"🎯 TP1: <code>{t.tp1}</code> | 🎯 TP2: <code>{t.tp2}</code>\n"
+        f"📌 النتيجة: <b>{result_label}</b>\n"
+        f"⏰ الإغلاق (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>"
     )
 
 # ---------------------------
-# أوامر الإدارة (مخفية عن /help العام)
+# تبادل (OKX): تحميل الأسواق وتصفية الرموز غير المتاحة
 # ---------------------------
-@dp.message(Command("approve"))
-async def cmd_approve(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return await m.answer("غير مصرح")
-    parts = m.text.strip().split()
-    if len(parts) not in (3, 4):
-        return await m.answer("استخدم: <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [ref]</code>")
-
-    uid = int(parts[1])
-    plan = parts[2]
-    dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
-    txh = parts[3] if len(parts) == 4 else None
-
-    with get_session() as s:
-        end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
-    await m.answer(f"تم التفعيل للمستخدم <b>{uid}</b>. صالح حتى <b>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</b>.")
+async def load_okx_markets_and_filter():
+    global AVAILABLE_SYMBOLS
     try:
-        await bot.send_message(uid, "✅ تم تفعيل اشتراكك. مرحبًا بك!")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, exchange.load_markets)
+        mkts = set(exchange.markets.keys())
+        filtered = [s for s in SYMBOLS if s in mkts]
+        skipped = [s for s in SYMBOLS if s not in mkts]
+        AVAILABLE_SYMBOLS = filtered
+        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped {len(skipped)}: {skipped}")
     except Exception as e:
-        logger.warning(f"USER DM ERROR: {e}")
-
-@dp.message(Command("admin_help"))
-async def cmd_admin_help(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return await m.answer("غير مصرح")
-    await m.answer(
-        "👑 <b>أوامر الإدارة</b>\n"
-        "• <code>/approve user_id 2w|4w [ref]</code> — تفعيل يدوي\n"
-        "• (قريبًا) /broadcast — إرسال رسالة للمشتركين\n"
-        "• (قريبًا) /stats — ملخص أداء عام"
-    )
+        logger.exception(f"load_okx_markets error: {e}")
+        AVAILABLE_SYMBOLS = []
 
 # ---------------------------
-# فحص الشموع/الإشارات (OKX)
+# جلب البيانات/الأسعار
 # ---------------------------
-async def fetch_ohlcv(symbol: str, timeframe="5m", limit=150):
+async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=150):
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -316,33 +163,41 @@ async def fetch_ohlcv(symbol: str, timeframe="5m", limit=150):
         logger.warning(f"FETCH_OHLCV ERROR {symbol}: {e}")
         return []
 
+async def fetch_ticker_price(symbol: str) -> float | None:
+    try:
+        loop = asyncio.get_event_loop()
+        ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+        # نأخذ آخر سعر معروف
+        price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
+        return float(price) if price is not None else None
+    except Exception as e:
+        logger.warning(f"FETCH_TICKER ERROR {symbol}: {e}")
+        return None
+
+# ---------------------------
+# حلقة فحص الإشارات
+# ---------------------------
 async def scan_and_dispatch():
     """
-    يفحص الرموز المتاحة على OKX، يطبق الاستراتيجية، ويرسل الإشارات فورًا للقناة.
-    يسجل الصفقات في DB (لتوسعة الأداء لاحقًا).
+    يفحص كل الرموز، يطبق الاستراتيجية، ويرسل الإشارات فورًا للقناة (و/أو DM للمشتركين).
+    يسجل الصفقات في DB.
     """
-    syms = OKX_SYMBOLS or SYMBOLS
-    for sym in syms:
+    if not AVAILABLE_SYMBOLS:
+        return
+    for sym in AVAILABLE_SYMBOLS:
         data = await fetch_ohlcv(sym)
+        if not data:
+            await asyncio.sleep(0.15)
+            continue
         sig = check_signal(sym, data)
         if sig:
             with get_session() as s:
                 if count_open_trades(s) < MAX_OPEN_TRADES:
                     add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
-            text = (
-                "🚀 <b>إشارة جديدة [BUY]</b>\n"
-                "━━━━━━━━━━━━━━\n"
-                f"🔹 العملة: <b>{sig['symbol']}</b>\n"
-                f"💵 سعر الدخول: <b>{sig['entry']}</b>\n"
-                f"📉 وقف الخسارة: <b>{sig['sl']}</b>\n"
-                f"🎯 الهدف 1: <b>{sig['tp1']}</b>\n"
-                f"🎯 الهدف 2: <b>{sig['tp2']}</b>\n"
-                f"⏰ الوقت: <code>{sig['timestamp']}</code>\n"
-                "━━━━━━━━━━━━━━\n⚡️ إدارة رأس المال قبل كل صفقة."
-            )
-            await send_channel(text)
-            logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']}")
-        await asyncio.sleep(0.4)  # تهدئة لتجنب rate limits
+                    text = format_signal_text(sig)
+                    await send_channel(text)
+                    logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']}")
+        await asyncio.sleep(0.2)  # تهدئة لتجنب rate limits
 
 async def loop_signals():
     """حلقة فحص الإشارات (كل 5 دقائق)."""
@@ -351,19 +206,67 @@ async def loop_signals():
             await scan_and_dispatch()
         except Exception as e:
             logger.exception(f"SCAN_LOOP ERROR: {e}")
-        await asyncio.sleep(300)  # 5 دقائق
+        await asyncio.sleep(SIGNAL_SCAN_INTERVAL_SEC)
 
 # ---------------------------
-# التقرير اليومي (صيغة أجمل؛ مع fallback لو لم تتوفر إحصائيات DB)
+# مراقبة الصفقات المفتوحة وإغلاقها عند TP/SL
 # ---------------------------
-def _fmt_time(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d")
+async def monitor_open_trades():
+    """
+    مراقبة مستمرة للصفقات المفتوحة:
+    - إذا وصل السعر إلى TP2: نغلق على TP2
+    - وإلا إذا وصل TP1: نغلق على TP1
+    - وإذا كسر SL: نغلق على SL
+    """
+    while True:
+        try:
+            with get_session() as s:
+                open_trades = s.query(Trade).filter(Trade.status == "open").all()
+                for t in open_trades:
+                    price = await fetch_ticker_price(t.symbol)
+                    if price is None:
+                        continue
+                    hit_tp2 = price >= t.tp2
+                    hit_tp1 = price >= t.tp1
+                    hit_sl = price <= t.sl
+                    result = None
+                    if hit_tp2:
+                        result = "tp2"
+                    elif hit_tp1:
+                        result = "tp1"
+                    elif hit_sl:
+                        result = "sl"
+
+                    if result:
+                        close_trade(s, t.id, result)
+                        await notify_subscribers(format_close_text(t))
+                        await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.exception(f"MONITOR ERROR: {e}")
+        await asyncio.sleep(MONITOR_INTERVAL_SEC)
+
+# ---------------------------
+# التقرير اليومي
+# ---------------------------
+def _report_card(stats_24: dict, stats_7d: dict) -> str:
+    return (
+        "📊 <b>التقرير اليومي</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>آخر 24 ساعة</b>\n"
+        f"• إشارات: <b>{stats_24['signals']}</b> | صفقات مفتوحة الآن: <b>{stats_24['open']}</b>\n"
+        f"• أهداف محققة: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})\n"
+        f"• وقف خسارة: <b>{stats_24['sl']}</b>\n"
+        f"• معدل نجاح: <b>{stats_24['win_rate']}%</b>\n"
+        f"• صافي R تقريبي: <b>{stats_24['r_sum']}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>آخر 7 أيام</b>\n"
+        f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف محققة: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>\n"
+        f"• معدل نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "⚡️ <i>انضم للتجربة المجانية ليوم واحد وراقب الأداء بنفسك.</i>"
+    )
 
 async def daily_report_loop():
-    """
-    يرسل تقريرًا يوميًا مُحسّن النص الساعة المحددة (بتوقيت الرياض).
-    إن توفرت دوال الإحصائيات في database.py سنستخدمها؛ وإلا نرسل تقريرًا عامًا جميل الصياغة.
-    """
     tz = pytz.timezone(TIMEZONE)
     while True:
         now = datetime.now(tz)
@@ -373,104 +276,256 @@ async def daily_report_loop():
         delay = (target - now).total_seconds()
         logger.info(f"Next daily report at {target.isoformat()} ({TIMEZONE}) in {int(delay)}s")
         await asyncio.sleep(delay)
-
         try:
-            # محاولة إحضار إحصائيات، لو غير موجودة نرسل نصًا عامًا
-            stats_text = None
-            try:
-                from database import get_stats_24h, get_stats_7d  # اختيارية
-                with get_session() as s:
-                    d24 = get_stats_24h(s)  # dict متوقعة: signals, open, tp1, tp2, sl, win_rate, r_sum
-                    w7  = get_stats_7d(s)   # dict مماثلة لفترة 7 أيام
-                stats_text = (
-                    "📊 <b>تقرير اليوم</b>\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"• الإشارات (24h): <b>{d24.get('signals', 0)}</b>\n"
-                    f"• الصفقات المفتوحة الآن: <b>{d24.get('open', 0)}</b>\n\n"
-                    f"• نتائج آخر 24h:\n"
-                    f"  – TP hit: <b>{d24.get('tp_total', 0)}</b> "
-                    f"(TP1: {d24.get('tp1', 0)} • TP2: {d24.get('tp2', 0)})\n"
-                    f"  – SL hit: <b>{d24.get('sl', 0)}</b>\n"
-                    f"  – Win Rate (24h): <b>{d24.get('win_rate', 0)}%</b>\n"
-                    f"  – R المحققة (24h): <b>{d24.get('r_sum', 0)}</b>\n\n"
-                    f"• نظرة 7 أيام:\n"
-                    f"  – Win Rate: <b>{w7.get('win_rate', 0)}%</b>\n"
-                    f"  – R التراكمي: <b>{w7.get('r_sum', 0)}</b>\n\n"
-                    f"⏱ يُرسل يوميًا <b>{DAILY_REPORT_HOUR_LOCAL}:00</b> ({TIMEZONE}).\n"
-                    "⚡️ تذكير: إدارة رأس المال أولًا."
-                )
-            except Exception:
-                pass
-
-            if not stats_text:
-                stats_text = (
-                    "📊 <b>تقرير الإشارات اليومي</b>\n"
-                    "━━━━━━━━━━━━━━\n"
-                    "سنضيف قريبًا ملخصًا بالأرقام (نسبة الفوز + R التراكمي).\n"
-                    f"⏱ يُرسل يوميًا <b>{DAILY_REPORT_HOUR_LOCAL}:00</b> ({TIMEZONE}).\n"
-                    "⚡️ تذكير: إدارة رأس المال أولًا."
-                )
-
-            await send_channel(stats_text)
+            with get_session() as s:
+                stats_24 = get_stats_24h(s)
+                stats_7d = get_stats_7d(s)
+            await send_channel(_report_card(stats_24, stats_7d))
             logger.info("Daily report sent.")
         except Exception as e:
             logger.exception(f"DAILY_REPORT ERROR: {e}")
 
 # ---------------------------
+# أوامر المستخدم
+# ---------------------------
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
+    kb.button(text="الدفع (USDT TRC20) + رقم المرجع", callback_data="subscribe_info")
+    kb.adjust(1)
+    await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "start_trial")
+async def cb_trial(q: CallbackQuery):
+    with get_session() as s:
+        ok = start_trial(s, q.from_user.id)
+    if ok:
+        await q.message.edit_text(
+            "✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁\n"
+            "ستصلك الإشارات والتقرير اليومي على القناة.",
+            parse_mode="HTML"
+        )
+    else:
+        await q.message.edit_text(
+            "ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\n"
+            "يمكنك الاشتراك عبر زر الدفع.",
+            parse_mode="HTML"
+        )
+    await q.answer()
+
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    text = (
+        "🤖 <b>أوامر المستخدم</b>\n"
+        "• <code>/start</code> – البداية والقائمة الرئيسية\n"
+        "• <code>/pay</code> – الدفع وشرح رقم المرجع (TxID)\n"
+        "• <code>/submit_tx</code> – إرسال رقم المرجع لتفعيل الاشتراك\n"
+        "• <code>/status</code> – حالة الاشتراك\n"
+    )
+    await m.answer(text, parse_mode="HTML")
+
+@dp.message(Command("status"))
+async def cmd_status(m: Message):
+    with get_session() as s:
+        ok = is_active(s, m.from_user.id)
+    await m.answer("✅ <b>اشتراكك نشط.</b>" if ok else "❌ <b>لا تملك اشتراكًا نشطًا.</b>", parse_mode="HTML")
+
+@dp.message(Command("pay"))
+async def cmd_pay(m: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="طريقة الإرسال ورقم المرجع؟", callback_data="tx_help")
+    kb.button(text="أسعار وخطط الاشتراك", callback_data="subscribe_info")
+    kb.adjust(1)
+
+    txt = (
+        "💳 <b>الدفع عبر USDT (TRC20)</b>\n"
+        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>\n"
+        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n\n"
+        f"أرسل إلى المحفظة:\n<code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
+        "بعد التحويل أرسل رقم المرجع (TxID) مع الخطة:\n"
+        "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n\n"
+        "✅ يدعم إلصاق <i>رابط Tronscan</i> مباشرة (سأستخرج رقم المرجع تلقائيًا)."
+    )
+    await m.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "tx_help")
+async def cb_tx_help(q: CallbackQuery):
+    await q.message.answer(REFERENCE_HINT, parse_mode="Markdown")
+    await q.answer()
+
+@dp.callback_query(F.data == "subscribe_info")
+async def cb_sub_info(q: CallbackQuery):
+    await cmd_pay(q.message)
+    await q.answer()
+
+@dp.message(Command("submit_tx"))
+async def cmd_submit(m: Message):
+    """
+    التحقق التلقائي من معاملة TRC20 USDT باستخدام «رقم المرجع (TxID)» أو رابط Tronscan.
+    إن نجح يتحول الاشتراك تلقائيًا؛ وإلا تُرسل تنبيهات للأدمن للمراجعة.
+    """
+    parts = (m.text or "").strip().split(maxsplit=2)
+    # الصيغة: /submit_tx <رقم_المرجع_أو_الرابط> <2w|4w>
+    if len(parts) != 3 or parts[2] not in ("2w", "4w"):
+        return await m.answer(
+            "استخدم: <code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n"
+            "يمكنك أيضًا إلصاق <i>رابط Tronscan</i> بدل رقم المرجع.",
+            parse_mode="HTML"
+        )
+
+    ref_or_url, plan = parts[1], parts[2]
+    min_amount = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
+
+    txid = extract_txid(ref_or_url)
+    ok, info = find_trc20_transfer_to_me(ref_or_url, min_amount)
+
+    if ok:
+        with get_session() as s:
+            dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
+            end_at = approve_paid(s, m.from_user.id, plan, dur, tx_hash=txid or ref_or_url)
+        return await m.answer(
+            "✅ <b>تم التحقق من الدفع</b>\n"
+            f"المبلغ المستلم: <b>{info} USDT</b>\n"
+            f"⏳ الاشتراك فعّال حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+            parse_mode="HTML"
+        )
+
+    # فشل التحقق التلقائي — ننبّه الأدمن للمراجعة اليدوية
+    alert = (
+        "🔔 <b>طلب تفعيل — فشل التحقق التلقائي</b>\n"
+        f"User: <code>{m.from_user.id}</code>\n"
+        f"Plan: <b>{plan}</b>\n"
+        f"Reference: <code>{_h(ref_or_url)}</code>\n"
+        f"Reason: {_h(info)}"
+    )
+    await send_admins(alert)
+    await m.answer(
+        "❗ لم أستطع التحقق تلقائيًا من الدفع.\n"
+        "سيتم مراجعته يدويًا قريبًا من قبل الدعم.\n"
+        "تلميح: تأكد أن الإرسال كان USDT على شبكة TRON (TRC20) وأن رقم المرجع صحيح.",
+        parse_mode="HTML"
+    )
+
+# ---------------------------
+# أوامر الإدارة (لا تظهر للمستخدمين)
+# ---------------------------
+@dp.message(Command("admin_help"))
+async def cmd_admin_help(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    txt = (
+        "🛠️ <b>أوامر الأدمن</b>\n"
+        "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – تفعيل يدوي\n"
+        "• <code>/broadcast &lt;text&gt;</code> – (اختياري) بث للمشتركين\n"
+        "• <code>/force_report</code> – إرسال تقرير فوري"
+    )
+    await m.answer(txt, parse_mode="HTML")
+
+@dp.message(Command("approve"))
+async def cmd_approve(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    parts = (m.text or "").strip().split()
+    if len(parts) not in (3, 4) or parts[2] not in ("2w", "4w"):
+        return await m.answer("استخدم: /approve <user_id> <2w|4w> [reference]")
+    uid = int(parts[1])
+    plan = parts[2]
+    txh = parts[3] if len(parts) == 4 else None
+    dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
+    with get_session() as s:
+        end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
+    await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+    try:
+        await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك!", parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"USER DM ERROR: {e}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    txt = m.text.partition(" ")[2].strip()
+    if not txt:
+        return await m.answer("استخدم: /broadcast <text>")
+    uids = list_active_user_ids()
+    sent = 0
+    for uid in uids:
+        try:
+            await bot.send_message(uid, txt, parse_mode="HTML")
+            sent += 1
+            await asyncio.sleep(0.02)
+        except Exception:
+            pass
+    await m.answer(f"تم الإرسال إلى {sent} مشترك.")
+
+@dp.message(Command("force_report"))
+async def cmd_force_report(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    with get_session() as s:
+        stats_24 = get_stats_24h(s)
+        stats_7d = get_stats_7d(s)
+    await send_channel(_report_card(stats_24, stats_7d))
+    await m.answer("تم إرسال التقرير للقناة.")
+
+# ---------------------------
+# فحوصات التشغيل
+# ---------------------------
+async def check_channel_and_admin_dm():
+    ok = True
+    # تأكد من القناة
+    try:
+        await bot.send_message(TELEGRAM_CHANNEL_ID, "🤖 البوت بدأ العمل (Polling).", parse_mode="HTML")
+        logger.info(f"CHANNEL OK: {TELEGRAM_CHANNEL_ID} / Bot_AI")
+    except Exception as e:
+        logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
+        ok = False
+
+    # DM للأدمن للتأكيد
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, "✅ البوت يعمل الآن.", parse_mode="HTML")
+            logger.info(f"ADMIN DM OK: {admin_id}")
+        except Exception as e:
+            logger.warning(f"ADMIN DM FAILED for {admin_id}: {e} — أرسل /start للبوت في الخاص وتحقق من الـ ID.")
+    return ok
+
+# ---------------------------
 # التشغيل
 # ---------------------------
 async def main():
-    logger.info("Initializing DB...")
+    # 1) قاعدة البيانات
     init_db()
-    logger.info("DB initialized.")
 
-    # حذف الـ Webhook لأننا نستعمل polling
+    # 2) تبادل OKX + الأسواق
+    await load_okx_markets_and_filter()
+
+    # 3) حذف أي Webhook لأننا نستعمل polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
     except Exception as e:
         logger.warning(f"DELETE_WEBHOOK WARN: {e}")
 
-    # تحميل أسواق OKX وتقييد الرموز
-    await load_okx_symbols()
+    # 4) فحص القناة وإشعار الأدمن
+    await check_channel_and_admin_dm()
 
-    # فحص القناة والأدمن
-    await check_channel_and_admin_on_boot()
-
-    # إشعار بدء التشغيل للأدمن (تلخيص)
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await bot.send_message(admin_id, "✅ البوت بدأ العمل على Render (polling).")
-        except Exception:
-            pass
-
-    # نطلق 3 مهام متوازية:
+    # 5) إطلاق المهام المتوازية
     t1 = asyncio.create_task(dp.start_polling(bot))
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
+    t4 = asyncio.create_task(monitor_open_trades())
 
     try:
-        await asyncio.gather(t1, t2, t3)
+        await asyncio.gather(t1, t2, t3, t4)
     except Exception as e:
         logger.exception(f"FATAL ERROR: {e}")
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await bot.send_message(admin_id, f"❌ تعطل البوت: {e}")
-            except Exception:
-                pass
+        try:
+            await send_admins(f"❌ تعطل البوت: <code>{_h(str(e))}</code>")
+        except Exception:
+            pass
         raise
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# ---------------------------------------------
-# ملاحظات سريعة لبوت فاذر (قائمة الأوامر المقترحة للمستخدمين فقط):
-#
-# start - ابدأ
-# pay - طريقة الدفع وإرسال المرجع
-# submit_ref - تأكيد الدفع (أرسل: /submit_ref رقم_المرجع 2w|4w)
-# status - حالة الاشتراك
-# help - مساعدة
-#
-# (لا تضف أوامر الأدمن في /setcommands حتى لا تظهر للمشتركين)
-# ---------------------------------------------
