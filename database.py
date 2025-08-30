@@ -1,67 +1,85 @@
-# database.py — نماذج SQLAlchemy ووظائف الاشتراكات والصفقات
-
+# database.py
 import os
+import logging
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple, List
+from datetime import datetime, timedelta
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, Float, Boolean, Text
+    create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Float,
+    Index, text
 )
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-# ضبط URL قاعدة البيانات
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///data.sqlite3")
-if DB_URL.startswith("postgres://"):
-    DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+logger = logging.getLogger("db")
 
-engine = create_engine(
-    DB_URL,
-    echo=False,
-    future=True,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+else:
+    engine = create_engine("sqlite:///bot.db", future=True)
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
-UTC = timezone.utc
-
+# ---------------- Models ----------------
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True)          # auto
-    tg_user_id = Column(Integer, unique=True, index=True, nullable=False)
-    trial_used = Column(Boolean, default=False)
-    end_at = Column(DateTime(timezone=True), nullable=True)  # اشتراك فعال حتى
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
-
-class Payment(Base):
-    __tablename__ = "payments"
     id = Column(Integer, primary_key=True)
-    tg_user_id = Column(Integer, index=True, nullable=False)
-    plan = Column(String(8))           # "2w" or "4w"
-    amount_usd = Column(Float, default=0.0)
-    tx_hash = Column(String(128))
-    status = Column(String(32), default="submitted")  # submitted/approved/rejected
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    tg_user_id = Column(BigInteger, index=True)  # قد يُضاف عبر ensure_schema
+    trial_used = Column(Boolean, default=False)
+    end_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+Index("ix_users_tg_user_id", User.tg_user_id)
 
 class Trade(Base):
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
-    symbol = Column(String(32), index=True, nullable=False)
-    side = Column(String(8), default="BUY")
-    entry = Column(Float, nullable=False)
-    sl = Column(Float, nullable=False)
-    tp1 = Column(Float, nullable=False)
-    tp2 = Column(Float, nullable=False)
-    status = Column(String(16), default="open")  # open/tp1/closed_tp2/closed_sl
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    symbol = Column(String(32))
+    side = Column(String(8))
+    entry = Column(Float)
+    sl = Column(Float)
+    tp1 = Column(Float)
+    tp2 = Column(Float)
+    status = Column(String(16), default="open")  # open/closed/tp/sl
+    created_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)
+    close_reason = Column(String(16), nullable=True)  # tp1/tp2/sl/manual
 
-def init_db():
-    Base.metadata.create_all(engine)
+class Invoice(Base):
+    __tablename__ = "invoices"
+    id = Column(Integer, primary_key=True)
+    tg_user_id = Column(BigInteger, index=True)
+    plan = Column(String(8))           # "2w" | "4w"
+    base_amount = Column(Float)        # 30 أو 60
+    code_frac = Column(Float)          # مثل 0.004 لتوليد مبلغ مميّز
+    expected_amount = Column(Float)    # المبلغ النهائي المطلوب دفعه
+    status = Column(String(16), default="pending")  # pending/paid/cancelled/expired
+    tx_hash = Column(String(128), nullable=True)
+    paid_amount = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    paid_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)    # صلاحية الفاتورة
 
+Index("ix_invoices_user_status", Invoice.tg_user_id, Invoice.status)
+
+# --------------- Schema patch ---------------
+def ensure_schema(engine):
+    with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.exec_driver_sql("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS tg_user_id BIGINT;
+            """)
+            conn.exec_driver_sql("""
+                CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);
+            """)
+        # SQLite يغطيه create_all عادةً
+    logger.info("db: schema checked/updated.")
+
+# --------------- Helpers ---------------
 @contextmanager
-def get_session() -> Session:
+def get_session():
     s = SessionLocal()
     try:
         yield s
@@ -72,82 +90,134 @@ def get_session() -> Session:
     finally:
         s.close()
 
-# ===== اشتراك المستخدم =====
-def is_active(s: Session, tg_user_id: int) -> bool:
-    u = s.query(User).filter_by(tg_user_id=tg_user_id).first()
-    if not u or not u.end_at:
-        return False
-    return u.end_at > datetime.now(UTC)
+def init_db():
+    Base.metadata.create_all(bind=engine)
+    ensure_schema(engine)
+    logger.info("Database ready.")
 
-def start_trial(s: Session, tg_user_id: int, days: int = 1) -> bool:
-    u = s.query(User).filter_by(tg_user_id=tg_user_id).first()
+# --------------- Subscription logic ---------------
+def _get_user(s, tg_user_id: int) -> User:
+    u = s.query(User).filter(User.tg_user_id == tg_user_id).first()
     if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=False)
+        u = User(tg_user_id=tg_user_id, created_at=datetime.utcnow())
         s.add(u)
         s.flush()
+    return u
+
+def is_active(s, tg_user_id: int) -> bool:
+    u = _get_user(s, tg_user_id)
+    return bool(u.end_at and u.end_at > datetime.utcnow())
+
+def start_trial(s, tg_user_id: int, days: int = 1) -> bool:
+    u = _get_user(s, tg_user_id)
     if u.trial_used:
         return False
     u.trial_used = True
-    u.end_at = (datetime.now(UTC) + timedelta(days=days))
+    now = datetime.utcnow()
+    u.end_at = max(u.end_at or now, now) + timedelta(days=days)
+    s.add(u)
     return True
 
-def approve_paid(s: Session, tg_user_id: int, plan: str, duration_days: int, tx_hash: Optional[str] = None):
-    # سجّل الدفع
-    amount = 0.0
-    if plan == "2w": amount = 30.0
-    if plan == "4w": amount = 60.0
-    p = Payment(tg_user_id=tg_user_id, plan=plan, amount_usd=amount, tx_hash=tx_hash, status="approved")
-    s.add(p)
-
-    # حدّث/أنشئ المستخدم
-    u = s.query(User).filter_by(tg_user_id=tg_user_id).first()
-    if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=True)  # لا يهم، دفع بالفعل
-        s.add(u)
-        s.flush()
-
-    now = datetime.now(UTC)
-    base = u.end_at if u.end_at and u.end_at > now else now
-    u.end_at = base + timedelta(days=duration_days)
-    s.flush()
+def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str | None = None):
+    u = _get_user(s, tg_user_id)
+    now = datetime.utcnow()
+    u.end_at = max(u.end_at or now, now) + timedelta(days=duration_days)
+    s.add(u)
+    # لو الفاتورة موجودة نحدّثها
+    inv = s.query(Invoice).filter(
+        Invoice.tg_user_id == tg_user_id,
+        Invoice.status == "pending"
+    ).order_by(Invoice.created_at.desc()).first()
+    if inv and tx_hash:
+        inv.status = "paid"
+        inv.tx_hash = tx_hash
+        inv.paid_at = datetime.utcnow()
+        s.add(inv)
     return u.end_at
 
-# ===== الصفقات =====
-OPENLIKE_STATUSES = ("open", "tp1")
+# --------------- Invoices ---------------
+from random import randint
 
-def add_trade(s: Session, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> Trade:
-    t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2, status="open")
+def _suggest_code_frac(s, base_amount: float) -> float:
+    """
+    يولد كسور مميزة 0.001 .. 0.009 للتفريق بين المشتركين (وتحويل الفحص إلى تلقائي).
+    يتفادا تضارب مع فواتير معلقة لنفس المبلغ.
+    """
+    used = {
+        round(inv.expected_amount - inv.base_amount, 6)
+        for inv in s.query(Invoice).filter(
+            Invoice.status == "pending",
+            Invoice.base_amount == base_amount
+        ).all()
+    }
+    # جرّب حتى تجد كسرًا غير مستخدم
+    for _ in range(20):
+        cand = round(randint(1, 9) / 1000.0, 6)  # 0.001 .. 0.009
+        if cand not in used:
+            return cand
+    # احتياط: 0.01 خطوة أصغر
+    for i in range(10, 100):
+        cand = round(i / 10000.0, 6)  # 0.0010 .. 0.0099
+        if cand not in used:
+            return cand
+    return 0.0
+
+def create_invoice(s, tg_user_id: int, plan: str, base_amount: float, validity_minutes: int = 120) -> Invoice:
+    code_frac = _suggest_code_frac(s, base_amount)
+    inv = Invoice(
+        tg_user_id=tg_user_id,
+        plan=plan,
+        base_amount=base_amount,
+        code_frac=code_frac,
+        expected_amount=round(base_amount + code_frac, 6),
+        status="pending",
+        created_at=datetime.utcnow(),
+        expires_at=datetime.utcnow() + timedelta(minutes=validity_minutes)
+    )
+    s.add(inv)
+    s.flush()
+    return inv
+
+def get_invoice(s, invoice_id: int) -> Invoice | None:
+    return s.query(Invoice).filter(Invoice.id == invoice_id).first()
+
+def list_pending_invoices(s, within_hours: int = 24) -> list[Invoice]:
+    since = datetime.utcnow() - timedelta(hours=within_hours)
+    return s.query(Invoice).filter(
+        Invoice.status == "pending",
+        Invoice.created_at >= since
+    ).all()
+
+def mark_invoice_paid(s, invoice_id: int, tx_hash: str, paid_amount: float):
+    inv = get_invoice(s, invoice_id)
+    if not inv:
+        return False
+    inv.status = "paid"
+    inv.tx_hash = tx_hash
+    inv.paid_amount = paid_amount
+    inv.paid_at = datetime.utcnow()
+    s.add(inv)
+    return True
+
+# --------------- Trades ---------------
+def count_open_trades(s) -> int:
+    return s.query(Trade).filter(Trade.status == "open").count()
+
+def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float):
+    t = Trade(
+        symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+        status="open", created_at=datetime.utcnow()
+    )
     s.add(t)
     s.flush()
-    return t
+    return t.id
 
-def count_open_trades(s: Session) -> int:
-    return s.query(Trade).filter(Trade.status.in_(OPENLIKE_STATUSES)).count()
-
-def update_trade_status(s: Session, trade_id: int, new_status: str) -> Optional[Trade]:
-    t = s.get(Trade, trade_id)
+def close_trade(s, trade_id: int, reason: str):
+    t = s.query(Trade).filter(Trade.id == trade_id).first()
     if not t:
-        return None
-    t.status = new_status
-    s.flush()
-    return t
-
-def list_trades_with_status(s: Session, statuses: Tuple[str, ...]) -> List[Trade]:
-    return list(s.query(Trade).filter(Trade.status.in_(statuses)).all())
-
-# إحصاءات للـ 24 ساعة الأخيرة (للتقرير اليومي)
-def trades_stats_last_24h(s: Session):
-    since = datetime.now(UTC) - timedelta(hours=24)
-    q = s.query(Trade).filter(Trade.created_at >= since)
-    total = q.count()
-    closed_tp2 = q.filter(Trade.status == "closed_tp2").count()
-    closed_sl = q.filter(Trade.status == "closed_sl").count()
-    tp1_only = q.filter(Trade.status == "tp1").count()
-    open_now = q.filter(Trade.status == "open").count()
-    return {
-        "total": total,
-        "closed_tp2": closed_tp2,
-        "closed_sl": closed_sl,
-        "tp1_only": tp1_only,
-        "open": open_now,
-    }
+        return False
+    t.status = "closed"
+    t.closed_at = datetime.utcnow()
+    t.close_reason = reason
+    s.add(t)
+    return True
