@@ -9,6 +9,7 @@ import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
+from payments_tron import extract_txid, find_trc20_transfer_to_me, REFERENCE_HINT
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
