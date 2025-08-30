@@ -1,137 +1,156 @@
-# payments_tron.py — فحص تلقائي لمدفوعات USDT TRC20
+# payments_tron.py — تحقق تلقائي من دفعات USDT على TRON (TRC20) باستخدام "رقم المرجع (TxID)"
+# - يدعم لصق رقم المرجع مباشرة أو رابط Tronscan/TronLink لاستخراج الـ TxID تلقائياً.
+# - يعتمد TronGrid API (يفضّل وضع TRONGRID_API_KEY لتفادي حدود المعدل).
+# - إن لم تحدد عقد USDT في env سنطابق بالرمز "USDT".
+#
+# بيئة التشغيل (Environment):
+#   TRONGRID_BASE          (اختياري) افتراضياً https://api.trongrid.io
+#   TRONGRID_API_KEY       (اختياري لكنه مُستحسن)
+#   USDT_TRC20_CONTRACT    (اختياري) إن وضعته سنطابق بالعقد بدلاً من الرمز
+#   USDT_TRC20_WALLET      (مطلوب)  محفظتك على TRON ليتحقق الإيداع إليها
+#   TRONGRID_TIMEOUT       (اختياري) مهلة الطلب بالثواني، افتراضياً 15
+#   TRON_MIN_CONF          (اختياري) حد أدنى للتأكيدات، افتراضياً 0 (ترون غالباً فوري)
+#
+# واجهة الاستدعاء في البوت:
+#   ok, info = find_trc20_transfer_to_me(ref_or_url, min_amount)
+#   - ok=True  => تم العثور على تحويل صالح؛ info = "المبلغ المستلم"
+#   - ok=False => فشل التحقق؛ info = سبب واضح بالعربية للمستخدم/الأدمن
+
 import os
-import time
+import re
 import requests
+from typing import Optional, Tuple
 
 TRONGRID_BASE = os.getenv("TRONGRID_BASE", "https://api.trongrid.io")
 TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY")
-USDT_CONTRACT = os.getenv("USDT_TRC20_CONTRACT", "")  # اختياري للتقييد بدقة
-RECEIVER_WALLET = os.getenv("USDT_TRC20_WALLET")
-TIMEOUT = 15
+USDT_CONTRACT = os.getenv("USDT_TRC20_CONTRACT", "")  # إن تُرك فارغاً سنطابق بالرمز "USDT"
+RECEIVER_WALLET = os.getenv("USDT_TRC20_WALLET")      # محفظتك — مطلوب
+TIMEOUT = int(os.getenv("TRONGRID_TIMEOUT", "15"))
+MIN_CONF = int(os.getenv("TRON_MIN_CONF", "0"))
 
-def _headers():
+# تطابق أي سلاسل TxID سداسية بطول 64 حتى لو ضمن رابط
+_TXID_RE = re.compile(r"(?i)\b([A-F0-9]{64})\b")
+
+def _headers() -> dict:
     hdr = {"Accept": "application/json"}
     if TRONGRID_API_KEY:
         hdr["TRON-PRO-API-KEY"] = TRONGRID_API_KEY
     return hdr
 
-def get_tx(txid: str):
+def extract_txid(ref_or_url: str) -> Optional[str]:
+    """
+    يستخرج رقم المرجع (TxID) من نصّ/رابط قام المستخدم بلصقه (Tronscan / TronLink / نص خام).
+    أمثلة مدعومة:
+      - 7F3D...ABCD (64 hex)
+      - https://tronscan.org/#/transaction/<txid>
+      - tronlink://transaction?hash=<txid>
+    """
+    if not ref_or_url:
+        return None
+    m = _TXID_RE.search(ref_or_url.strip())
+    return m.group(1) if m else None
+
+def get_tx(txid: str) -> Optional[dict]:
+    """
+    يجلب تفاصيل معاملة عبر TronGrid:
+      GET /v1/transactions/{txid}
+    يرجع dict للمعاملة أو None إن لم توجد.
+    """
     url = f"{TRONGRID_BASE}/v1/transactions/{txid}"
     r = requests.get(url, timeout=TIMEOUT, headers=_headers())
     r.raise_for_status()
     data = r.json()
-    if isinstance(data, dict):
-        arr = data.get("data") or []
-        return arr[0] if arr else None
-    return None
+    arr = data.get("data") if isinstance(data, dict) else None
+    return arr[0] if arr else None
 
-def find_trc20_transfer_to_me(txid: str, min_amount: float) -> tuple[bool, str]:
+def _ok_symbol_or_contract(ev: dict) -> bool:
+    """
+    يطابق نوع الأصل: إمّا وفق عقد USDT المحدّد، أو بواسطة الرمز "USDT" إن لم يُحدَّد عقد.
+    """
+    contract = ev.get("contract_address")
+    symbol = (ev.get("symbol") or "").upper()
+    if USDT_CONTRACT:
+        return contract == USDT_CONTRACT
+    return symbol == "USDT"
+
+def _amount_from_event(ev: dict) -> Optional[float]:
+    """
+    يحسب المبلغ الفعلي من سجّل تحويل TRC20 وفق الحقول المتاحة.
+    """
+    try:
+        decimals = int(ev.get("decimals") or 6)
+        raw_val = ev.get("amount_str") or ev.get("amount") or "0"
+        return float(raw_val) / (10 ** decimals)
+    except Exception:
+        return None
+
+def _enough_confirmations(tx: dict) -> bool:
+    """
+    TRON عادةً يؤكد بسرعة وتظهر الحالة SUCCESS.
+    إن رغبت بالتحقق من الارتفاع إلى عدد تأكيدات معيّن، يمكن استخدام block/confirmation_count لو توفر.
+    هنا نكتفي بـ MIN_CONF == 0 (افتراضياً).
+    """
+    if MIN_CONF <= 0:
+        return True
+    # إن توفر حقول تأكيدات مستقبلاً يمكن إضافتها هنا.
+    return True
+
+def find_trc20_transfer_to_me(ref_or_url: str, min_amount: float) -> Tuple[bool, str]:
+    """
+    التحقق أن المعاملة بالـ «رقم المرجع (TxID)» تمّت بنجاح وتحمل تحويل USDT TRC20 إلى محفظتنا بالمبلغ المطلوب.
+    ترجع (ok, info):
+      - ok=True  => info = المبلغ المستلم كنص
+      - ok=False => info = سبب الفشل (رسالة عربية واضحة)
+    """
     if not RECEIVER_WALLET:
-        return False, "المحفظة غير مهيأة (USDT_TRC20_WALLET مفقود)"
+        return False, "المحفظة غير مهيأة لدى الخادم. الرجاء إبلاغ الدعم (USDT_TRC20_WALLET مفقود)."
+
+    txid = extract_txid(ref_or_url)
+    if not txid:
+        return False, "لم أفهم «رقم المرجع». أرسل رقم المرجع المكوّن من 64 رمزاً (أو أرسل رابط المعاملة من Tronscan)."
+
     try:
         tx = get_tx(txid)
+    except requests.HTTPError as e:
+        return False, f"تعذّر الاتصال بواجهة TRON (HTTP {e.response.status_code}). جرّب بعد قليل أو تأكد من رقم المرجع."
     except Exception as e:
         return False, f"فشل الاتصال بواجهة TRON: {e}"
 
     if not tx:
-        return False, "لم يتم العثور على المعاملة"
+        return False, "لم أجد معاملة بهذا «رقم المرجع». تأكد من نسخه بشكل صحيح أو أرسل رابط Tronscan للمعاملة."
 
-    ret = tx.get("ret", [])
+    # حالة التنفيذ
+    ret = tx.get("ret") or []
     if not ret or ret[0].get("contractRet") != "SUCCESS":
-        return False, "المعاملة ليست ناجحة بعد (أو ما زالت قيد التأكيد)"
+        return False, "المعاملة ليست ناجحة بعد (قد تكون قيد التنفيذ). أعد المحاولة لاحقاً."
 
+    if not _enough_confirmations(tx):
+        return False, "المعاملة رُصدت ولكن ننتظر مزيداً من التأكيدات على الشبكة."
+
+    # ابحث عن سجلات تحويل TRC20 داخل المعاملة
     trc20_list = tx.get("trc20TransferInfo") or tx.get("tokenTransferInfo") or []
     if not trc20_list:
-        return False, "لا توجد سجلات تحويل TRC20 في هذه المعاملة"
+        return False, "لا توجد سجلات تحويل TRC20 في هذه المعاملة. تأكد أنك أرسلت USDT (TRC20)."
 
     for ev in trc20_list:
         to_addr = ev.get("to_address")
-        contract = ev.get("contract_address")
-        symbol = (ev.get("symbol") or "").upper()
-        decimals = int(ev.get("decimals") or 6)
-        raw_val = ev.get("amount_str") or ev.get("amount") or "0"
-
-        try:
-            amount = float(raw_val) / (10 ** decimals)
-        except Exception:
+        if not _ok_symbol_or_contract(ev):
             continue
-
-        if USDT_CONTRACT:
-            if contract != USDT_CONTRACT:
-                continue
-        else:
-            if symbol and symbol != "USDT":
-                continue
-
         if to_addr != RECEIVER_WALLET:
             continue
 
+        amount = _amount_from_event(ev)
+        if amount is None:
+            continue
+
         if amount + 1e-9 >= float(min_amount):
+            # نجاح
             return True, f"{amount:.6f}"
 
-    return False, "لم أجد تحويل USDT صالحًا لهذه المحفظة بهذا txid وبالمبلغ المطلوب"
+    return False, "لم أعثر على إيداع USDT صالح إلى محفظتنا بهذه المعاملة وبالمبلغ المطلوب."
 
-# -------- فحص التحويلات الواردة للمحفظة (لمطابقة الفواتير) --------
-def list_recent_incoming_usdt(limit: int = 100) -> list[dict]:
-    """
-    يعيد قائمة تحويلات TRC20 (USDT) الواردة لمحفظتنا (الأحدث).
-    يعتمد على TronGrid v1. لو تغيّر السلوك، حدّث المسار حسب وثائق TronGrid.
-    """
-    if not RECEIVER_WALLET:
-        raise RuntimeError("USDT_TRC20_WALLET is not set")
-    # only_to=true لتصفيه التحويلات الداخلة
-    # ملاحظة: بعض تنصيبات TronGrid تُعيد الحقل data أو token_transfers
-    url = f"{TRONGRID_BASE}/v1/accounts/{RECEIVER_WALLET}/transactions/trc20"
-    params = {"limit": limit, "only_to": "true"}
-    if USDT_CONTRACT:
-        params["contract_address"] = USDT_CONTRACT
-
-    r = requests.get(url, params=params, timeout=TIMEOUT, headers=_headers())
-    r.raise_for_status()
-    js = r.json()
-    rows = js.get("data") or js.get("token_transfers") or []
-    out = []
-    for ev in rows:
-        try:
-            to_addr = ev.get("to")
-            contract = ev.get("contract_address") or ev.get("token_info", {}).get("address")
-            symbol = (ev.get("symbol") or ev.get("token_info", {}).get("symbol") or "").upper()
-            decimals = int(ev.get("decimals") or ev.get("token_info", {}).get("decimals") or 6)
-            raw = ev.get("value") or ev.get("amount") or ev.get("amount_str") or "0"
-            txid = ev.get("transaction_id") or ev.get("transaction_id_str") or ev.get("transaction_id_hex")
-            ts = ev.get("block_timestamp") or ev.get("trigger_info", {}).get("block_timestamp")
-            amount = float(raw) / (10 ** decimals)
-            if USDT_CONTRACT:
-                if contract != USDT_CONTRACT:
-                    continue
-            else:
-                if symbol and symbol != "USDT":
-                    continue
-            if to_addr != RECEIVER_WALLET:
-                continue
-            out.append({
-                "txid": txid,
-                "amount": round(amount, 6),
-                "timestamp": ts
-            })
-        except Exception:
-            continue
-    return out
-
-def match_invoices_by_amount(invoices: list[dict], incoming: list[dict], tol: float = 0.000001):
-    """
-    يطابق كل فاتورة (expected_amount) مع تحويل مطابق نفس المبلغ (± tol).
-    يعيد dict: invoice_id -> {"txid":..., "amount":...}
-    """
-    res = {}
-    used_tx = set()
-    for inv in invoices:
-        exp_amt = round(float(inv["expected_amount"]), 6)
-        for tr in incoming:
-            if tr["txid"] in used_tx:
-                continue
-            if abs(tr["amount"] - exp_amt) <= tol:
-                res[inv["id"]] = {"txid": tr["txid"], "amount": tr["amount"]}
-                used_tx.add(tr["txid"])
-                break
-    return res
+# ملاحظة: لإظهار تلميح ودّي في واجهات البوت:
+REFERENCE_HINT = (
+    "🔎 *رقم المرجع (TxID)* هو رقم مكوّن من 64 رمزاً يُميّز تحويلك على شبكة TRON.\n"
+    "يمكنك نسخه من محفظتك (TronLink/Trust/Tronscan) أو إلصاق رابط المعاملة هنا، وسألتقطه تلقائياً."
+)
