@@ -3,31 +3,26 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import pandas as pd
 
-# ===== إعدادات عامة =====
 EMA_FAST, EMA_SLOW, EMA_TREND = 9, 21, 50
 RSI_MIN, RSI_MAX = 50, 70
 SR_WINDOW = 50
-RESISTANCE_BUFFER = 0.005   # 0.5% تحت المقاومة نرفض الدخول
-SUPPORT_BUFFER    = 0.002   # 0.2% فوق الدعم نرفض الدخول
+RESISTANCE_BUFFER = 0.005
+SUPPORT_BUFFER    = 0.002
 VOL_MA = 20
 
 ATR_PERIOD   = 14
 ATR_SL_MULT  = 1.5
 R_MULT_TP    = 2.0
 
-# سلّم أهداف أقرب
-P1_R = 0.6      # TP1 = entry + 0.6R
-P2_R = 1.0      # TP2 = entry + 1.0R
+P1_R = 0.6
+P2_R = 1.0
 
-# حدود دنيا/قصوى لمسافة SL (كنسبة من الدخول)
-MIN_SL_PCT = 0.006   # 0.6% حد أدنى
-MAX_SL_PCT = 0.04    # 4%  حد أقصى — لو أكبر: نتجاهل الإشارة
+MIN_SL_PCT = 0.006
+MAX_SL_PCT = 0.04
 
-# لمنع إعادة الإشارة على نفس الشمعة
 _LAST_ENTRY_BAR_TS = {}
 
-# ===== مؤشرات =====
-def ema(series, period): 
+def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
@@ -62,22 +57,15 @@ def add_indicators(df):
     return df
 
 def get_sr_on_closed(df, window=50):
-    """حساب دعم/مقاومة باستخدام البيانات حتى الشمعة المغلقة (استثناء آخر صف تشكُّل)."""
     if len(df) < window + 3:
         return None, None
-    df_prev = df.iloc[:-1]  # استبعد الشمعة قيد التشكل
+    df_prev = df.iloc[:-1]
     w = min(window, len(df_prev))
     resistance = df_prev["high"].rolling(w).max().iloc[-1]
     support    = df_prev["low"].rolling(w).min().iloc[-1]
     return support, resistance
 
-# ===== الإشارة =====
 def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[list]] = None) -> Optional[Dict]:
-    """
-    يعيد dict بالإشارة (BUY) أو None.
-    ohlcv_5m: لائحة [ts, open, high, low, close, volume]
-    ohlcv_15m: (اختياري) لتأكيد تعدد الأطر: إغلاق > EMA50 على 15m
-    """
     if not ohlcv_5m or len(ohlcv_5m) < 80:
         return None
 
@@ -86,19 +74,16 @@ def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[lis
     if len(df) < 60:
         return None
 
-    # استخدم آخر شمعة مُغلقة فقط
     prev   = df.iloc[-3]
-    closed = df.iloc[-2]   # الشمعة المكتملة
+    closed = df.iloc[-2]
     last_ts_closed = int(closed["timestamp"])
 
-    # منع التكرار على نفس الشمعة
     if _LAST_ENTRY_BAR_TS.get(symbol) == last_ts_closed:
         return None
 
     price = float(closed["close"])
 
-    # فلاتر الاتجاه/الزخم/الحجم
-    if price < closed["ema50"]: 
+    if price < closed["ema50"]:
         return None
     if not (RSI_MIN < closed["rsi"] < RSI_MAX):
         return None
@@ -107,54 +92,39 @@ def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[lis
     if closed["close"] <= closed["open"]:
         return None
 
-    # دعم/مقاومة
     sup, res = get_sr_on_closed(df, SR_WINDOW)
     if sup and res:
-        if price >= res * (1 - RESISTANCE_BUFFER): 
+        if price >= res * (1 - RESISTANCE_BUFFER):
             return None
-        if price <= sup * (1 + SUPPORT_BUFFER):    
+        if price <= sup * (1 + SUPPORT_BUFFER):
             return None
 
-    # تقاطع EMA + MACD
     crossed = (prev["ema9"] < prev["ema21"]) and (closed["ema9"] > closed["ema21"])
     macd_ok = closed["macd"] > closed["macd_signal"]
     if not (crossed and macd_ok):
         return None
 
-    # تعدد الأطر (اختياري)
-    if ohlcv_15m:
-        df15 = pd.DataFrame(ohlcv_15m, columns=["timestamp","open","high","low","close","volume"])
-        if len(df15) >= 60:
-            df15["ema50"] = ema(df15["close"], EMA_TREND)
-            if df15.iloc[-2]["close"] < df15.iloc[-2]["ema50"]:
-                return None
-
-    # حساب ATR ووقف هجين (الأبعد)
     atr = float(df["atr"].iloc[-2])
-    # قاع تأرجح من آخر 10 شمعات قبل الشمعة المغلقة
     swing_low = float(df.iloc[:-1]["low"].rolling(10).min().iloc[-1])
 
     sl_atr = price - ATR_SL_MULT * atr
-    sl_hybrid = min(sl_atr, swing_low)  # للأوامر الطويلة: الأبعد يكون أقل سعر
+    sl_hybrid = min(sl_atr, swing_low)
 
-    # حدود دنيا/قصوى لمسافة SL
     dist_pct = (price - sl_hybrid) / max(price, 1e-9)
     if dist_pct < MIN_SL_PCT:
         sl_hybrid = price * (1 - MIN_SL_PCT)
     elif dist_pct > MAX_SL_PCT:
-        return None  # الوقف بعيد جدًا — نتجنب الصفقة
+        return None
 
     sl = float(sl_hybrid)
     R  = price - sl
     if R <= 0:
         return None
 
-    # أهداف
-    tp1 = price + P1_R * R
-    tp2 = price + P2_R * R
-    tp_final = price + R_MULT_TP * R  # إن أحببت استخدامه في الإدارة
+    tp1 = price + 0.6 * R
+    tp2 = price + 1.0 * R
+    tp_final = price + 2.0 * R
 
-    # وسم الشمعة كي لا نكرر الإشارة عليها
     _LAST_ENTRY_BAR_TS[symbol] = last_ts_closed
 
     return {
