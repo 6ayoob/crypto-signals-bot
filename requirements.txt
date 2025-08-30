@@ -1,7 +1,11 @@
 aiogram==3.10.0
 ccxt==4.3.85
 SQLAlchemy==2.0.32
-pytz
-requests
-pandas
+pandas==2.3.2
+requests==2.32.5
+pytz==2025.2
+aiohttp==3.9.5
+aiodns==3.5.0
+aiofiles==23.2.1
+numpy==2.3.2
 psycopg2-binary==2.9.9
