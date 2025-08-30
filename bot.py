@@ -167,7 +167,6 @@ async def fetch_ticker_price(symbol: str) -> float | None:
     try:
         loop = asyncio.get_event_loop()
         ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
-        # نأخذ آخر سعر معروف
         price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
         return float(price) if price is not None else None
     except Exception as e:
@@ -178,10 +177,6 @@ async def fetch_ticker_price(symbol: str) -> float | None:
 # حلقة فحص الإشارات
 # ---------------------------
 async def scan_and_dispatch():
-    """
-    يفحص كل الرموز، يطبق الاستراتيجية، ويرسل الإشارات فورًا للقناة (و/أو DM للمشتركين).
-    يسجل الصفقات في DB.
-    """
     if not AVAILABLE_SYMBOLS:
         return
     for sym in AVAILABLE_SYMBOLS:
@@ -197,10 +192,9 @@ async def scan_and_dispatch():
                     text = format_signal_text(sig)
                     await send_channel(text)
                     logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']}")
-        await asyncio.sleep(0.2)  # تهدئة لتجنب rate limits
+        await asyncio.sleep(0.2)
 
 async def loop_signals():
-    """حلقة فحص الإشارات (كل 5 دقائق)."""
     while True:
         try:
             await scan_and_dispatch()
@@ -212,12 +206,6 @@ async def loop_signals():
 # مراقبة الصفقات المفتوحة وإغلاقها عند TP/SL
 # ---------------------------
 async def monitor_open_trades():
-    """
-    مراقبة مستمرة للصفقات المفتوحة:
-    - إذا وصل السعر إلى TP2: نغلق على TP2
-    - وإلا إذا وصل TP1: نغلق على TP1
-    - وإذا كسر SL: نغلق على SL
-    """
     while True:
         try:
             with get_session() as s:
@@ -351,7 +339,8 @@ async def cmd_pay(m: Message):
 
 @dp.callback_query(F.data == "tx_help")
 async def cb_tx_help(q: CallbackQuery):
-    await q.message.answer(REFERENCE_HINT, parse_mode="Markdown")
+    # نرسل REFERENCE_HINT كنص عادي لتجنّب مشاكل Markdown/HTML
+    await q.message.answer(REFERENCE_HINT)
     await q.answer()
 
 @dp.callback_query(F.data == "subscribe_info")
@@ -417,7 +406,7 @@ async def cmd_admin_help(m: Message):
     txt = (
         "🛠️ <b>أوامر الأدمن</b>\n"
         "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – تفعيل يدوي\n"
-        "• <code>/broadcast &lt;text&gt;</code> – (اختياري) بث للمشتركين\n"
+        "• <code>/broadcast &lt;text&gt;</code> – بث رسالة لكل المشتركين\n"
         "• <code>/force_report</code> – إرسال تقرير فوري"
     )
     await m.answer(txt, parse_mode="HTML")
@@ -470,19 +459,19 @@ async def cmd_force_report(m: Message):
     await m.answer("تم إرسال التقرير للقناة.")
 
 # ---------------------------
-# فحوصات التشغيل
+# فحوصات التشغيل (صامتة)
 # ---------------------------
 async def check_channel_and_admin_dm():
     ok = True
-    # تأكد من القناة
+    # فحص القناة "صامت" بدون إرسال رسالة عامة
     try:
-        await bot.send_message(TELEGRAM_CHANNEL_ID, "🤖 البوت بدأ العمل (Polling).", parse_mode="HTML")
-        logger.info(f"CHANNEL OK: {TELEGRAM_CHANNEL_ID} / Bot_AI")
+        chat = await bot.get_chat(TELEGRAM_CHANNEL_ID)
+        logger.info(f"CHANNEL OK: {chat.id} / {chat.title or chat.username or 'channel'}")
     except Exception as e:
         logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
         ok = False
 
-    # DM للأدمن للتأكيد
+    # DM للأدمن فقط لتأكيد التشغيل
     for admin_id in ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, "✅ البوت يعمل الآن.", parse_mode="HTML")
@@ -508,7 +497,7 @@ async def main():
     except Exception as e:
         logger.warning(f"DELETE_WEBHOOK WARN: {e}")
 
-    # 4) فحص القناة وإشعار الأدمن
+    # 4) فحص القناة (صامت) + إشعار الأدمن فقط
     await check_channel_and_admin_dm()
 
     # 5) إطلاق المهام المتوازية
