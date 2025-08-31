@@ -1,4 +1,4 @@
-# database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
+# database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite) — Enhanced
 import os
 import logging
 from contextlib import contextmanager
@@ -55,6 +55,17 @@ class Trade(Base):
     sl    = Column(Float, nullable=False)
     tp1   = Column(Float, nullable=False)
     tp2   = Column(Float, nullable=False)
+
+    # حقول مُضافة اختياريًا (لا تكسر التوافق)
+    tp_final  = Column(Float, nullable=True)       # الهدف الثالث/النهائي
+    score     = Column(Integer, nullable=True)     # Signal Score
+    regime    = Column(String(8), nullable=True)   # "trend" | "mean" | ...
+    reasons   = Column(String(512), nullable=True) # أسباب مختصرة مفصولة بفواصل
+    audit_id  = Column(String(64), nullable=True)  # معرّف التدقيق
+    qty       = Column(Float, nullable=True)       # كمية تنفيذ (اختياري)
+    exit_price = Column(Float, nullable=True)      # سعر الإغلاق الفعلي (اختياري)
+    r_multiple = Column(Float, nullable=True)      # R المُحقق (اختياري)
+
     status = Column(String(8), default="open", index=True, nullable=False)  # open | closed
     result = Column(String(8), nullable=True)  # tp1 | tp2 | sl
     opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -82,21 +93,39 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "last_tx_hash": "VARCHAR(128)",
             "created_at": "TIMESTAMP"
         }
-        typ = mapping_pg[col] if dialect == "postgresql" else mapping_sq[col]
+        typ = mapping_pg.get(col) if dialect == "postgresql" else mapping_sq.get(col)
+        if typ is None: typ = "TEXT"
     elif table == "trades":
         mapping_pg = {
             "result": "VARCHAR(8)",
             "opened_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "closed_at": "TIMESTAMPTZ",
-            "status": "VARCHAR(8) NOT NULL DEFAULT 'open'"
+            "status": "VARCHAR(8) NOT NULL DEFAULT 'open'",
+            "tp_final": "DOUBLE PRECISION",
+            "score": "INTEGER",
+            "regime": "VARCHAR(8)",
+            "reasons": "VARCHAR(512)",
+            "audit_id": "VARCHAR(64)",
+            "qty": "DOUBLE PRECISION",
+            "exit_price": "DOUBLE PRECISION",
+            "r_multiple": "DOUBLE PRECISION"
         }
         mapping_sq = {
             "result": "VARCHAR(8)",
             "opened_at": "TIMESTAMP",
             "closed_at": "TIMESTAMP",
-            "status": "VARCHAR(8)"
+            "status": "VARCHAR(8)",
+            "tp_final": "REAL",
+            "score": "INTEGER",
+            "regime": "VARCHAR(8)",
+            "reasons": "VARCHAR(512)",
+            "audit_id": "VARCHAR(64)",
+            "qty": "REAL",
+            "exit_price": "REAL",
+            "r_multiple": "REAL"
         }
-        typ = mapping_pg[col] if dialect == "postgresql" else mapping_sq[col]
+        typ = mapping_pg.get(col) if dialect == "postgresql" else mapping_sq.get(col)
+        if typ is None: typ = "TEXT"
     else:
         typ = "TEXT"
 
@@ -106,21 +135,30 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
     return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'
 
 def _ensure_indexes(connection, dialect: str):
-    if dialect == "postgresql":
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
+    try:
+        if dialect == "postgresql":
+            connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
+            connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
+            connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
+            connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol ON "trades" (symbol);'))
+            connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_closed_at ON "trades" (closed_at);'))
+    except Exception as e:
+        logger.warning(f"CREATE INDEX failed: {e}")
 
 def _lightweight_migrate():
+    # أنشئ الجداول أولًا
+    Base.metadata.create_all(bind=engine)
+
+    # ثم استعلم عن الأعمدة الموجودة
     insp = inspect(engine)
     dialect = engine.dialect.name  # 'postgresql' أو 'sqlite'
 
-    # أنشئ الجداول إذا لم تكن موجودة
-    Base.metadata.create_all(bind=engine)
-
     with engine.begin() as conn:
         # users
-        cols_users = {c["name"] for c in insp.get_columns("users")}
+        try:
+            cols_users = {c["name"] for c in insp.get_columns("users")}
+        except Exception:
+            cols_users = set()
         required_users = ["tg_user_id", "trial_used", "end_at", "plan", "last_tx_hash", "created_at"]
         for c in required_users:
             if c not in cols_users:
@@ -130,8 +168,15 @@ def _lightweight_migrate():
                     logger.warning(f"ALTER users ADD {c} failed: {e}")
 
         # trades
-        cols_trades = {c["name"] for c in insp.get_columns("trades")}
-        required_trades = ["result", "opened_at", "closed_at", "status"]
+        try:
+            cols_trades = {c["name"] for c in insp.get_columns("trades")}
+        except Exception:
+            cols_trades = set()
+        required_trades = [
+            "result", "opened_at", "closed_at", "status",
+            "tp_final", "score", "regime", "reasons", "audit_id",
+            "qty", "exit_price", "r_multiple"
+        ]
         for c in required_trades:
             if c not in cols_trades:
                 try:
@@ -140,10 +185,7 @@ def _lightweight_migrate():
                     logger.warning(f"ALTER trades ADD {c} failed: {e}")
 
         # فهارس
-        try:
-            _ensure_indexes(conn, dialect)
-        except Exception as e:
-            logger.warning(f"CREATE INDEX failed: {e}")
+        _ensure_indexes(conn, dialect)
 
 def init_db():
     try:
@@ -215,7 +257,28 @@ def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str
 # وظائف الصفقات
 # ---------------------------
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> int:
+    """دالة قديمة (متوافقة) لإضافة صفقة أساسية."""
     t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2, status="open")
+    s.add(t)
+    s.flush()
+    return t.id
+
+def add_trade_sig(s, sig: dict, audit_id: str | None = None, qty: float | None = None) -> int:
+    """
+    دالة اختيارية لقبول كائن إشارة strategy.py مباشرة.
+    لن تكسر شيئًا—استخدمها إذا رغبت بتخزين حقول إضافية (score/regime/...).
+    """
+    t = Trade(
+        symbol=sig["symbol"], side=sig.get("side","BUY"),
+        entry=float(sig["entry"]), sl=float(sig["sl"]),
+        tp1=float(sig["tp1"]), tp2=float(sig["tp2"]),
+        tp_final=float(sig.get("tp_final")) if sig.get("tp_final") is not None else None,
+        score=int(sig.get("score")) if sig.get("score") is not None else None,
+        regime=str(sig.get("regime")) if sig.get("regime") is not None else None,
+        reasons=", ".join(sig.get("reasons", [])[:10]) if sig.get("reasons") else None,
+        audit_id=audit_id, qty=float(qty) if qty is not None else None,
+        status="open"
+    )
     s.add(t)
     s.flush()
     return t.id
@@ -223,13 +286,35 @@ def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp
 def count_open_trades(s) -> int:
     return s.execute(select(func.count(Trade.id)).where(Trade.status == "open")).scalar() or 0
 
-def close_trade(s, trade_id: int, result: str):
+def has_open_trade_on_symbol(s, symbol: str) -> bool:
+    return (s.execute(select(func.count(Trade.id)).where(Trade.status == "open", Trade.symbol == symbol)).scalar() or 0) > 0
+
+def close_trade(s, trade_id: int, result: str, exit_price: float | None = None, r_multiple: float | None = None):
+    """
+    إغلاق صفقة. التواقيع القديمة (trade_id, result) ما زالت تعمل.
+    يمكن تمرير exit_price و r_multiple اختياريًا للتوثيق الدقيق.
+    """
     t = s.get(Trade, trade_id)
     if not t:
         return
     t.status = "closed"
     t.result = result
     t.closed_at = _utcnow()
+    if exit_price is not None:
+        t.exit_price = float(exit_price)
+    # إن لم يُمرّر r_multiple نحسبه من الأهداف/الوقف
+    if r_multiple is not None:
+        t.r_multiple = float(r_multiple)
+    else:
+        risk = max(float(t.entry) - float(t.sl), 1e-9)
+        if result == "tp1":
+            t.r_multiple = (float(t.tp1) - float(t.entry)) / risk
+        elif result == "tp2":
+            t.r_multiple = (float(t.tp2) - float(t.entry)) / risk
+        elif result == "sl":
+            t.r_multiple = -1.0
+        else:
+            t.r_multiple = None
     s.flush()
 
 def list_active_user_ids(s) -> list[int]:
@@ -259,18 +344,22 @@ def _period_stats(s, since: datetime) -> dict:
         select(func.count(Trade.id)).where(Trade.result == "sl", Trade.closed_at >= since)
     ).scalar() or 0
 
+    # صافي R: يفضّل استخدام r_multiple إن كان محفوظًا، وإلا نرجع للصيغة التقريبية القديمة
     r_sum = 0.0
     closed_rows = s.execute(
         select(Trade).where(Trade.status == "closed", Trade.closed_at >= since)
     ).scalars().all()
     for t in closed_rows:
-        risk = max(t.entry - t.sl, 1e-9)
-        if t.result == "tp1":
-            r_sum += (t.tp1 - t.entry) / risk
-        elif t.result == "tp2":
-            r_sum += (t.tp2 - t.entry) / risk
-        elif t.result == "sl":
-            r_sum += -1.0
+        if t.r_multiple is not None:
+            r_sum += float(t.r_multiple)
+        else:
+            risk = max(float(t.entry) - float(t.sl), 1e-9)
+            if t.result == "tp1":
+                r_sum += (float(t.tp1) - float(t.entry)) / risk
+            elif t.result == "tp2":
+                r_sum += (float(t.tp2) - float(t.entry)) / risk
+            elif t.result == "sl":
+                r_sum += -1.0
 
     wins = tp1 + tp2
     losses = sl
