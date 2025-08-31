@@ -574,7 +574,7 @@ async def cb_tx_help(q: CallbackQuery):
 async def cb_sub_info(q: CallbackQuery):
     await cmd_pay(q.message); await q.answer()
 
-# دعم
+# --- دعم: فتح محادثة المستخدم ---
 @dp.message(Command("support"))
 async def cmd_support(m: Message):
     _support_set(m.from_user.id)
@@ -637,6 +637,7 @@ async def _send_ticket_to_admins(user_msg: Message):
         except Exception as e:
             logger.warning(f"copy ticket to {chat_id} failed: {e}")
 
+# --- دعم: تحويل أي رسالة أثناء الانتظار إلى «تذكرة» ---
 @dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
 async def any_user_message_router(m: Message):
     uid = m.from_user.id
@@ -645,6 +646,7 @@ async def any_user_message_router(m: Message):
         await m.answer("✅ تم استلام رسالتك. سيردّ عليك الدعم قريبًا.", parse_mode="HTML")
         await _send_ticket_to_admins(m)
 
+# --- دعم: الإداري يضغط «الرد على المستخدم» ---
 @dp.callback_query(F.data.startswith("reply_to:"))
 async def cb_reply_to(q: CallbackQuery):
     if q.from_user.id not in ADMIN_USER_IDS:
@@ -653,19 +655,41 @@ async def cb_reply_to(q: CallbackQuery):
         uid = int(q.data.split(":", 1)[1])
     except Exception:
         return await q.answer("بيانات غير صالحة.", show_alert=True)
+
     ADMIN_REPLY_TARGET[q.from_user.id] = uid
-    await q.message.answer(f"✍️ أرسل رسالتك الآن، سيتم إرسالها للمستخدم <code>{uid}</code>.", parse_mode="HTML")
+
+    # رسالة في نفس المكان (قروب/خاص)
+    await q.message.answer(
+        f"✍️ أرسل رسالتك الآن هنا أو على الخاص، وسيتم إرسالها للمستخدم <code>{uid}</code>.",
+        parse_mode="HTML"
+    )
+
+    # تذكير على الخاص أيضاً
+    try:
+        await bot.send_message(
+            q.from_user.id,
+            f"✍️ أرسل ردك الآن ليُرسل للمستخدم <code>{uid}</code>.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
     await q.answer("اكتب ردك الآن.")
 
+# --- دعم: أول رسالة يرسلها الإداري بعد الضغط تُرسل للمستخدم (إصلاح النسخ) ---
 @dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
 async def admin_reply_bridge(m: Message):
     aid = m.from_user.id
+    if aid not in ADMIN_USER_IDS:
+        return  # ليس إدمن
     target = ADMIN_REPLY_TARGET.get(aid)
     if not target:
-        return
+        return  # الإدمن ليس في وضع الرد حالياً
+
     try:
         await bot.send_message(target, "📩 <b>رد من الدعم</b>:", parse_mode="HTML")
-        await bot.copy_message(chat_id=target, from_chat_id=aid, message_id=m.message_id)
+        # مهم: انسخ من مكان إرسال الإدمن الفعلي (قروب/خاص)
+        await bot.copy_message(chat_id=target, from_chat_id=m.chat.id, message_id=m.message_id)
         await m.answer("✅ تم إرسال ردك إلى المستخدم.")
     except Exception as e:
         await m.answer(f"❌ تعذّر إرسال الرد: {e}")
