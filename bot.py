@@ -1,5 +1,5 @@
 # bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + TRC20 + تقارير + مخاطر V2
-# + تكامل add_trade_sig/audit_id + نظام تواصل/دعم للمشتركين (Support)
+# + تكامل add_trade_sig/audit_id + نظام تواصل/دعم للمشتركين (Support) + Leader DB Lock
 import asyncio
 import json
 import hashlib
@@ -8,7 +8,6 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from database import try_acquire_leader_lock
 from pathlib import Path
 from typing import Tuple, Optional
 
@@ -56,7 +55,8 @@ from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
     count_open_trades, add_trade, close_trade,  # add_trade للتوافق
     add_trade_sig, has_open_trade_on_symbol,
-    get_stats_24h, get_stats_7d, User, Trade
+    get_stats_24h, get_stats_7d, User, Trade,
+    try_acquire_leader_lock,   # ⬅️ قفل قائد عبر قاعدة البيانات
 )
 
 # الاستراتيجية + الرموز
@@ -619,10 +619,6 @@ async def _send_ticket_to_admins(user_msg: Message):
 @dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
 async def any_user_message_router(m: Message):
     uid = m.from_user.id
-    # أولوية: إن كان الإداري في وضع الرد
-    if uid in ADMIN_REPLY_TARGET:
-        # هذا إداري يرد؟ (ADMIN_REPLY_TARGET مفتاحه admin_id فقط)
-        pass  # سيُلتقط في معالج الإداري أدناه
     # إن كان المستخدم في وضع الدعم
     if _support_waiting(uid):
         _support_clear(uid)
@@ -751,7 +747,7 @@ async def check_channel_and_admin_dm():
     ok = True
     try:
         chat = await bot.get_chat(TELEGRAM_CHANNEL_ID)
-        logger.info(f"CHANNEL OK: {chat.id} / {chat.title or chat.username or 'channel'}")
+        logger.info(f"CHANNEL OK: {chat.id} / {chat.title or {}}".format(chat.username or 'channel'))
     except Exception as e:
         logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
         ok = False
@@ -769,6 +765,14 @@ async def check_channel_and_admin_dm():
 # ---------------------------
 async def main():
     init_db()
+
+    # قفل قائد عبر قاعدة البيانات لمنع تكرار النسخ بين الخوادم/المنصّات
+    holder = os.getenv("SERVICE_NAME") or os.getenv("HOSTNAME") or f"pid-{os.getpid()}"
+    if os.getenv("ENABLE_DB_LOCK", "1") == "1":
+        if not try_acquire_leader_lock("telebot_poller", holder):
+            logger.error("Another instance holds the leader DB lock. Exiting.")
+            return
+
     await load_okx_markets_and_filter()
 
     # تأكد من عدم وجود Webhook لأننا نستعمل polling
