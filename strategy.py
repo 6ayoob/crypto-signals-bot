@@ -29,7 +29,19 @@ RVOL_L1, RVOL_L2 = 1.2, 1.5       # مستويات RVOL
 TRAIL_ATR_TREND = 2.5
 TRAIL_ATR_MEAN  = 1.8
 
-_LAST_ENTRY_BAR_TS = {}
+# ==== تحسينات V2.1 (قابلة للتهيئة) ====
+# سيولة دنيا بالدولار (تقريبية): volume * close >= هذا الحد
+MIN_QUOTE_VOL = 10_000            # مثال: 10 آلاف USDT خلال الشمعة
+# نطاق تذبذب (ATR% من السعر) المقبول
+ATR_PCT_MIN = 0.002               # 0.2% حد أدنى
+ATR_PCT_MAX = 0.03                # 3% حد أعلى
+# RVOL أدنى إلزامي (بالإضافة إلى نقاط الـ score)
+RVOL_MIN_HARD = 1.05
+# تبريد إشارات: لا تُصدر أكثر من إشارة للرمز خلال N شموع
+HOLDOUT_BARS = 6
+
+_LAST_ENTRY_BAR_TS: dict[str, int] = {}
+_LAST_SIGNAL_BAR_IDX: dict[str, int] = {}
 
 # ---------- مؤشرات ----------
 def ema(series, period):
@@ -65,7 +77,7 @@ def add_indicators(df):
     df["ema50"]  = ema(df["close"], EMA_TREND)
     df["ema200"] = ema(df["close"], EMA_LONG)
     df["rsi"]    = rsi(df["close"], 14)
-    df["vol_ma20"] = df["volume"].rolling(VOL_MA).mean()
+    df["vol_ma20"] = df["volume"].rolling(VOL_MA, min_periods=1).mean()
     df = macd_cols(df)
     df["atr"] = atr_series(df, ATR_PERIOD)
     return df
@@ -75,8 +87,11 @@ def get_sr_on_closed(df, window=50) -> Tuple[Optional[float], Optional[float]]:
         return None, None
     df_prev = df.iloc[:-1]
     w = min(window, len(df_prev))
-    resistance = df_prev["high"].rolling(w).max().iloc[-1]
-    support    = df_prev["low"].rolling(w).min().iloc[-1]
+    # حماية من NaN مع min_periods
+    resistance = df_prev["high"].rolling(w, min_periods=max(5, w//3)).max().iloc[-1]
+    support    = df_prev["low"].rolling(w,  min_periods=max(5, w//3)).min().iloc[-1]
+    if pd.isna(resistance) or pd.isna(support):
+        return None, None
     return float(support), float(resistance)
 
 # ---------- كشف نظام السوق ----------
@@ -98,7 +113,7 @@ def compute_rvol(closed_row) -> float:
     return v / (vma + 1e-9) if vma > 0 else 0.0
 
 def score_signal(df, regime: str, df_htf: Optional[pd.DataFrame] = None) -> Tuple[int, list, dict]:
-    """يرجع (score, reasons, features)"""
+    """يرجع (score, reasons, features) — يستخدم الشمعة المغلقة الأخيرة"""
     closed = df.iloc[-2]
     prev   = df.iloc[-3]
     price  = float(closed["close"])
@@ -108,13 +123,13 @@ def score_signal(df, regime: str, df_htf: Optional[pd.DataFrame] = None) -> Tupl
     hist, hist_prev = float(closed["macd_hist"]), float(prev["macd_hist"])
     rvol = compute_rvol(closed)
 
-    # SR context
+    # SR context (تعريف نطاق داخلي إضافي)
     sup, res = get_sr_on_closed(df, SR_WINDOW)
     breakout = False
     near_support = False
-    if sup and res:
-        hhv = float(df.iloc[:-1]["high"].rolling(SR_WINDOW).max().iloc[-1])
-        llv = float(df.iloc[:-1]["low"].rolling(SR_WINDOW).min().iloc[-1])
+    if sup is not None and res is not None:
+        hhv = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
+        llv = float(df.iloc[:-1]["low"].rolling(SR_WINDOW,  min_periods=10).min().iloc[-1])
         breakout = price > hhv * (1.0 + 0.001)
         near_support = price <= llv * (1.01)
 
@@ -141,13 +156,19 @@ def score_signal(df, regime: str, df_htf: Optional[pd.DataFrame] = None) -> Tupl
     if regime == "mean" and near_support and (float(prev["rsi"]) < 45 < rsi_val):
         score += 20; reasons.append("Mean-rev bounce")
 
-    # تأكيد إطار أعلى (إن توفر ohlcv_15m)
+    # تأكيد إطار أعلى (إن توفر)
     if df_htf is not None and len(df_htf) >= 60:
         htfc = df_htf.iloc[-2]
         if (htfc["close"] > htfc["ema50"]):
             score += 8; reasons.append("HTF close>EMA50")
         if (htfc["ema9"] > htfc["ema21"]):
             score += 7; reasons.append("HTF EMA9>21")
+        # تعزيز طفيف إذا أيضًا فوق EMA200 على HTF
+        try:
+            if htfc["close"] > htfc["ema200"]:
+                score += 3; reasons.append("HTF close>EMA200")
+        except Exception:
+            pass
 
     score = int(min(score, 100))
     features = {
@@ -165,7 +186,7 @@ def trailing_stop_from_df(df, current_stop: float, regime: str) -> float:
     h, c = df["high"], df["close"]
     atr = df["atr"]
     mult = TRAIL_ATR_TREND if regime == "trend" else TRAIL_ATR_MEAN
-    chandelier = c.rolling(22).max() - atr * mult
+    chandelier = c.rolling(22, min_periods=5).max() - atr * mult
     new_stop = max(float(current_stop), float(chandelier.iloc[-1]))
     return round(new_stop, 6)
 
@@ -173,15 +194,25 @@ def trailing_stop_from_df(df, current_stop: float, regime: str) -> float:
 def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[list]] = None) -> Optional[Dict]:
     """
     يعتمد على الشمعة المغلقة الأخيرة من إطار 5m. يمكن تمرير 15m كإطار أعلى لتأكيد إضافي.
+    يحافظ على نفس واجهة الإرجاع المستخدمة في بقية المشروع.
     """
     if not ohlcv_5m or len(ohlcv_5m) < 80:
         return None
 
     df = pd.DataFrame(ohlcv_5m, columns=["timestamp","open","high","low","close","volume"])
+    # تأكد أن الأعمدة float لتفادي casting لاحق
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna().reset_index(drop=True)
+
+    if len(df) < 60:
+        return None
+
     df = add_indicators(df)
     if len(df) < 60:
         return None
 
+    # مؤشرات الشمعة المغلقة
     prev   = df.iloc[-3]
     closed = df.iloc[-2]
     last_ts_closed = int(closed["timestamp"])
@@ -189,6 +220,12 @@ def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[lis
 
     # منع التكرار على نفس الشمعة
     if _LAST_ENTRY_BAR_TS.get(symbol) == last_ts_closed:
+        return None
+
+    # تبريد إشارات لعدد N شموع
+    last_idx = _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000)
+    cur_idx = len(df) - 2  # مؤشر الشمعة المغلقة
+    if cur_idx - last_idx < HOLDOUT_BARS:
         return None
 
     # فلاتر أصلية (محافظة لضمان التوافق السابق)
@@ -201,9 +238,14 @@ def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[lis
     if float(closed["close"]) <= float(closed["open"]):
         return None
 
+    # فلتر سيولة بالدولار
+    quote_vol = float(closed["volume"]) * price
+    if quote_vol < MIN_QUOTE_VOL:
+        return None
+
     # فلاتر S/R
     sup, res = get_sr_on_closed(df, SR_WINDOW)
-    if sup and res:
+    if sup is not None and res is not None:
         if price >= res * (1 - RESISTANCE_BUFFER):
             return None
         if price <= sup * (1 + SUPPORT_BUFFER):
@@ -222,16 +264,29 @@ def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[lis
     df_htf = None
     if ohlcv_15m and len(ohlcv_15m) >= 60:
         df_htf = pd.DataFrame(ohlcv_15m, columns=["timestamp","open","high","low","close","volume"])
-        df_htf = add_indicators(df_htf)
+        for col in ["open","high","low","close","volume"]:
+            df_htf[col] = pd.to_numeric(df_htf[col], errors="coerce")
+        df_htf = df_htf.dropna().reset_index(drop=True)
+        if len(df_htf) >= 60:
+            df_htf = add_indicators(df_htf)
 
     # حساب النقاط
     score, reasons, features = score_signal(df, regime, df_htf)
     if score < MIN_SCORE:
         return None
 
+    # RVOL دنيا إلزامية
+    if features["rvol"] < RVOL_MIN_HARD:
+        return None
+
     # SL هجيني (ATR و/أو سوينغ لو)
     atr = float(df["atr"].iloc[-2])
-    swing_low = float(df.iloc[:-1]["low"].rolling(10).min().iloc[-1])
+    swing_low = float(df.iloc[:-1]["low"].rolling(10, min_periods=3).min().iloc[-1])
+
+    # فلتر تذبذب: ATR% من السعر ضمن النطاق
+    atr_pct = atr / max(price, 1e-9)
+    if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
+        return None
 
     sl_atr = price - ATR_SL_MULT * atr
     sl_hybrid = min(sl_atr, swing_low)
@@ -253,6 +308,7 @@ def check_signal(symbol: str, ohlcv_5m: List[list], ohlcv_15m: Optional[List[lis
     tp_final = price + R_MULT_TP * R
 
     _LAST_ENTRY_BAR_TS[symbol] = last_ts_closed
+    _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
     # معلومات إضافية للمخاطر/التنفيذ
     trail_mult = TRAIL_ATR_TREND if regime == "trend" else TRAIL_ATR_MEAN
