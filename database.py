@@ -1,12 +1,15 @@
-# database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite) — متوافق مع bot.py V2 + Leader Lock (TTL)
+# database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
+# متوافق مع bot.py V2 + Leader Lock (TTL) — تحسينات: منع تكرار TxID (payments)، فهارس إضافية، UTC صارم.
+
 import os
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Boolean, DateTime,
-    Float, Text, text, select, func
+    Float, Text, text, select, func, UniqueConstraint
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import inspect
@@ -35,12 +38,12 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 Base = declarative_base()
 
 # ---------------------------
-# Helpers
+# Helpers (وقت UTC موحّد)
 # ---------------------------
-def _utcnow():
+def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-def _as_aware(dt: datetime | None) -> datetime | None:
+def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
     """حوّل أي datetime إلى UTC-aware (يفترض UTC إن كان naive)."""
     if dt is None:
         return None
@@ -49,7 +52,6 @@ def _as_aware(dt: datetime | None) -> datetime | None:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        # إن حدث أي خطأ، أعده كما هو لتفادي كسر السريان
         return dt
 
 # ---------------------------
@@ -62,7 +64,7 @@ class User(Base):
     trial_used = Column(Boolean, default=False, nullable=False)
     end_at = Column(DateTime, nullable=True)             # UTC
     plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w"
-    last_tx_hash = Column(String(128), nullable=True)    # رقم المرجع/Tx
+    last_tx_hash = Column(String(128), nullable=True)    # رقم المرجع/Tx (آخر عملية)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 class Trade(Base):
@@ -97,8 +99,21 @@ class Lock(Base):
     holder = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
+# جـدول المدفوعات (لمنع تكرار TxID + تتبّع مبالغ)
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True)
+    tg_user_id = Column(BigInteger, index=True, nullable=False)
+    plan = Column(String(8), nullable=True)           # "2w" | "4w" | None
+    amount_usdt = Column(Float, nullable=True)
+    tx_hash = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("tx_hash", name="uq_payments_tx_hash"),
+    )
+
 # ---------------------------
-# تهيئة + هجرة خفيفة (إضافة أعمدة ناقصة)
+# تهيئة + هجرة خفيفة (إضافة أعمدة/فهارس)
 # ---------------------------
 def _add_column_sql(table: str, col: str, dialect: str) -> str:
     if table == "users":
@@ -154,24 +169,32 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
 
     if dialect == "postgresql":
         return f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {typ};'
-    return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'  # SQLite
+    return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'  # SQLite لا يدعم IF NOT EXISTS للأعمدة
 
 def _ensure_indexes(connection, dialect: str):
+    # فهارس إضافية مفيدة للاستعلامات
     if dialect == "postgresql":
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_end_at ON "users" (end_at);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_plan ON "users" (plan);'))
+
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
 
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_payments_user ON "payments" (tg_user_id);'))
+        # قيْد uq_payments_tx_hash مُعرّف على الموديل
+
 def _lightweight_migrate():
+    # ينشئ الجداول المعروفة (ومنها payments) إن لم تكن موجودة
     Base.metadata.create_all(bind=engine)
 
     insp = inspect(engine)
     dialect = engine.dialect.name
 
     with engine.begin() as conn:
-        # users
+        # users — أعمدة قديمة إن نقصت
         try:
             cols_users = {c["name"] for c in insp.get_columns("users")}
         except Exception:
@@ -184,7 +207,7 @@ def _lightweight_migrate():
                 except Exception as e:
                     logger.warning(f"ALTER users ADD {c} failed: {e}")
 
-        # trades
+        # trades — أعمدة إضافية V2 إن نقصت
         try:
             cols_trades = {c["name"] for c in insp.get_columns("trades")}
         except Exception:
@@ -201,6 +224,7 @@ def _lightweight_migrate():
                 except Exception as e:
                     logger.warning(f"ALTER trades ADD {c} failed: {e}")
 
+        # payments — create_all ينشئ الجدول + قيود، نضيف فقط فهارس إضافية عند الحاجة
         try:
             _ensure_indexes(conn, dialect)
         except Exception as e:
@@ -236,15 +260,13 @@ def _get_or_create_user(s, tg_user_id: int) -> User:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
     if not u:
         u = User(tg_user_id=tg_user_id, trial_used=False, end_at=None)
-        s.add(u)
-        s.flush()
+        s.add(u); s.flush()
     return u
 
 def is_active(s, tg_user_id: int) -> bool:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
     if not u or not u.end_at:
         return False
-    # طبّع القيمة لضمان الاتساق
     return _as_aware(u.end_at) > _utcnow()
 
 def start_trial(s, tg_user_id: int) -> bool:
@@ -259,14 +281,45 @@ def start_trial(s, tg_user_id: int) -> bool:
     u.plan = "trial"
     return True
 
+def was_tx_used(s, tx_hash: str) -> bool:
+    """تحقّق سريع: هل تم استخدام رقم المرجع سابقًا؟"""
+    if not tx_hash:
+        return False
+    cnt = s.execute(select(func.count(Payment.id)).where(Payment.tx_hash == tx_hash)).scalar() or 0
+    return cnt > 0
+
+def record_payment_if_new(s, tg_user_id: int, plan: Optional[str], amount_usdt: Optional[float], tx_hash: str) -> int:
+    """يسجل دفعًا جديدًا أو يطلق IntegrityError لو كان tx_hash مكررًا."""
+    if not tx_hash:
+        raise ValueError("tx_hash is required")
+    p = Payment(tg_user_id=tg_user_id, plan=plan, amount_usdt=amount_usdt, tx_hash=tx_hash)
+    s.add(p)
+    try:
+        s.flush()  # سيطلق IntegrityError لو tx_hash مكرر
+    except IntegrityError as e:
+        s.rollback()
+        raise IntegrityError("Duplicate tx_hash", params=None, orig=e)  # رسالة أوضح
+    return p.id
+
 def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str | None = None) -> datetime:
+    """
+    تفعيل مدفوع:
+    - يضيف المدة للخطة الحالية (يمدّد إن كان نشطًا).
+    - يسجّل الدفع في جدول payments إن توفّر tx_hash (ويمنع التكرار).
+    - يُحدّث آخر مرجع في users.last_tx_hash.
+    """
     u = _get_or_create_user(s, tg_user_id)
     now = _utcnow()
     base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
-    u.end_at = base + timedelta(days=int(duration_days))
-    u.plan = plan
+    end_at = base + timedelta(days=int(duration_days))
+
+    # منع إعادة استخدام المراجع
     if tx_hash:
+        record_payment_if_new(s, tg_user_id=tg_user_id, plan=plan, amount_usdt=None, tx_hash=tx_hash)
         u.last_tx_hash = tx_hash
+
+    u.end_at = end_at
+    u.plan = plan
     s.flush()
     return u.end_at
 
@@ -275,8 +328,7 @@ def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str
 # ---------------------------
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> int:
     t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2, status="open")
-    s.add(t)
-    s.flush()
+    s.add(t); s.flush()
     return t.id
 
 def add_trade_sig(s, sig: dict, audit_id: str | None = None, qty: float | None = None) -> int:
@@ -296,8 +348,7 @@ def add_trade_sig(s, sig: dict, audit_id: str | None = None, qty: float | None =
         status="open",
         opened_at=_utcnow(),
     )
-    s.add(t)
-    s.flush()
+    s.add(t); s.flush()
     return t.id
 
 def has_open_trade_on_symbol(s, symbol: str) -> bool:
@@ -314,15 +365,11 @@ def close_trade(s, trade_id: int, result: str, exit_price: float | None = None, 
     t.result = result
     t.closed_at = _utcnow()
     if exit_price is not None:
-        try:
-            t.exit_price = float(exit_price)
-        except Exception:
-            pass
+        try: t.exit_price = float(exit_price)
+        except Exception: pass
     if r_multiple is not None:
-        try:
-            t.r_multiple = float(r_multiple)
-        except Exception:
-            pass
+        try: t.r_multiple = float(r_multiple)
+        except Exception: pass
     s.flush()
 
 def list_active_user_ids(s) -> list[int]:
@@ -358,8 +405,7 @@ def _period_stats(s, since: datetime) -> dict:
     ).scalars().all()
     for t in closed_rows:
         if t.r_multiple is not None:
-            r_sum += float(t.r_multiple)
-            continue
+            r_sum += float(t.r_multiple); continue
         try:
             risk = max(float(t.entry) - float(t.sl), 1e-9)
             if t.result == "tp1":
@@ -404,11 +450,9 @@ def try_acquire_leader_lock(name: str, holder: str) -> bool:
             return False
         s.add(Lock(name=name, holder=holder))
         try:
-            s.commit()
-            return True
+            s.commit(); return True
         except IntegrityError:
-            s.rollback()
-            return False
+            s.rollback(); return False
 
 def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300) -> bool:
     now = _utcnow()
