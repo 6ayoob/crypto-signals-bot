@@ -1,7 +1,10 @@
-# bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + دفع TRC20 (رقم المرجع TxID) + تقارير يومية + إشعارات إغلاق الصفقات
+# bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + دفع TRC20 + تقارير + مخاطر V2 (Hard-Stop/Cooldown) + Trust Layer اختياري
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Tuple
 
 import ccxt
 import pytz
@@ -30,6 +33,13 @@ from symbols import SYMBOLS
 # الدفع TRON (رقم المرجع TxID)
 from payments_tron import extract_txid, find_trc20_transfer_to_me, REFERENCE_HINT
 
+# --- Trust Layer (اختياري) ---
+try:
+    from trust_layer import format_signal_card, log_signal, log_close, make_audit_id
+    TRUST_LAYER = True
+except Exception:
+    TRUST_LAYER = False
+
 # ---------------------------
 # إعدادات عامة
 # ---------------------------
@@ -47,6 +57,13 @@ AVAILABLE_SYMBOLS: list[str] = []
 SIGNAL_SCAN_INTERVAL_SEC = 300  # كل 5 دقائق
 MONITOR_INTERVAL_SEC = 15       # مراقبة الصفقات المفتوحة
 TIMEFRAME = "5m"
+
+# --- حوكمة مخاطر V2 (قابلة للتعديل) ---
+RISK_STATE_FILE = Path("risk_state.json")
+MAX_DAILY_LOSS_R = 2.0          # إيقاف دخول صفقات جديدة اليوم عند بلوغ -2R
+MAX_LOSSES_STREAK = 3           # إيقاف مؤقت بعد 3 خسائر متتالية
+COOLDOWN_HOURS = 6              # مدّة التبريد
+AUDIT_IDS: dict[int, str] = {}  # trade_id -> audit_id (داخل الذاكرة)
 
 # ---------------------------
 # أدوات مساعدة
@@ -94,7 +111,7 @@ async def notify_subscribers(text: str):
 async def welcome_text() -> str:
     return (
         "👋 أهلاً بك في <b>عالم الفرص</b> 🚀\n\n"
-        "🔔 إشارات لحظية مبنية على استراتيجية احترافية\n"
+        "🔔 إشارات لحظية مبنية على استراتيجية احترافية (Score/Regime + إدارة مخاطر)\n"
         f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n"
         "💰 إدارة مخاطر صارمة + حد صفقات نشطة محسوب\n\n"
         "خطط الاشتراك:\n"
@@ -106,7 +123,13 @@ async def welcome_text() -> str:
         "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>"
     )
 
-def format_signal_text(sig: dict) -> str:
+def format_signal_text_basic(sig: dict) -> str:
+    """تنسيق أساسي للإشارة عند عدم توفر trust_layer.py"""
+    extra = ""
+    if "score" in sig or "regime" in sig:
+        extra = f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
+        if sig.get("reasons"):
+            extra += f"\n🧠 أسباب: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
     return (
         "🚀 <b>إشارة جديدة [BUY]</b>\n"
         "━━━━━━━━━━━━━━\n"
@@ -115,13 +138,15 @@ def format_signal_text(sig: dict) -> str:
         f"📉 وقف الخسارة: <code>{sig['sl']}</code>\n"
         f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
         f"🎯 الهدف 2: <code>{sig['tp2']}</code>\n"
-        f"⏰ الوقت (UTC): <code>{_h(sig['timestamp'])}</code>\n"
+        f"⏰ الوقت (UTC): <code>{_h(sig['timestamp'])}</code>"
+        f"{extra}\n"
         "━━━━━━━━━━━━━━\n⚡️ <i>تذكير: إدارة رأس المال واجبة قبل كل صفقة.</i>"
     )
 
-def format_close_text(t: Trade) -> str:
+def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
     emoji = {"tp1": "🎯", "tp2": "🏁", "sl": "🛑"}.get(t.result or "", "ℹ️")
     result_label = {"tp1": "تحقق الهدف 1", "tp2": "تحقق الهدف 2", "sl": "ضرب وقف الخسارة"}.get(t.result or "", "إغلاق")
+    r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
     return (
         f"{emoji} <b>تم إغلاق الصفقة</b>\n"
         "━━━━━━━━━━━━━━\n"
@@ -129,9 +154,97 @@ def format_close_text(t: Trade) -> str:
         f"💵 الدخول: <code>{t.entry}</code>\n"
         f"📉 الوقف: <code>{t.sl}</code>\n"
         f"🎯 TP1: <code>{t.tp1}</code> | 🎯 TP2: <code>{t.tp2}</code>\n"
-        f"📌 النتيجة: <b>{result_label}</b>\n"
+        f"📌 النتيجة: <b>{result_label}</b>{r_line}\n"
         f"⏰ الإغلاق (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>"
     )
+
+# ---------------------------
+# إدارة المخاطر (ملف حالة بسيط)
+# ---------------------------
+def _load_risk_state() -> dict:
+    try:
+        if RISK_STATE_FILE.exists():
+            return json.loads(RISK_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"RISK_STATE load warn: {e}")
+    return {"date": datetime.now(timezone.utc).date().isoformat(),
+            "r_today": 0.0, "loss_streak": 0, "cooldown_until": None}
+
+def _save_risk_state(state: dict):
+    try:
+        RISK_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"RISK_STATE save warn: {e}")
+
+def _reset_if_new_day(state: dict) -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("date") != today:
+        state.update({"date": today, "r_today": 0.0, "loss_streak": 0, "cooldown_until": None})
+    return state
+
+def can_open_new_trade(s) -> Tuple[bool, str]:
+    """يتحقق من القيود: عدد الصفقات، Hard-stop اليومي، وCooldown."""
+    state = _reset_if_new_day(_load_risk_state())
+    # تبريد؟
+    if state.get("cooldown_until"):
+        try:
+            until = datetime.fromisoformat(state["cooldown_until"])
+            if datetime.now(timezone.utc) < until:
+                return False, f"Cooldown حتى {until.isoformat()}"
+        except Exception:
+            pass
+    # Hard-stop يومي؟
+    if float(state.get("r_today", 0.0)) <= -MAX_DAILY_LOSS_R:
+        return False, f"بلوغ حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
+    # حد الصفقات المفتوحة؟
+    if count_open_trades(s) >= MAX_OPEN_TRADES:
+        return False, "بلوغ حد الصفقات المفتوحة"
+    return True, "OK"
+
+def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> float:
+    """يحسب R للصفقة ويحدث الحالة (r_today/loss_streak/ cooldown). يعيد r_multiple."""
+    # حساب R لصفقة شراء:
+    try:
+        R = float(t.entry) - float(t.sl)
+        if R <= 0:
+            r_multiple = 0.0
+        else:
+            r_multiple = (float(exit_price) - float(t.entry)) / R
+    except Exception:
+        r_multiple = 0.0
+
+    state = _reset_if_new_day(_load_risk_state())
+    state["r_today"] = round(float(state.get("r_today", 0.0)) + r_multiple, 6)
+    # خسارة؟
+    if r_multiple < 0:
+        state["loss_streak"] = int(state.get("loss_streak", 0)) + 1
+    else:
+        state["loss_streak"] = 0
+
+    # تفعيل تبريد؟
+    cooldown_reason = None
+    if float(state["r_today"]) <= -MAX_DAILY_LOSS_R:
+        cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
+    if int(state["loss_streak"]) >= MAX_LOSSES_STREAK:
+        cooldown_reason = (cooldown_reason + " + " if cooldown_reason else "") + f"{MAX_LOSSES_STREAK} خسائر متتالية"
+
+    if cooldown_reason:
+        until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
+        state["cooldown_until"] = until.isoformat()
+        _save_risk_state(state)
+        # تنبيه القناة/الأدمن
+        asyncio.create_task(send_channel(
+            f"⏸️ <b>إيقاف مؤقت لفتح صفقات جديدة</b>\n"
+            f"السبب: {cooldown_reason}\n"
+            f"حتى: <code>{until.strftime('%Y-%m-%d %H:%M UTC')}</code>"
+        ))
+        asyncio.create_task(send_admins(
+            f"⚠️ Cooldown مُفعل — {cooldown_reason}. حتى {until.isoformat()}"
+        ))
+    else:
+        _save_risk_state(state)
+
+    return r_multiple
 
 # ---------------------------
 # تبادل (OKX): تحميل الأسواق وتصفية الرموز غير المتاحة
@@ -153,7 +266,7 @@ async def load_okx_markets_and_filter():
 # ---------------------------
 # جلب البيانات/الأسعار
 # ---------------------------
-async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=150):
+async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=400):
     try:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -176,23 +289,54 @@ async def fetch_ticker_price(symbol: str) -> float | None:
 # ---------------------------
 # حلقة فحص الإشارات
 # ---------------------------
+SCAN_LOCK = asyncio.Lock()
+
 async def scan_and_dispatch():
     if not AVAILABLE_SYMBOLS:
         return
-    for sym in AVAILABLE_SYMBOLS:
-        data = await fetch_ohlcv(sym)
-        if not data:
-            await asyncio.sleep(0.15)
-            continue
-        sig = check_signal(sym, data)
-        if sig:
+    async with SCAN_LOCK:
+        for sym in AVAILABLE_SYMBOLS:
+            data = await fetch_ohlcv(sym)
+            if not data:
+                await asyncio.sleep(0.05)
+                continue
+
+            sig = check_signal(sym, data)
+            if not sig:
+                await asyncio.sleep(0.05)
+                continue
+
+            # تحقق المخاطر قبل فتح صفقة جديدة
             with get_session() as s:
-                if count_open_trades(s) < MAX_OPEN_TRADES:
-                    add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
-                    text = format_signal_text(sig)
-                    await send_channel(text)
-                    logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']}")
-        await asyncio.sleep(0.2)
+                allowed, reason = can_open_new_trade(s)
+                if not allowed:
+                    logger.info(f"SKIP SIGNAL {sym}: {reason}")
+                    continue
+
+                # فتح الصفقة وحفظها
+                add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
+
+                # رسالة الإشارة
+                try:
+                    if TRUST_LAYER:
+                        text = format_signal_card(sig, risk_pct=0.005, daily_cap_r=MAX_DAILY_LOSS_R)
+                        await send_channel(text)
+                        audit_id = log_signal(sig, status="opened")
+                        # اربط ال Audit ID بمعرف الصفقة الأخيرة (تقريبياً عبر آخر Trade مفتوح على هذا الرمز)
+                        try:
+                            t = s.query(Trade).filter(Trade.symbol == sig["symbol"], Trade.status == "open")\
+                                              .order_by(Trade.id.desc()).first()
+                            if t:
+                                AUDIT_IDS[t.id] = audit_id
+                        except Exception:
+                            pass
+                    else:
+                        text = format_signal_text_basic(sig)
+                        await send_channel(text)
+                except Exception as e:
+                    logger.exception(f"SEND SIGNAL ERROR: {e}")
+
+            await asyncio.sleep(0.1)
 
 async def loop_signals():
     while True:
@@ -218,16 +362,28 @@ async def monitor_open_trades():
                     hit_tp1 = price >= t.tp1
                     hit_sl = price <= t.sl
                     result = None
+                    exit_px = None
                     if hit_tp2:
-                        result = "tp2"
+                        result = "tp2"; exit_px = float(t.tp2)
                     elif hit_tp1:
-                        result = "tp1"
+                        result = "tp1"; exit_px = float(t.tp1)
                     elif hit_sl:
-                        result = "sl"
+                        result = "sl"; exit_px = float(t.sl)
 
                     if result:
+                        # أغلق بالقاعدة
                         close_trade(s, t.id, result)
-                        await notify_subscribers(format_close_text(t))
+                        # احسب R وحدّث حالة المخاطر
+                        r_multiple = on_trade_closed_update_risk(t, result, exit_px)
+                        # Trust Layer: سجل الإغلاق
+                        if TRUST_LAYER:
+                            audit_id = AUDIT_IDS.get(t.id) or make_audit_id(t.symbol, float(t.entry), 0)
+                            try:
+                                log_close(audit_id, t.symbol, float(exit_px), float(r_multiple), reason=result)
+                            except Exception:
+                                pass
+                        # أرسل الإشعار
+                        await notify_subscribers(format_close_text(t, r_multiple))
                         await asyncio.sleep(0.05)
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
