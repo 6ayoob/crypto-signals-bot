@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from database import try_acquire_leader_lock
 from pathlib import Path
 from typing import Tuple, Optional
 
