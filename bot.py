@@ -3,6 +3,8 @@ import asyncio
 import json
 import hashlib
 import logging
+import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple
@@ -13,6 +15,43 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# ====== [قفل نسخة واحدة — عبر ملف Lock] ======
+# يضمن عدم تشغيل أكثر من نسخة من البوت على نفس الجهاز.
+# يمكن تخصيص مسار القفل عبر BOT_INSTANCE_LOCK، افتراضيًا /tmp/mk1_ai_bot.lock على لينكس/ماك.
+LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
+_LOCK_FP = None
+def _acquire_single_instance_lock():
+    global _LOCK_FP
+    try:
+        _LOCK_FP = open(LOCKFILE_PATH, "w")
+        _LOCK_FP.write(str(os.getpid()))
+        _LOCK_FP.flush()
+        if os.name == "nt":
+            # Windows
+            import msvcrt
+            msvcrt.locking(_LOCK_FP.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            # POSIX
+            import fcntl
+            fcntl.flock(_LOCK_FP, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        print(f"Another bot instance is already running (lock: {LOCKFILE_PATH}). Exiting.")
+        try:
+            _LOCK_FP and _LOCK_FP.close()
+        except Exception:
+            pass
+        sys.exit(1)
+
+_acquire_single_instance_lock()
+# ============================================
+
+# بعض إصدارات Aiogram تعرض TelegramConflictError—نلتقطها بأمان
+try:
+    from aiogram.exceptions import TelegramConflictError
+except Exception:  # احتياط لإصدارات لا تحتوي الاستثناء
+    class TelegramConflictError(Exception):
+        pass
 
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS, USDT_TRC20_WALLET,
@@ -702,6 +741,10 @@ async def main():
 
     try:
         await asyncio.gather(t1, t2, t3, t4)
+    except TelegramConflictError:
+        logger.error("❌ Conflict: يبدو أن نسخة أخرى من البوت تعمل وتستخدم getUpdates. أوقف النسخة الأخرى أو غيّر التوكن.")
+        # خروج هادئ بدل إعادة المحاولة بلا نهاية
+        return
     except Exception as e:
         logger.exception(f"FATAL ERROR: {e}")
         try:
