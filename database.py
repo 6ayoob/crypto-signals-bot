@@ -1,4 +1,4 @@
-# database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite) — متوافق مع bot.py V2
+# database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite) — متوافق مع bot.py V2 + Leader Lock (TTL)
 import os
 import logging
 from contextlib import contextmanager
@@ -10,6 +10,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger("db")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -70,6 +71,13 @@ class Trade(Base):
     result = Column(String(8), nullable=True)  # tp1 | tp2 | sl
     opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     closed_at = Column(DateTime, nullable=True)
+
+# قفل القيادة (Leader)
+class Lock(Base):
+    __tablename__ = "locks"
+    name = Column(String(64), primary_key=True)
+    holder = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 # ---------------------------
 # تهيئة + هجرة خفيفة (إضافة أعمدة ناقصة)
@@ -140,15 +148,18 @@ def _ensure_indexes(connection, dialect: str):
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
 
 def _lightweight_migrate():
+    # أنشئ الجداول أولاً
+    Base.metadata.create_all(bind=engine)
+
     insp = inspect(engine)
     dialect = engine.dialect.name  # 'postgresql' أو 'sqlite'
 
-    # أنشئ الجداول إذا لم تكن موجودة
-    Base.metadata.create_all(bind=engine)
-
     with engine.begin() as conn:
         # users
-        cols_users = {c["name"] for c in insp.get_columns("users")}
+        try:
+            cols_users = {c["name"] for c in insp.get_columns("users")}
+        except Exception:
+            cols_users = set()
         required_users = ["tg_user_id", "trial_used", "end_at", "plan", "last_tx_hash", "created_at"]
         for c in required_users:
             if c not in cols_users:
@@ -158,7 +169,10 @@ def _lightweight_migrate():
                     logger.warning(f"ALTER users ADD {c} failed: {e}")
 
         # trades
-        cols_trades = {c["name"] for c in insp.get_columns("trades")}
+        try:
+            cols_trades = {c["name"] for c in insp.get_columns("trades")}
+        except Exception:
+            cols_trades = set()
         required_trades = [
             "result", "opened_at", "closed_at", "status",
             "tp_final", "audit_id", "score", "regime", "reasons",
@@ -377,19 +391,14 @@ def get_stats_24h(s) -> dict:
 def get_stats_7d(s) -> dict:
     since = _utcnow() - timedelta(days=7)
     return _period_stats(s, since)
-# --- Leader Lock (اختياري) ---
-from sqlalchemy.exc import IntegrityError
 
-class Lock(Base):
-    __tablename__ = "locks"
-    name = Column(String(64), primary_key=True)
-    holder = Column(String(128), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
-
+# ---------------------------
+# Leader Lock APIs
+# ---------------------------
 def try_acquire_leader_lock(name: str, holder: str) -> bool:
     """
     يحاول الاستحواذ على قفل باسم ثابت (leader). لو كان موجودًا مسبقًا يفشل.
-    يعمل بشكل ممتاز على PostgreSQL. على SQLite لن يفيد إلا إذا الملف نفسه مشترك.
+    يعمل على PostgreSQL بشكل ممتاز؛ وعلى SQLite فقط إن كان الملف مشترك.
     """
     with SessionLocal() as s:
         if s.get(Lock, name):
@@ -401,3 +410,60 @@ def try_acquire_leader_lock(name: str, holder: str) -> bool:
         except IntegrityError:
             s.rollback()
             return False
+
+def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300) -> bool:
+    """
+    يحاول أخذ القفل:
+    - إن لم يوجد صف -> ينشئه لك.
+    - إن وُجد لكنه قديم (expired) -> يستولي عليه بتحديث holder و created_at.
+    - غير ذلك -> يفشل.
+    """
+    now = datetime.now(timezone.utc)
+    expiry = now - timedelta(seconds=int(ttl_seconds))
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row is None:
+            s.add(Lock(name=name, holder=holder, created_at=now))
+            try:
+                s.commit(); return True
+            except Exception:
+                s.rollback(); return False
+        # يوجد قفل
+        if row.created_at < expiry:
+            # منتهي الصلاحية -> استيلاء
+            row.holder = holder
+            row.created_at = now
+            try:
+                s.commit(); return True
+            except Exception:
+                s.rollback(); return False
+        return False  # قفل نشط لغيرنا
+
+def heartbeat_leader_lock(name: str, holder: str) -> bool:
+    """
+    يبقي القفل حيًا بتحديث created_at لو كان holder مطابقًا.
+    يرجع False لو القفل تغير لشخص آخر.
+    """
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row is None:
+            return False
+        if row.holder != holder:
+            return False
+        row.created_at = now
+        try:
+            s.commit(); return True
+        except Exception:
+            s.rollback(); return False
+
+def release_leader_lock(name: str, holder: str) -> None:
+    """يحذف القفل لو كنت أنت الـ holder."""
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row and row.holder == holder:
+            s.delete(row)
+            try:
+                s.commit()
+            except Exception:
+                s.rollback()
