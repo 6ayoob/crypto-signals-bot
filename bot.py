@@ -1,6 +1,7 @@
-# bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + دفع TRC20 + تقارير + مخاطر V2 (Hard-Stop/Cooldown) + Trust Layer اختياري
+# bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + TRC20 + تقارير + مخاطر V2 + تكامل add_trade_sig/audit_id
 import asyncio
 import json
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +23,8 @@ from config import (
 # قاعدة البيانات + النماذج + دوال المساعدة
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
-    count_open_trades, add_trade, close_trade,
+    count_open_trades, add_trade, close_trade,  # add_trade بقي للتوافق (لا نستخدمه)
+    add_trade_sig, has_open_trade_on_symbol,    # الدوال الجديدة
     get_stats_24h, get_stats_7d, User, Trade
 )
 
@@ -71,6 +73,12 @@ AUDIT_IDS: dict[int, str] = {}  # trade_id -> audit_id (داخل الذاكرة)
 def _h(s: str) -> str:
     """هروب HTML بسيط."""
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _make_audit_id(symbol: str, entry: float, score: int) -> str:
+    """مولّد داخلي للـ Audit ID عند غياب trust_layer."""
+    base = f"{datetime.utcnow().strftime('%Y-%m-%d')}_{symbol}_{round(float(entry), 4)}_{int(score or 0)}"
+    h = hashlib.md5(base.encode()).hexdigest()[:6]
+    return f"{base}_{h}"
 
 async def send_channel(text: str):
     """إرسال رسالة إلى قناة الإشارات (HTML)."""
@@ -291,6 +299,20 @@ async def fetch_ticker_price(symbol: str) -> float | None:
 # ---------------------------
 SCAN_LOCK = asyncio.Lock()
 
+async def _send_signal_to_channel(sig: dict, audit_id: str | None) -> None:
+    """إرسال بطاقة الإشارة للقناة (Trust Layer إن توفر)."""
+    if TRUST_LAYER:
+        try:
+            text = format_signal_card(sig, risk_pct=0.005, daily_cap_r=MAX_DAILY_LOSS_R)
+            await send_channel(text)
+            # نسجل أيضًا في JSONL
+            _ = log_signal(sig, status="opened")
+            return
+        except Exception as e:
+            logger.exception(f"TRUST LAYER send error: {e}")
+    # تنسيق أساسي fallback
+    await send_channel(format_signal_text_basic(sig))
+
 async def scan_and_dispatch():
     if not AVAILABLE_SYMBOLS:
         return
@@ -313,28 +335,35 @@ async def scan_and_dispatch():
                     logger.info(f"SKIP SIGNAL {sym}: {reason}")
                     continue
 
-                # فتح الصفقة وحفظها
-                add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
-
-                # رسالة الإشارة
+                # لا تفتح صفقة ثانية على نفس الرمز إن كانت مفتوحة
                 try:
-                    if TRUST_LAYER:
-                        text = format_signal_card(sig, risk_pct=0.005, daily_cap_r=MAX_DAILY_LOSS_R)
-                        await send_channel(text)
-                        audit_id = log_signal(sig, status="opened")
-                        # اربط ال Audit ID بمعرف الصفقة الأخيرة (تقريبياً عبر آخر Trade مفتوح على هذا الرمز)
-                        try:
-                            t = s.query(Trade).filter(Trade.symbol == sig["symbol"], Trade.status == "open")\
-                                              .order_by(Trade.id.desc()).first()
-                            if t:
-                                AUDIT_IDS[t.id] = audit_id
-                        except Exception:
-                            pass
-                    else:
-                        text = format_signal_text_basic(sig)
-                        await send_channel(text)
+                    if has_open_trade_on_symbol(s, sig["symbol"]):
+                        logger.info(f"SKIP {sym}: already open position")
+                        continue
+                except Exception:
+                    pass
+
+                # حضّر audit_id (واحد موحّد مع Trust Layer)
+                if TRUST_LAYER:
+                    audit_id = make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
+                else:
+                    audit_id = _make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
+
+                # أضف الصفقة باستخدام add_trade_sig (يحفظ score/regime/reasons/audit_id/tp_final)
+                try:
+                    trade_id = add_trade_sig(s, sig, audit_id=audit_id, qty=None)
+                    AUDIT_IDS[trade_id] = audit_id
                 except Exception as e:
-                    logger.exception(f"SEND SIGNAL ERROR: {e}")
+                    logger.exception(f"add_trade_sig error, fallback to add_trade: {e}")
+                    trade_id = add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
+                    AUDIT_IDS[trade_id] = audit_id
+
+            # إرسال الإشارة للقناة/المشتركين
+            try:
+                await _send_signal_to_channel(sig, audit_id)
+                logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
+            except Exception as e:
+                logger.exception(f"SEND SIGNAL ERROR: {e}")
 
             await asyncio.sleep(0.1)
 
@@ -372,12 +401,21 @@ async def monitor_open_trades():
 
                     if result:
                         # أغلق بالقاعدة
-                        close_trade(s, t.id, result)
+                        close_trade(s, t.id, result, exit_price=exit_px)
                         # احسب R وحدّث حالة المخاطر
                         r_multiple = on_trade_closed_update_risk(t, result, exit_px)
+                        # خزّن r_multiple أيضًا في السجل (تعديل ثانٍ اختياري—لدقة أعلى)
+                        try:
+                            close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
+                        except Exception:
+                            pass
+
                         # Trust Layer: سجل الإغلاق
+                        audit_id = AUDIT_IDS.get(t.id)
+                        if not audit_id:
+                            # نبني Audit محلي لو لم يكن محفوظ
+                            audit_id = _make_audit_id(t.symbol, float(t.entry), 0)
                         if TRUST_LAYER:
-                            audit_id = AUDIT_IDS.get(t.id) or make_audit_id(t.symbol, float(t.entry), 0)
                             try:
                                 log_close(audit_id, t.symbol, float(exit_px), float(r_multiple), reason=result)
                             except Exception:
