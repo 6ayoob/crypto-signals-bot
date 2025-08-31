@@ -35,6 +35,24 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 Base = declarative_base()
 
 # ---------------------------
+# Helpers
+# ---------------------------
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+def _as_aware(dt: datetime | None) -> datetime | None:
+    """حوّل أي datetime إلى UTC-aware (يفترض UTC إن كان naive)."""
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        # إن حدث أي خطأ، أعده كما هو لتفادي كسر السريان
+        return dt
+
+# ---------------------------
 # النماذج (Models)
 # ---------------------------
 class User(Base):
@@ -45,7 +63,7 @@ class User(Base):
     end_at = Column(DateTime, nullable=True)             # UTC
     plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w"
     last_tx_hash = Column(String(128), nullable=True)    # رقم المرجع/Tx
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 class Trade(Base):
     __tablename__ = "trades"
@@ -69,7 +87,7 @@ class Trade(Base):
     # حالة
     status = Column(String(8), default="open", index=True, nullable=False)  # open | closed
     result = Column(String(8), nullable=True)  # tp1 | tp2 | sl
-    opened_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    opened_at = Column(DateTime, default=_utcnow, nullable=False)
     closed_at = Column(DateTime, nullable=True)
 
 # قفل القيادة (Leader)
@@ -77,7 +95,7 @@ class Lock(Base):
     __tablename__ = "locks"
     name = Column(String(64), primary_key=True)
     holder = Column(String(128), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 # ---------------------------
 # تهيئة + هجرة خفيفة (إضافة أعمدة ناقصة)
@@ -136,8 +154,7 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
 
     if dialect == "postgresql":
         return f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {typ};'
-    # SQLite لا يدعم IF NOT EXISTS للأعمدة
-    return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'
+    return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'  # SQLite
 
 def _ensure_indexes(connection, dialect: str):
     if dialect == "postgresql":
@@ -148,11 +165,10 @@ def _ensure_indexes(connection, dialect: str):
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
 
 def _lightweight_migrate():
-    # أنشئ الجداول أولاً
     Base.metadata.create_all(bind=engine)
 
     insp = inspect(engine)
-    dialect = engine.dialect.name  # 'postgresql' أو 'sqlite'
+    dialect = engine.dialect.name
 
     with engine.begin() as conn:
         # users
@@ -185,7 +201,6 @@ def _lightweight_migrate():
                 except Exception as e:
                     logger.warning(f"ALTER trades ADD {c} failed: {e}")
 
-        # فهارس
         try:
             _ensure_indexes(conn, dialect)
         except Exception as e:
@@ -217,9 +232,6 @@ def get_session():
 # ---------------------------
 # وظائف الاشتراك
 # ---------------------------
-def _utcnow():
-    return datetime.now(timezone.utc)
-
 def _get_or_create_user(s, tg_user_id: int) -> User:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
     if not u:
@@ -232,7 +244,8 @@ def is_active(s, tg_user_id: int) -> bool:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
     if not u or not u.end_at:
         return False
-    return u.end_at > _utcnow()
+    # طبّع القيمة لضمان الاتساق
+    return _as_aware(u.end_at) > _utcnow()
 
 def start_trial(s, tg_user_id: int) -> bool:
     u = _get_or_create_user(s, tg_user_id)
@@ -240,8 +253,8 @@ def start_trial(s, tg_user_id: int) -> bool:
         return False
     u.trial_used = True
     base = _utcnow()
-    if u.end_at and u.end_at > base:
-        base = u.end_at
+    if u.end_at and _as_aware(u.end_at) > base:
+        base = _as_aware(u.end_at)
     u.end_at = base + timedelta(days=1)
     u.plan = "trial"
     return True
@@ -249,7 +262,7 @@ def start_trial(s, tg_user_id: int) -> bool:
 def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str | None = None) -> datetime:
     u = _get_or_create_user(s, tg_user_id)
     now = _utcnow()
-    base = u.end_at if (u.end_at and u.end_at > now) else now
+    base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
     u.end_at = base + timedelta(days=int(duration_days))
     u.plan = plan
     if tx_hash:
@@ -261,17 +274,12 @@ def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str
 # وظائف الصفقات
 # ---------------------------
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> int:
-    """إصدار قديم للتوافق."""
     t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2, status="open")
     s.add(t)
     s.flush()
     return t.id
 
 def add_trade_sig(s, sig: dict, audit_id: str | None = None, qty: float | None = None) -> int:
-    """
-    إصدار حديث يدعم خصائص إضافية (score/regime/reasons/tp_final/audit_id).
-    sig: {symbol, side, entry, sl, tp1, tp2, [tp_final], [score], [regime], [reasons]}
-    """
     t = Trade(
         symbol=sig["symbol"],
         side=sig["side"],
@@ -299,10 +307,6 @@ def count_open_trades(s) -> int:
     return s.execute(select(func.count(Trade.id)).where(Trade.status == "open")).scalar() or 0
 
 def close_trade(s, trade_id: int, result: str, exit_price: float | None = None, r_multiple: float | None = None):
-    """
-    إغلاق صفقة مع توثيق النتيجة. result ∈ {"tp1","tp2","sl"}.
-    يقبل exit_price و r_multiple كحقول اختيارية (متوافقة مع bot.py V2).
-    """
     t = s.get(Trade, trade_id)
     if not t:
         return
@@ -356,7 +360,6 @@ def _period_stats(s, since: datetime) -> dict:
         if t.r_multiple is not None:
             r_sum += float(t.r_multiple)
             continue
-        # fallback الحساب القديم إن لم تُسجَّل r_multiple
         try:
             risk = max(float(t.entry) - float(t.sl), 1e-9)
             if t.result == "tp1":
@@ -396,10 +399,6 @@ def get_stats_7d(s) -> dict:
 # Leader Lock APIs
 # ---------------------------
 def try_acquire_leader_lock(name: str, holder: str) -> bool:
-    """
-    يحاول الاستحواذ على قفل باسم ثابت (leader). لو كان موجودًا مسبقًا يفشل.
-    يعمل على PostgreSQL بشكل ممتاز؛ وعلى SQLite فقط إن كان الملف مشترك.
-    """
     with SessionLocal() as s:
         if s.get(Lock, name):
             return False
@@ -412,13 +411,7 @@ def try_acquire_leader_lock(name: str, holder: str) -> bool:
             return False
 
 def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300) -> bool:
-    """
-    يحاول أخذ القفل:
-    - إن لم يوجد صف -> ينشئه لك.
-    - إن وُجد لكنه قديم (expired) -> يستولي عليه بتحديث holder و created_at.
-    - غير ذلك -> يفشل.
-    """
-    now = datetime.now(timezone.utc)
+    now = _utcnow()
     expiry = now - timedelta(seconds=int(ttl_seconds))
     with SessionLocal() as s:
         row = s.get(Lock, name)
@@ -428,23 +421,18 @@ def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300)
                 s.commit(); return True
             except Exception:
                 s.rollback(); return False
-        # يوجد قفل
-        if row.created_at < expiry:
-            # منتهي الصلاحية -> استيلاء
+        row_ct = _as_aware(row.created_at)
+        if row_ct is not None and row_ct < expiry:
             row.holder = holder
             row.created_at = now
             try:
                 s.commit(); return True
             except Exception:
                 s.rollback(); return False
-        return False  # قفل نشط لغيرنا
+        return False
 
 def heartbeat_leader_lock(name: str, holder: str) -> bool:
-    """
-    يبقي القفل حيًا بتحديث created_at لو كان holder مطابقًا.
-    يرجع False لو القفل تغير لشخص آخر.
-    """
-    now = datetime.now(timezone.utc)
+    now = _utcnow()
     with SessionLocal() as s:
         row = s.get(Lock, name)
         if row is None:
@@ -458,7 +446,6 @@ def heartbeat_leader_lock(name: str, holder: str) -> bool:
             s.rollback(); return False
 
 def release_leader_lock(name: str, holder: str) -> None:
-    """يحذف القفل لو كنت أنت الـ holder."""
     with SessionLocal() as s:
         row = s.get(Lock, name)
         if row and row.holder == holder:
