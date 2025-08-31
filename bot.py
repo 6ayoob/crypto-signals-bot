@@ -1,5 +1,5 @@
 # bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + TRC20 + تقارير + مخاطر V2
-# + تكامل add_trade_sig/audit_id + نظام تواصل/دعم للمشتركين (Support) + Leader DB Lock
+# + تكامل add_trade_sig/audit_id + نظام تواصل/دعم + Leader Lock مع TTL/Heartbeat
 import asyncio
 import json
 import hashlib
@@ -18,7 +18,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ====== [قفل نسخة واحدة — عبر ملف Lock] ======
+# ====== [قفل ملف محلي لمنع نسختين على نفس الجهاز] ======
 LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
 _LOCK_FP = None
 def _acquire_single_instance_lock():
@@ -38,7 +38,7 @@ def _acquire_single_instance_lock():
 _acquire_single_instance_lock()
 # ============================================
 
-# بعض بيئات Aiogram: نلتقط TelegramConflictError إن توفر
+# تلغرام Conflict (قد لا يتوفر في بعض الإصدارات)
 try:
     from aiogram.exceptions import TelegramConflictError
 except Exception:
@@ -50,23 +50,23 @@ from config import (
     PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD, SUB_DURATION_2W, SUB_DURATION_4W
 )
 
-# قاعدة البيانات + النماذج + دوال المساعدة
+# قاعدة البيانات
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
-    count_open_trades, add_trade, close_trade,  # add_trade للتوافق
+    count_open_trades, add_trade, close_trade,
     add_trade_sig, has_open_trade_on_symbol,
     get_stats_24h, get_stats_7d, User, Trade,
-    try_acquire_leader_lock,   # ⬅️ قفل قائد عبر قاعدة البيانات
+    acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock
 )
 
 # الاستراتيجية + الرموز
 from strategy import check_signal
 from symbols import SYMBOLS
 
-# الدفع TRON (رقم المرجع TxID)
+# الدفع TRON
 from payments_tron import extract_txid, find_trc20_transfer_to_me, REFERENCE_HINT
 
-# --- Trust Layer (اختياري) ---
+# Trust Layer (اختياري)
 try:
     from trust_layer import format_signal_card, log_signal, log_close, make_audit_id
     TRUST_LAYER = True
@@ -83,26 +83,33 @@ logging.getLogger("aiogram").setLevel(logging.INFO)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# استخدم OKX
+# OKX
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: list[str] = []
 
-SIGNAL_SCAN_INTERVAL_SEC = 300  # 5 دقائق
+SIGNAL_SCAN_INTERVAL_SEC = 300
 MONITOR_INTERVAL_SEC = 15
 TIMEFRAME = "5m"
 
-# --- حوكمة مخاطر V2 ---
+# مخاطر V2
 RISK_STATE_FILE = Path("risk_state.json")
 MAX_DAILY_LOSS_R = 2.0
 MAX_LOSSES_STREAK = 3
 COOLDOWN_HOURS = 6
 AUDIT_IDS: dict[int, str] = {}
 
-# --- دعم/تواصل ---
+# دعم/تواصل
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
-SUPPORT_WAIT: dict[int, float] = {}         # user_id -> expiry_ts
-ADMIN_REPLY_TARGET: dict[int, int] = {}     # admin_id -> user_id (الرد القادم يذهب لهذا المستخدم)
+SUPPORT_WAIT: dict[int, float] = {}
+ADMIN_REPLY_TARGET: dict[int, int] = {}
 SUPPORT_WAIT_MINUTES = 10
+
+# Leader Lock (بيئة)
+ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
+LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
+LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # ثواني
+HEARTBEAT_INTERVAL = max(10, LEADER_TTL // 2)
 
 # ---------------------------
 # أدوات مساعدة
@@ -140,13 +147,11 @@ async def send_channel(text: str):
         logger.error(f"send_channel error: {e}")
 
 async def send_admins(text: str):
-    # إلى مجموعة دعم محددة إن توفرت
     if SUPPORT_CHAT_ID:
         try:
             await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode="HTML")
         except Exception as e:
             logger.warning(f"SUPPORT_CHAT notify error: {e}")
-    # وإلى كل الأدمن
     for admin_id in ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, text, parse_mode="HTML")
@@ -295,7 +300,7 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
     return r_multiple
 
 # ---------------------------
-# OKX: الأسواق
+# OKX
 # ---------------------------
 async def load_okx_markets_and_filter():
     global AVAILABLE_SYMBOLS
@@ -335,7 +340,7 @@ async def fetch_ticker_price(symbol: str) -> float | None:
         return None
 
 # ---------------------------
-# حلقة فحص الإشارات
+# فحص الإشارات
 # ---------------------------
 SCAN_LOCK = asyncio.Lock()
 
@@ -549,7 +554,7 @@ async def cb_tx_help(q: CallbackQuery):
 async def cb_sub_info(q: CallbackQuery):
     await cmd_pay(q.message); await q.answer()
 
-# --- دعم: فتح محادثة المستخدم ---
+# دعم: فتح محادثة
 @dp.message(Command("support"))
 async def cmd_support(m: Message):
     _support_set(m.from_user.id)
@@ -577,7 +582,6 @@ async def cb_support(q: CallbackQuery):
     await q.answer()
 
 async def _send_ticket_to_admins(user_msg: Message):
-    # اجمع حالة المستخدم من قاعدة البيانات
     uid = user_msg.from_user.id
     username = f"@{user_msg.from_user.username}" if user_msg.from_user.username else "-"
     with get_session() as s:
@@ -602,9 +606,7 @@ async def _send_ticket_to_admins(user_msg: Message):
     kb.button(text="↩️ الرد على المستخدم", callback_data=f"reply_to:{uid}")
     kb.adjust(1)
 
-    # أرسل الهيدر ثم انسخ الرسالة الأصلية
     await send_admins(header)
-    # انسخ الرسالة للأدمنين + قروب الدعم (لو محدد)
     targets = list(ADMIN_USER_IDS)
     if SUPPORT_CHAT_ID:
         targets.append(SUPPORT_CHAT_ID)
@@ -615,17 +617,14 @@ async def _send_ticket_to_admins(user_msg: Message):
         except Exception as e:
             logger.warning(f"copy ticket to {chat_id} failed: {e}")
 
-# --- دعم: تحويل أي رسالة أثناء الانتظار إلى «تذكرة» ---
 @dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
 async def any_user_message_router(m: Message):
     uid = m.from_user.id
-    # إن كان المستخدم في وضع الدعم
     if _support_waiting(uid):
         _support_clear(uid)
         await m.answer("✅ تم استلام رسالتك. سيردّ عليك الدعم قريبًا.", parse_mode="HTML")
         await _send_ticket_to_admins(m)
 
-# --- دعم: الإداري يضغط «الرد على المستخدم» ---
 @dp.callback_query(F.data.startswith("reply_to:"))
 async def cb_reply_to(q: CallbackQuery):
     if q.from_user.id not in ADMIN_USER_IDS:
@@ -638,14 +637,12 @@ async def cb_reply_to(q: CallbackQuery):
     await q.message.answer(f"✍️ أرسل رسالتك الآن، سيتم إرسالها للمستخدم <code>{uid}</code>.", parse_mode="HTML")
     await q.answer("اكتب ردك الآن.")
 
-# --- دعم: أول رسالة يرسلها الإداري بعد الضغط تُرسل للمستخدم ---
 @dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
 async def admin_reply_bridge(m: Message):
     aid = m.from_user.id
     target = ADMIN_REPLY_TARGET.get(aid)
     if not target:
-        return  # ليس في وضع الرد
-    # أرسل للمستخدم: عنوان + نسخة من رسالة الأدمن
+        return
     try:
         await bot.send_message(target, "📩 <b>رد من الدعم</b>:", parse_mode="HTML")
         await bot.copy_message(chat_id=target, from_chat_id=aid, message_id=m.message_id)
@@ -747,7 +744,7 @@ async def check_channel_and_admin_dm():
     ok = True
     try:
         chat = await bot.get_chat(TELEGRAM_CHANNEL_ID)
-        logger.info(f"CHANNEL OK: {chat.id} / {chat.title or {}}".format(chat.username or 'channel'))
+        logger.info(f"CHANNEL OK: {chat.id} / {chat.title or chat.username or 'channel'}")
     except Exception as e:
         logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
         ok = False
@@ -761,21 +758,38 @@ async def check_channel_and_admin_dm():
     return ok
 
 # ---------------------------
+# Leader heartbeat task
+# ---------------------------
+async def _leader_heartbeat_task(name: str, holder: str):
+    while True:
+        try:
+            ok = heartbeat_leader_lock(name, holder)
+            if not ok:
+                logger.error("Leader lock lost! Exiting worker loop.")
+                os._exit(1)  # خروج فوري ليستلمه Orchestrator
+        except Exception as e:
+            logger.warning(f"Heartbeat error: {e}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+# ---------------------------
 # التشغيل
 # ---------------------------
 async def main():
     init_db()
 
-    # قفل قائد عبر قاعدة البيانات لمنع تكرار النسخ بين الخوادم/المنصّات
-    holder = os.getenv("SERVICE_NAME") or os.getenv("HOSTNAME") or f"pid-{os.getpid()}"
-    if os.getenv("ENABLE_DB_LOCK", "1") == "1":
-        if not try_acquire_leader_lock("telebot_poller", holder):
+    # Leader Lock (عبر قاعدة البيانات)
+    hb_task = None
+    holder = f"{SERVICE_NAME}:{os.getpid()}"
+    if ENABLE_DB_LOCK:
+        ok = acquire_or_steal_leader_lock(LEADER_LOCK_NAME, holder, ttl_seconds=LEADER_TTL)
+        if not ok:
             logger.error("Another instance holds the leader DB lock. Exiting.")
             return
+        hb_task = asyncio.create_task(_leader_heartbeat_task(LEADER_LOCK_NAME, holder))
 
     await load_okx_markets_and_filter()
 
-    # تأكد من عدم وجود Webhook لأننا نستعمل polling
+    # احذف أي Webhook لأننا نستعمل polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
@@ -784,7 +798,6 @@ async def main():
 
     await check_channel_and_admin_dm()
 
-    # مهام Worker فقط
     t1 = asyncio.create_task(dp.start_polling(bot))
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
@@ -802,6 +815,14 @@ async def main():
         except Exception:
             pass
         raise
+    finally:
+        if ENABLE_DB_LOCK:
+            try:
+                release_leader_lock(LEADER_LOCK_NAME, holder)
+            except Exception:
+                pass
+        if hb_task:
+            hb_task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
