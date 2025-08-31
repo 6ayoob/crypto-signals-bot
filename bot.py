@@ -1,5 +1,5 @@
 # bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + TRC20 + تقارير + مخاطر V2
-# + تكامل add_trade_sig/audit_id + نظام تواصل/دعم + Leader Lock مع TTL/Heartbeat
+# + تكامل add_trade_sig/audit_id + نظام تواصل/دعم + Leader Lock متوافق رجعيًا
 import asyncio
 import json
 import hashlib
@@ -18,7 +18,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ====== [قفل ملف محلي لمنع نسختين على نفس الجهاز] ======
+# ====== قفل ملف محلي لمنع نسختين على نفس الجهاز ======
 LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
 _LOCK_FP = None
 def _acquire_single_instance_lock():
@@ -50,14 +50,41 @@ from config import (
     PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD, SUB_DURATION_2W, SUB_DURATION_4W
 )
 
-# قاعدة البيانات
+# قاعدة البيانات: استيراد أساسي دائمًا
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
     count_open_trades, add_trade, close_trade,
     add_trade_sig, has_open_trade_on_symbol,
-    get_stats_24h, get_stats_7d, User, Trade,
-    acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock
+    get_stats_24h, get_stats_7d, User, Trade
 )
+
+# ---------- Leader Lock (بيئة + استيراد متحمل للأخطاء) ----------
+ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
+LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
+LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # ثواني
+HEARTBEAT_INTERVAL = max(10, LEADER_TTL // 2)
+
+# حاول استخدام الدوال الجديدة؛ لو غير موجودة، جرّب القديمة؛ وإلا عطّل القفل
+acquire_or_steal_leader_lock = heartbeat_leader_lock = release_leader_lock = None
+if ENABLE_DB_LOCK:
+    try:
+        from database import acquire_or_steal_leader_lock as _acq
+        from database import heartbeat_leader_lock as _hb
+        from database import release_leader_lock as _rel
+        acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock = _acq, _hb, _rel
+    except Exception:
+        try:
+            from database import try_acquire_leader_lock as _try_acq
+            def acquire_or_steal_leader_lock(name, holder, ttl_seconds=300):
+                return _try_acq(name, holder)
+            def heartbeat_leader_lock(name, holder):
+                return True
+            def release_leader_lock(name, holder):
+                pass
+        except Exception:
+            ENABLE_DB_LOCK = False  # لا توجد دوال قفل في database.py الحالي
+# ------------------------------------------------------------------
 
 # الاستراتيجية + الرموز
 from strategy import check_signal
@@ -103,13 +130,6 @@ SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv(
 SUPPORT_WAIT: dict[int, float] = {}
 ADMIN_REPLY_TARGET: dict[int, int] = {}
 SUPPORT_WAIT_MINUTES = 10
-
-# Leader Lock (بيئة)
-ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
-LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
-SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
-LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # ثواني
-HEARTBEAT_INTERVAL = max(10, LEADER_TTL // 2)
 
 # ---------------------------
 # أدوات مساعدة
@@ -554,7 +574,7 @@ async def cb_tx_help(q: CallbackQuery):
 async def cb_sub_info(q: CallbackQuery):
     await cmd_pay(q.message); await q.answer()
 
-# دعم: فتح محادثة
+# دعم
 @dp.message(Command("support"))
 async def cmd_support(m: Message):
     _support_set(m.from_user.id)
@@ -766,7 +786,7 @@ async def _leader_heartbeat_task(name: str, holder: str):
             ok = heartbeat_leader_lock(name, holder)
             if not ok:
                 logger.error("Leader lock lost! Exiting worker loop.")
-                os._exit(1)  # خروج فوري ليستلمه Orchestrator
+                os._exit(1)
         except Exception as e:
             logger.warning(f"Heartbeat error: {e}")
         await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -777,10 +797,9 @@ async def _leader_heartbeat_task(name: str, holder: str):
 async def main():
     init_db()
 
-    # Leader Lock (عبر قاعدة البيانات)
     hb_task = None
     holder = f"{SERVICE_NAME}:{os.getpid()}"
-    if ENABLE_DB_LOCK:
+    if ENABLE_DB_LOCK and acquire_or_steal_leader_lock:
         ok = acquire_or_steal_leader_lock(LEADER_LOCK_NAME, holder, ttl_seconds=LEADER_TTL)
         if not ok:
             logger.error("Another instance holds the leader DB lock. Exiting.")
@@ -789,7 +808,6 @@ async def main():
 
     await load_okx_markets_and_filter()
 
-    # احذف أي Webhook لأننا نستعمل polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
@@ -816,7 +834,7 @@ async def main():
             pass
         raise
     finally:
-        if ENABLE_DB_LOCK:
+        if ENABLE_DB_LOCK and release_leader_lock:
             try:
                 release_leader_lock(LEADER_LOCK_NAME, holder)
             except Exception:
