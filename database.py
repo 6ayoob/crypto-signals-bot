@@ -377,3 +377,27 @@ def get_stats_24h(s) -> dict:
 def get_stats_7d(s) -> dict:
     since = _utcnow() - timedelta(days=7)
     return _period_stats(s, since)
+# --- Leader Lock (اختياري) ---
+from sqlalchemy.exc import IntegrityError
+
+class Lock(Base):
+    __tablename__ = "locks"
+    name = Column(String(64), primary_key=True)
+    holder = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+def try_acquire_leader_lock(name: str, holder: str) -> bool:
+    """
+    يحاول الاستحواذ على قفل باسم ثابت (leader). لو كان موجودًا مسبقًا يفشل.
+    يعمل بشكل ممتاز على PostgreSQL. على SQLite لن يفيد إلا إذا الملف نفسه مشترك.
+    """
+    with SessionLocal() as s:
+        if s.get(Lock, name):
+            return False
+        s.add(Lock(name=name, holder=holder))
+        try:
+            s.commit()
+            return True
+        except IntegrityError:
+            s.rollback()
+            return False
