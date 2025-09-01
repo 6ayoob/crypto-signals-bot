@@ -1,6 +1,6 @@
 # set_commands.py
 # ضبط أوامر تيليجرام برمجيًا (Telegram Bot API) باستخدام aiogram v3
-# - يضبط أوامر المستخدم كـ Default (تظهر لكل المشتركين)
+# - يضبط أوامر المستخدم كـ Default (تظهر لكل المستخدمين)
 # - يضبط أوامر الأدمن في محادثات محددة (user_id / chat_id)
 # مصادر التوكن/الأدمن:
 #   1) من config.py (TELEGRAM_BOT_TOKEN, ADMIN_USER_IDS) إن وُجد
@@ -21,19 +21,21 @@ from aiogram.types import (
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 )
 
+# === وضع يدوي فقط: لا /pay ولا /submit_tx ===
 DEFAULT_COMMANDS = [
-    BotCommand(command="start",      description="البداية والقائمة الرئيسية"),
-    BotCommand(command="pay",        description="الدفع USDT (TRC20) + طريقة الإرسال"),
-    BotCommand(command="submit_tx",  description="تفعيل الاشتراك عبر رقم المرجع (TxID)"),
-    BotCommand(command="status",     description="حالة اشتراكك"),
-    BotCommand(command="help",       description="المساعدة وقائمة الأوامر"),
+    BotCommand(command="start",  description="البداية والقائمة الرئيسية"),
+    BotCommand(command="status", description="حالة اشتراكك"),
+    BotCommand(command="help",   description="المساعدة وقائمة الأوامر"),
 ]
 
+# أوامر الأدمن الملائمة للوضع اليدوي
 ADMIN_COMMANDS = [
-    BotCommand(command="admin_help",  description="تعليمات الأدمن"),
-    BotCommand(command="approve",     description="تفعيل يدوي: /approve <user_id> <2w|4w> [ref]"),
-    BotCommand(command="broadcast",   description="بث رسالة لكل المشتركين"),
-    BotCommand(command="force_report",description="إرسال التقرير اليومي فورًا"),
+    BotCommand(command="admin",        description="لوحة الأدمن"),
+    BotCommand(command="admin_help",   description="تعليمات الأدمن"),
+    BotCommand(command="approve",      description="تفعيل: /approve <user_id> <2w|4w> [ref]"),
+    BotCommand(command="activate",     description="مرادف لـ /approve"),
+    BotCommand(command="broadcast",    description="بث رسالة لكل المشتركين"),
+    BotCommand(command="force_report", description="إرسال التقرير اليومي فورًا"),
 ]
 
 def parse_admin_ids(s: str | None):
@@ -97,10 +99,10 @@ async def main():
 
     bot = Bot(token=token)
 
+    # الوضع الافتراضي: طبّق الكل
     if args.apply_all or (not any([
         args.default_only, args.admin_only, args.clear_default, args.clear_admin
     ])):
-        # الوضع الافتراضي: طبّق الكل
         await set_default(bot)
         await set_admin_for_ids(bot, admins)
         return
