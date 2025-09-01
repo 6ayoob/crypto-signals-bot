@@ -1,9 +1,10 @@
-# bot.py — مُشغِّل البوت (Aiogram v3) مع تفعيل يدوي مبسّط (2w / 4w) + تقارير + مخاطر + قفل قائد
-# هذه النسخة:
-# - لا تحتوي على أي دفع آلي (TRC20) أو أوامر /submit_tx.
-# - عند "🔑 طلب اشتراك": تُرسل للمستخدم المحفظة والأسعار والخطوات + زر خاص لمراسلة الأدمن،
-#   وتُرسل للأدمن إشعارًا بأزرار تفعيل 2w/4w/رفض (الأدمن يتأكد يدويًا من المبلغ قبل التفعيل).
-# - التجربة المجانية معطّلة افتراضيًا ويمكن تفعيلها عبر ENV: ENABLE_TRIAL=1.
+# bot.py — تشغيل Aiogram v3 | تفعيل يدوي + دعوة قناة + تجربة يومية + تقارير + مخاطر + قفل قائد
+# الجديد:
+# - زر "🔑 طلب اشتراك": يرسل إشعارًا للأدمن + يرسل للمستخدم عنوان المحفظة والانتقال لمراسلة الأدمن.
+# - بعد أي تفعيل (Approve): إرسال رابط دعوة للقناة تلقائيًا (توليد/ثابت).
+# - إضافة أمر /trial بجانب زر التجربة في /start، ومعه إرسال رابط القناة عند النجاح.
+# - لا يوجد دفع أوتوماتيكي/TxID.
+# المتطلبات: اجعل البوت "مشرفًا" في القناة ليتمكن من create_chat_invite_link، أو وفّر CHANNEL_INVITE_LINK ثابت.
 
 import asyncio
 import json
@@ -54,10 +55,9 @@ except Exception:
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS,
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
-    SUB_DURATION_2W, SUB_DURATION_4W,
-    # القيم التالية اختيارية للعرض في الرسائل فقط:
-    PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD,
-    USDT_TRC20_WALLET,
+    PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD,  # اختياري للعرض
+    SUB_DURATION_2W, SUB_DURATION_4W,      # إلزامي للتفعيل
+    USDT_TRC20_WALLET                      # اختياري للعرض في الرسائل
 )
 
 # قاعدة البيانات
@@ -112,7 +112,7 @@ dp = Dispatcher()
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: List[str] = []
 
-# ==== محدّد المعدّل لواجهات OKX العامة ====
+# ==== Rate Limiter لواجهات OKX العامة ====
 OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))      # طلبات لكل نافذة
 OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))  # مدة النافذة بالثواني
 class SlidingRateLimiter:
@@ -157,8 +157,24 @@ _LAST_SIGNAL_AT: Dict[str, float] = {}
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
 
-# ===== إعداد: تمكين/تعطيل التجربة المجانية عبر ENV =====
-ENABLE_TRIAL = os.getenv("ENABLE_TRIAL", "0") == "1"
+# ===== روابط دعوة القناة =====
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # إن وفّرت رابطًا ثابتًا
+async def get_channel_invite_link() -> Optional[str]:
+    # 1) إن وُجد رابط ثابت في .env استخدمه
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
+    # 2) توليد رابط جديد (يتطلب أن يكون البوت مشرفًا في القناة)
+    try:
+        inv = await bot.create_chat_invite_link(TELEGRAM_CHANNEL_ID, creates_join_request=False)
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK create failed: {e}")
+        return None
+
+def invite_kb(url: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📣 ادخل القناة الآن", url=url)
+    return kb.as_markup()
 
 # ====== تدفق تفعيل يدوي للأدمن ======
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # {admin_id: {'stage': 'await_user'|'await_plan'|'await_ref', 'uid': int, 'plan': '2w'|'4w'}}
@@ -217,20 +233,7 @@ def _contact_line() -> str:
     if SUPPORT_CHAT_ID:
         parts.append(f"🆔 معرّف الأدمن: <code>{SUPPORT_CHAT_ID}</code>")
     if SUPPORT_CHAT_ID and not SUPPORT_USERNAME:
-        parts.append(f"⚡️ أو افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
-    return "\n".join(parts) if parts else "—"
-
-def _price_wallet_block() -> str:
-    parts = []
-    try:
-        parts.append(f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>")
-    except Exception:
-        pass
-    try:
-        if USDT_TRC20_WALLET:
-            parts.append(f"محفظة USDT (TRC20):\n<code>{_h(USDT_TRC20_WALLET)}</code>")
-    except Exception:
-        pass
+        parts.append(f"⚡️ افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
     return "\n".join(parts) if parts else "—"
 
 async def welcome_text() -> str:
@@ -239,16 +242,22 @@ async def welcome_text() -> str:
         price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
     except Exception:
         pass
+    wallet_line = ""
+    try:
+        if USDT_TRC20_WALLET:
+            wallet_line = f"محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n"
+    except Exception:
+        pass
     return (
-        "👋 أهلاً بك في <b>عالم الفرص</b> — حيث تُلتقط الحركات القوية قبل أن يشاهدها الجميع!\n\n"
-        "🔔 إشارات لحظية مبنية على منهجية صارمة (Score + Regime + إدارة مخاطر)\n"
-        f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n"
-        "💰 استراتيجيتنا تركز على <b>حماية رأس المال أولاً</b> ثم تعظيم العائد.\n\n"
+        "👋 أهلاً بك في <b>عالم الفرص</b>\n\n"
+        "🔔 إشارات لحظية + تقرير يومي + إدارة مخاطر.\n"
+        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
         "خطط الاشتراك:\n"
         f"{price_line}"
-        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصلك عنوان المحفظة وخطوات الدفع، ثم يتحقق الأدمن ويفعّل الاشتراك (2w/4w).\n\n"
-        + ("✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n" if ENABLE_TRIAL else "")
-        + "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن لتفعيلك لمدة 2 أسابيع أو 4 أسابيع.\n\n"
+        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
+        f"{wallet_line}"
+        "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
     )
 
 # ===== زر مراسلة الأدمن (خاص) =====
@@ -622,8 +631,7 @@ async def daily_report_loop():
 async def cmd_start(m: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🔑 طلب اشتراك", callback_data="req_sub")
-    if ENABLE_TRIAL:
-        kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
+    kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
     kb.button(text="🧾 حالة اشتراكي", callback_data="status_btn")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
@@ -644,21 +652,42 @@ async def cb_status_btn(q: CallbackQuery):
 
 @dp.callback_query(F.data == "start_trial")
 async def cb_trial(q: CallbackQuery):
-    if not ENABLE_TRIAL:
-        return await q.answer("التجربة غير مفعلة حاليًا.", show_alert=True)
     with get_session() as s:
         ok = start_trial(s, q.from_user.id)
     if ok:
         await q.message.answer(
             "✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁\n"
-            "🚀 استعد لتجربة إشارات احترافية مع إدارة مخاطرة منضبطة.", parse_mode="HTML")
+            "🚀 استمتع بالإشارات والتقرير اليومي.", parse_mode="HTML")
+        # إرسال دعوة للقناة
+        invite = await get_channel_invite_link()
+        if invite:
+            try:
+                await bot.send_message(q.from_user.id, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
+            except Exception as e:
+                logger.warning(f"SEND INVITE(TRIAL) ERROR: {e}")
     else:
         await q.message.answer(
             "ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\n"
-            "✨ يمكنك طلب الاشتراك الآن والاستفادة من كامل الميزات.", parse_mode="HTML")
+            "✨ يمكنك طلب الاشتراك الآن وسيقوم الأدمن بالتفعيل.", parse_mode="HTML")
     await q.answer()
 
-# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن + عرض المحفظة/الأسعار/الخطوات للمستخدم ===
+# أمر نصّي للتجربة (إضافة على الزر)
+@dp.message(Command("trial"))
+async def cmd_trial(m: Message):
+    with get_session() as s:
+        ok = start_trial(s, m.from_user.id)
+    if ok:
+        await m.answer("✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁", parse_mode="HTML")
+        invite = await get_channel_invite_link()
+        if invite:
+            try:
+                await bot.send_message(m.from_user.id, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
+            except Exception as e:
+                logger.warning(f"SEND INVITE(TRIAL CMD) ERROR: {e}")
+    else:
+        await m.answer("ℹ️ لقد استخدمت التجربة المجانية مسبقًا.", parse_mode="HTML")
+
+# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن + إرشاد دفع للمستخدم ===
 @dp.callback_query(F.data == "req_sub")
 async def cb_req_sub(q: CallbackQuery):
     u = q.from_user
@@ -666,7 +695,7 @@ async def cb_req_sub(q: CallbackQuery):
     uname = (u.username and f"@{u.username}") or (u.full_name or "")
     user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
 
-    # 1) إشعار للأدمن مع أزرار الموافقة
+    # إشعار للأدمن مع أزرار الموافقة/الرفض
     kb_admin = InlineKeyboardBuilder()
     kb_admin.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
     kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
@@ -675,23 +704,33 @@ async def cb_req_sub(q: CallbackQuery):
     await send_admins(
         "🔔 <b>طلب اشتراك جديد</b>\n"
         f"المستخدم: {user_line}\n"
-        "الرجاء التحقق يدويًا من المبلغ/الإثبات قبل التفعيل:",
+        "اختر نوع التفعيل:",
         reply_markup=kb_admin.as_markup()
     )
 
-    # 2) رد للمستخدم: الأسعار + عنوان المحفظة + خطوات + زر مراسلة خاص
-    text_user = (
-        "🧾 <b>خطوات الاشتراك اليدوي</b>\n"
-        "1) حوِّل المبلغ حسب الخطة المرغوبة إلى المحفظة أدناه.\n"
-        "2) راسل الأدمن في الخاص وأرسل <b>الإثبات</b> (صورة التحويل أو TxID).\n"
-        "3) بعد التحقق، سيقوم الأدمن بتفعيل اشتراكك.\n\n"
-        f"{_price_wallet_block()}\n\n"
-        "📨 بعد التحويل، راسل الأدمن مباشرة من الزر التالي."
-    )
-    await q.message.answer(text_user, parse_mode="HTML", reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None)
+    # رسالة للمستخدم: الأسعار + عنوان المحفظة + زر مراسلة الأدمن
+    price_line = ""
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
+    wallet_line = ""
+    try:
+        if USDT_TRC20_WALLET:
+            wallet_line = f"💳 محفظة USDT (TRC20):\n<code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
+    except Exception:
+        pass
 
-    # 3) إشعار قصير أن الطلب أرسل للأدمن
-    await q.message.answer("📩 تم إرسال طلبك للأدمن. سيتم التفعيل بعد التحقق من التحويل بإذن الله.")
+    await q.message.answer(
+        "📩 تم إرسال طلبك للأدمن.\n"
+        "يرجى التحويل ثم مراسلة الأدمن لتأكيد التفعيل.\n\n"
+        "الخطط:\n"
+        f"{price_line}"
+        f"{wallet_line}"
+        "بعد التأكيد ستستلم رابط الدخول للقناة تلقائيًا.",
+        parse_mode="HTML",
+        reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None
+    )
     await q.answer()
 
 # موافقات الأدمن السريعة من إشعار "طلب اشتراك"
@@ -712,10 +751,15 @@ async def cb_approve_inline(q: CallbackQuery):
             f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
             parse_mode="HTML"
         )
+        # إرسال رابط دعوة للمستخدم
+        invite = await get_channel_invite_link()
         try:
-            await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
+            if invite:
+                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
+            else:
+                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
         except Exception as e:
-            logger.warning(f"USER DM ERROR: {e}")
+            logger.warning(f"USER DM/INVITE ERROR: {e}")
         await q.answer("تم.")
     except Exception as e:
         logger.exception(f"APPROVE_INLINE ERROR: {e}")
@@ -743,6 +787,7 @@ async def cmd_help(m: Message):
     text = (
         "🤖 <b>أوامر المستخدم</b>\n"
         "• <code>/start</code> – البداية والقائمة الرئيسية\n"
+        "• <code>/trial</code> – تجربة مجانية ليوم\n"
         "• <code>/status</code> – حالة الاشتراك\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
         "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
@@ -802,7 +847,7 @@ async def cb_admin_manual(q: CallbackQuery):
 
 @dp.message(F.text)
 async def admin_manual_router(m: Message):
-    """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> (مرجع اختياري) -> تفعيل."""
+    """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> (مرجع اختياري) -> تفعيل + إرسال دعوة."""
     aid = m.from_user.id
     flow = ADMIN_FLOW.get(aid)
     if not flow or aid not in ADMIN_USER_IDS:
@@ -841,8 +886,13 @@ async def admin_manual_router(m: Message):
                 f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
                 parse_mode="HTML"
             )
+            # إرسال الدعوة
+            invite = await get_channel_invite_link()
             try:
-                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
+                if invite:
+                    await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
+                else:
+                    await bot.send_message(uid, "✅ تم تفعيل اشتراكك. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
             except Exception as e:
                 logger.warning(f"USER DM ERROR: {e}")
         except Exception as e:
@@ -897,8 +947,13 @@ async def cb_admin_skip_ref(q: CallbackQuery):
             f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
             parse_mode="HTML"
         )
+        # إرسال الدعوة
+        invite = await get_channel_invite_link()
         try:
-            await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
+            if invite:
+                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
+            else:
+                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
         except Exception as e:
             logger.warning(f"USER DM ERROR: {e}")
     except Exception as e:
@@ -927,6 +982,13 @@ async def cmd_approve(m: Message):
     with get_session() as s:
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
     await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+    # إرسال دعوة
+    invite = await get_channel_invite_link()
+    if invite:
+        try:
+            await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
+        except Exception as e:
+            logger.warning(f"SEND INVITE ERROR (/approve): {e}")
 
 @dp.message(Command("activate"))
 async def cmd_activate(m: Message):
