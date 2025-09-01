@@ -3,9 +3,7 @@
 # إصلاح إغلاق الصفقة (استدعاء واحد)، إعادة محاولة للتقرير اليومي، لوج أوضح، لمسات استقرار.
 # جديد: صورة دليل الدفع للمشترك + لوحة تفعيل يدوي للأدمن بخطوات سهلة.
 # مضاف حديثًا: Rate Limiter لطلبات OKX لمنع 50011 (Too Many Requests)
-#  بيئة الاختيارات:
-#   OKX_PUBLIC_RATE_MAX      افتراض 18  (عدد الطلبات لكل نافذة)
-#   OKX_PUBLIC_RATE_WINDOW   افتراض 2.0 (مدة النافذة بالثواني)
+# + زر "💬 مراسلة الدعم (خاص)" يفتح الخاص مباشرة + رسائل تحفيزية للمشتركين.
 
 import asyncio
 import json
@@ -24,7 +22,7 @@ import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ====== قفل ملف محلي لمنع نسختين على نفس الجهاز ======
@@ -130,7 +128,6 @@ class SlidingRateLimiter:
         self.window = window_sec
         self.calls = deque()
         self._lock = asyncio.Lock()
-
     async def wait(self):
         async with self._lock:
             now = asyncio.get_running_loop().time()
@@ -141,7 +138,6 @@ class SlidingRateLimiter:
                 await asyncio.sleep(max(sleep_for, 0.05))
                 return await self.wait()
             self.calls.append(now)
-
 RATE = SlidingRateLimiter(OKX_PUBLIC_MAX, OKX_PUBLIC_WIN)
 
 # جداول المسح
@@ -166,13 +162,15 @@ _LAST_SIGNAL_AT: Dict[str, float] = {}  # key=symbol, value=unix_ts
 
 # دعم/تواصل
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
 SUPPORT_WAIT: Dict[int, float] = {}
 ADMIN_REPLY_TARGET: Dict[int, int] = {}
 SUPPORT_WAIT_MINUTES = int(os.getenv("SUPPORT_WAIT_MINUTES", "10"))
 
 # ====== إعدادات صورة دليل الدفع (اختياري) ======
-PAY_GUIDE_FILE_ID = os.getenv("PAY_GUIDE_FILE_ID")  # إن وُجد file_id لصورة سبق رفعها
-PAY_GUIDE_URL = os.getenv("PAY_GUIDE_URL")          # أو رابط مباشر للصورة
+PAY_GUIDE_FILE_ID = os.getenv("PAY_GUIDE_FILE_ID")      # إن وُجد file_id لصورة سبق رفعها
+PAY_GUIDE_URL = os.getenv("PAY_GUIDE_URL")              # أو رابط مباشر للصورة
+PAY_GUIDE_LOCAL_PATH = os.getenv("PAY_GUIDE_LOCAL_PATH")# أو مسار محلي داخل المشروع (assets/payment_guide.jpg)
 
 # ====== تدفق تفعيل يدوي للأدمن ======
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # {admin_id: {'stage': 'await_user'|'await_plan'|'await_ref', 'uid': int, 'plan': '2w'|'4w'}}
@@ -208,19 +206,19 @@ def _support_waiting(uid: int) -> bool:
 
 async def send_channel(text: str):
     try:
-        await bot.send_message(TELEGRAM_CHANNEL_ID, text, parse_mode="HTML")
+        await bot.send_message(TELEGRAM_CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"send_channel error: {e}")
 
 async def send_admins(text: str):
     if SUPPORT_CHAT_ID:
         try:
-            await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode="HTML")
+            await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
             logger.warning(f"SUPPORT_CHAT notify error: {e}")
     for admin_id in ADMIN_USER_IDS:
         try:
-            await bot.send_message(admin_id, text, parse_mode="HTML")
+            await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
             logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
@@ -239,73 +237,104 @@ async def notify_subscribers(text: str):
     uids = list_active_user_ids()
     for uid in uids:
         try:
-            await bot.send_message(uid, text, parse_mode="HTML")
+            await bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
             await asyncio.sleep(0.02)  # rate-limit لطيف
         except Exception:
             pass
 
+# ===== رسائل ترحيب/دفع تحفيزية =====
 async def welcome_text() -> str:
     return (
-        "👋 أهلاً بك في <b>عالم الفرص</b> 🚀\n\n"
-        "🔔 إشارات لحظية مبنية على استراتيجية احترافية (Score/Regime + إدارة مخاطر)\n"
+        "👋 أهلاً بك في <b>عالم الفرص</b> — حيث تُلتقط الحركات القوية قبل أن يشاهدها الجميع!\n\n"
+        "🔔 إشارات لحظية مبنية على منهجية صارمة (Score + Regime + إدارة مخاطر)\n"
         f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n"
-        "💰 إدارة مخاطر صارمة + حد صفقات نشطة محسوب\n\n"
+        "💰 استراتيجيتنا تركز على <b>حماية رأس المال أولاً</b> ثم تعظيم العائد.\n\n"
         "خطط الاشتراك:\n"
-        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>\n"
-        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
         f"محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
-        "✨ جرّبنا مجانًا لمدة <b>يوم واحد</b> عبر الزر.\n"
-        "💳 بعد الدفع أرسل رقم المرجع (TxID) هكذا:\n"
-        "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>"
+        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b> وراقب قوة الإشارات بنفسك.\n"
+        "💳 بعد الدفع أرسل رقم المرجع (TxID):\n"
+        "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n\n"
+        "🚀 <i>كل صفقة مدروسة بإطار واضح: دخول، وقف، أهداف، ورسائل متابعة.</i>"
     )
 
+# ===== زر مراسلة الدعم (خاص) =====
+def support_dm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if SUPPORT_USERNAME:
+        kb.button(text="💬 مراسلة الدعم (خاص)", url=f"https://t.me/{SUPPORT_USERNAME}")
+    return kb.as_markup()
+
+# ===== إرسال صورة دليل الدفع =====
+from aiogram.types import FSInputFile
 async def send_pay_guide(chat_id: int):
-    """إرسال صورة/إنفوغرافيك طريقة الدفع إن توفّر file_id أو URL."""
+    """إرسال صورة/إنفوغرافيك طريقة الدفع إن توفّر ملف محلي أو file_id أو URL."""
+    # 1) ملف محلي
+    if PAY_GUIDE_LOCAL_PATH and os.path.exists(PAY_GUIDE_LOCAL_PATH):
+        try:
+            msg = await bot.send_photo(chat_id, photo=FSInputFile(PAY_GUIDE_LOCAL_PATH), caption="📸 دليل الدفع المختصر")
+            logger.info(f"pay_guide sent (local) → msg_id={msg.message_id} chat_id={chat_id} path={PAY_GUIDE_LOCAL_PATH}")
+            return
+        except Exception as e:
+            logger.warning(f"PAY_GUIDE_LOCAL failed: {e}")
+    # 2) file_id
     if PAY_GUIDE_FILE_ID:
         try:
-            await bot.send_photo(chat_id, PAY_GUIDE_FILE_ID, caption="📸 دليل الدفع المختصر")
+            msg = await bot.send_photo(chat_id, PAY_GUIDE_FILE_ID, caption="📸 دليل الدفع المختصر")
+            logger.info(f"pay_guide sent (file_id) → msg_id={msg.message_id} chat_id={chat_id}")
             return
         except Exception as e:
             logger.warning(f"PAY_GUIDE_FILE_ID failed: {e}")
+    # 3) URL
     if PAY_GUIDE_URL:
         try:
-            await bot.send_photo(chat_id, PAY_GUIDE_URL, caption="📸 دليل الدفع المختصر")
+            msg = await bot.send_photo(chat_id, PAY_GUIDE_URL, caption="📸 دليل الدفع المختصر")
+            logger.info(f"pay_guide sent (url) → msg_id={msg.message_id} chat_id={chat_id} url={PAY_GUIDE_URL}")
             return
         except Exception as e:
             logger.warning(f"PAY_GUIDE_URL failed: {e}")
+    # فشل
+    await bot.send_message(chat_id, "⚠️ تعذّر إرفاق صورة دليل الدفع حاليًا.")
+    logger.warning("pay_guide: no valid source (local/file_id/url).")
 
+# ===== تنسيق رسائل الإشارة/الإغلاق بتحفيز =====
 def format_signal_text_basic(sig: dict) -> str:
     extra = ""
     if "score" in sig or "regime" in sig:
         extra = f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
         if sig.get("reasons"):
-            extra += f"\n🧠 أسباب: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+            extra += f"\n🧠 أسباب مختصرة: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
     return (
-        "🚀 <b>إشارة جديدة [BUY]</b>\n"
+        "🚀 <b>إشارة شراء جديدة!</b>\n"
         "━━━━━━━━━━━━━━\n"
-        f"🔹 العملة: <b>{_h(sig['symbol'])}</b>\n"
+        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
         f"💵 الدخول: <code>{sig['entry']}</code>\n"
-        f"📉 وقف الخسارة: <code>{sig['sl']}</code>\n"
+        f"📉 الوقف: <code>{sig['sl']}</code>\n"
         f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
-        f"🎯 الهدف 2: <code>{sig['tp2']}</code>\n"
-        f"⏰ الوقت (UTC): <code>{_h(sig['timestamp'])}</code>"
+        f"🏁 الهدف 2: <code>{sig['tp2']}</code>\n"
+        f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
         f"{extra}\n"
-        "━━━━━━━━━━━━━━\n⚡️ <i>تذكير: إدارة رأس المال واجبة قبل كل صفقة.</i>"
+        "━━━━━━━━━━━━━━\n"
+        "⚡️ <i>التزم بالخطة: حجم مخاطرة ثابت، لا تلحق بالسعر، والتزم بالوقف.</i>\n"
+        "💡 <i>نصيحة: إدخال هادئ أفضل من مطاردة شمعة سريعة.</i>"
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
-    emoji = {"tp1": "🎯", "tp2": "🏁", "sl": "🛑"}.get(t.result or "", "ℹ️")
-    result_label = {"tp1": "تحقق الهدف 1", "tp2": "تحقق الهدف 2", "sl": "ضرب وقف الخسارة"}.get(t.result or "", "إغلاق")
+    emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(t.result or "", "ℹ️")
+    result_label = {"tp1": "تحقق الهدف 1 — خطوة ممتازة!", "tp2": "تحقق الهدف 2 — إنجاز رائع!", "sl": "وقف الخسارة — حماية رأس المال"}.get(t.result or "", "إغلاق")
     r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
+    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (t.result == "sl") else "🎯 إدارة الربح أهم من الصفقات الكثيرة."
     return (
-        f"{emoji} <b>تم إغلاق الصفقة</b>\n"
+        f"{emoji} <b>إغلاق صفقة</b>\n"
         "━━━━━━━━━━━━━━\n"
-        f"🔹 العملة: <b>{_h(t.symbol)}</b>\n"
+        f"🔹 الأصل: <b>{_h(t.symbol)}</b>\n"
         f"💵 الدخول: <code>{t.entry}</code>\n"
         f"📉 الوقف: <code>{t.sl}</code>\n"
-        f"🎯 TP1: <code>{t.tp1}</code> | 🎯 TP2: <code>{t.tp2}</code>\n"
+        f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>\n"
         f"📌 النتيجة: <b>{result_label}</b>{r_line}\n"
-        f"⏰ الإغلاق (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>"
+        f"⏰ الإغلاق (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"{tip}"
     )
 
 # ---------------------------
@@ -371,7 +400,8 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
         asyncio.create_task(send_channel(
             f"⏸️ <b>إيقاف مؤقت لفتح صفقات جديدة</b>\n"
             f"السبب: {cooldown_reason}\n"
-            f"حتى: <code>{until.strftime('%Y-%m-%d %H:%M UTC')}</code>"
+            f"حتى: <code>{until.strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
+            "💡 <i>نحافظ على الذخيرة لفرص أعلى جودة.</i>"
         ))
         asyncio.create_task(send_admins(
             f"⚠️ Cooldown مُفعل — {cooldown_reason}. حتى {until.isoformat()}"
@@ -519,6 +549,18 @@ async def scan_and_dispatch():
 
                 try:
                     await _send_signal_to_channel(sig, audit_id)
+                    # رسالة تحفيزية قصيرة على الخاص للمشتركين النشطين
+                    note = (
+                        "🚀 <b>إشارة جديدة وصلت!</b>\n"
+                        "🔔 لا تتعجل — التزم بحجم مخاطرة ثابت وانتظر مناطق الدخول المحددة."
+                    )
+                    uids = list_active_user_ids()
+                    for uid in uids:
+                        try:
+                            await bot.send_message(uid, note, parse_mode="HTML", disable_web_page_preview=True)
+                            await asyncio.sleep(0.02)
+                        except Exception:
+                            pass
                     logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
                 except Exception as e:
                     logger.exception(f"SEND SIGNAL ERROR: {e}")
@@ -578,7 +620,10 @@ async def monitor_open_trades():
                         except Exception:
                             pass
 
-                    await notify_subscribers(format_close_text(t, r_multiple))
+                    # إشعار تحفيزي
+                    msg = format_close_text(t, r_multiple)
+                    msg += "\n💡 <i>انضباطك مع الوقف والأهداف يصنع الفرق على المدى الطويل.</i>"
+                    await notify_subscribers(msg)
                     await asyncio.sleep(0.05)
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
@@ -589,20 +634,21 @@ async def monitor_open_trades():
 # ---------------------------
 def _report_card(stats_24: dict, stats_7d: dict) -> str:
     return (
-        "📊 <b>التقرير اليومي</b>\n"
+        "📊 <b>التقرير اليومي — لقطة أداء مركّزة</b>\n"
         "━━━━━━━━━━━━━━\n"
         "<b>آخر 24 ساعة</b>\n"
         f"• إشارات: <b>{stats_24['signals']}</b> | صفقات مفتوحة الآن: <b>{stats_24['open']}</b>\n"
-        f"• أهداف محققة: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})\n"
+        f"• محقق من الأهداف: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})\n"
         f"• وقف خسارة: <b>{stats_24['sl']}</b>\n"
         f"• معدل نجاح: <b>{stats_24['win_rate']}%</b>\n"
         f"• صافي R تقريبي: <b>{stats_24['r_sum']}</b>\n"
         "━━━━━━━━━━━━━━\n"
         "<b>آخر 7 أيام</b>\n"
-        f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف محققة: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>\n"
+        f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>\n"
         f"• معدل نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>\n"
         "━━━━━━━━━━━━━━\n"
-        "⚡️ <i>انضم للتجربة المجانية ليوم واحد وراقب الأداء بنفسك.</i>"
+        "💡 <i>الخطة أهم من الضجيج: إدارة مخاطرة ثابتة + التزام بالأهداف.</i>\n"
+        "🚀 <i>نستهدف فرصًا منتقاة بجودة أعلى بدل كثرة الإشارات.</i>"
     )
 
 async def daily_report_once():
@@ -638,11 +684,13 @@ async def daily_report_loop():
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
-    kb.button(text="الدفع (USDT TRC20) + رقم المرجع", callback_data="subscribe_info")
+    kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
+    kb.button(text="💳 الدفع (USDT TRC20) + رقم المرجع", callback_data="subscribe_info")
     kb.button(text="💬 تواصل الدعم", callback_data="support")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
+    if SUPPORT_USERNAME:
+        await m.answer("تحتاج مساعدة؟ فريق الدعم يرد بسرعة:", reply_markup=support_dm_kb())
 
 @dp.callback_query(F.data == "start_trial")
 async def cb_trial(q: CallbackQuery):
@@ -651,11 +699,11 @@ async def cb_trial(q: CallbackQuery):
     if ok:
         await q.message.edit_text(
             "✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁\n"
-            "ستصلك الإشارات والتقرير اليومي على القناة.", parse_mode="HTML")
+            "🚀 استعد لتجربة إشارات احترافية مع إدارة مخاطرة منضبطة.", parse_mode="HTML")
     else:
         await q.message.edit_text(
             "ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\n"
-            "يمكنك الاشتراك عبر زر الدفع.", parse_mode="HTML")
+            "✨ يمكنك الاشتراك الآن والاستفادة من كامل الميزات.", parse_mode="HTML")
     await q.answer()
 
 @dp.message(Command("help"))
@@ -666,7 +714,7 @@ async def cmd_help(m: Message):
         "• <code>/pay</code> – الدفع وشرح رقم المرجع (TxID)\n"
         "• <code>/submit_tx</code> – إرسال رقم المرجع لتفعيل الاشتراك\n"
         "• <code>/status</code> – حالة الاشتراك\n"
-        "• <code>/support</code> – فتح محادثة مع الدعم\n"
+        "• <code>/support</code> – فتح محادثة مع الدعم + زر مراسلة خاص\n"
         "• <code>/cancel</code> – إلغاء محادثة الدعم الحالية"
     )
     await m.answer(text, parse_mode="HTML")
@@ -675,13 +723,18 @@ async def cmd_help(m: Message):
 async def cmd_status(m: Message):
     with get_session() as s:
         ok = is_active(s, m.from_user.id)
-    await m.answer("✅ <b>اشتراكك نشط.</b>" if ok else "❌ <b>لا تملك اشتراكًا نشطًا.</b>", parse_mode="HTML")
+    await m.answer(
+        "✅ <b>اشتراكك نشط.</b>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
+        if ok else
+        "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اشترك اليوم وابدأ مع أول تقرير صباحي.",
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("pay"))
 async def cmd_pay(m: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="طريقة الإرسال ورقم المرجع؟", callback_data="tx_help")
-    kb.button(text="أسعار وخطط الاشتراك", callback_data="subscribe_info")
+    kb.button(text="📎 طريقة الإرسال ورقم المرجع (TxID)", callback_data="tx_help")
+    kb.button(text="💳 أسعار وخطط الاشتراك", callback_data="subscribe_info")
     kb.button(text="💬 تواصل الدعم", callback_data="support")
     kb.adjust(1)
     txt = (
@@ -692,15 +745,19 @@ async def cmd_pay(m: Message):
         "بعد التحويل أرسل رقم المرجع (TxID) مع الخطة:\n"
         "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n\n"
         "✅ يمكنك لصق <i>رابط Tronscan</i> مباشرة (سأستخرج رقم المرجع تلقائيًا).\n"
-        "📸 أرفقت لك صورة دليل مختصر 👇"
+        "📸 أرفقنا لك دليلًا بصريًا مختصرًا 👇"
     )
     await m.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
     await send_pay_guide(m.chat.id)  # إرسال الصورة إن توفرت
+    if SUPPORT_USERNAME:
+        await m.answer("تحتاج مساعدة بالدفع؟ اضغط الزر لفتح الخاص:", reply_markup=support_dm_kb())
 
 @dp.callback_query(F.data == "tx_help")
 async def cb_tx_help(q: CallbackQuery):
     await q.message.answer(REFERENCE_HINT, parse_mode="HTML")
     await send_pay_guide(q.message.chat.id)
+    if SUPPORT_USERNAME:
+        await q.message.answer("لو واجهتك صعوبة، راسلنا على الخاص:", reply_markup=support_dm_kb())
     await q.answer()
 
 @dp.callback_query(F.data == "subscribe_info")
@@ -713,15 +770,17 @@ async def cmd_support(m: Message):
     _support_set(m.from_user.id)
     await m.answer(
         "🆘 <b>تم فتح محادثة الدعم.</b>\n"
-        f"اكتب مشكلتك الآن (المهلة {SUPPORT_WAIT_MINUTES} دقائق). أرسل <code>/cancel</code> للإلغاء.",
-        parse_mode="HTML"
+        f"اكتب مشكلتك الآن (المهلة {SUPPORT_WAIT_MINUTES} دقائق). أرسل <code>/cancel</code> للإلغاء.\n\n"
+        "أو اضغط الزر لفتح الخاص مباشرة مع الدعم:",
+        parse_mode="HTML",
+        reply_markup=support_dm_kb()
     )
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(m: Message):
     if _support_waiting(m.from_user.id):
         _support_clear(m.from_user.id)
-        return await m.answer("✅ تم إلغاء محادثة الدعم.", parse_mode="HTML")
+        return await m.answer("✅ تم إلغاء محادثة الدعم. نحن هنا متى ما احتجتنا.", parse_mode="HTML")
     await m.answer("ℹ️ لا توجد محادثة دعم جارية.", parse_mode="HTML")
 
 @dp.callback_query(F.data == "support")
@@ -729,8 +788,10 @@ async def cb_support(q: CallbackQuery):
     _support_set(q.from_user.id)
     await q.message.answer(
         "🆘 <b>تم فتح محادثة الدعم.</b>\n"
-        f"اكتب مشكلتك الآن (المهلة {SUPPORT_WAIT_MINUTES} دقائق). أرسل <code>/cancel</code> للإلغاء.",
-        parse_mode="HTML"
+        f"اكتب مشكلتك الآن (المهلة {SUPPORT_WAIT_MINUTES} دقائق). أرسل <code>/cancel</code> للإلغاء.\n\n"
+        "أو اضغط الزر لفتح الخاص مباشرة مع الدعم:",
+        parse_mode="HTML",
+        reply_markup=support_dm_kb()
     )
     await q.answer()
 
@@ -820,7 +881,7 @@ async def admin_manual_router(m: Message):
                 parse_mode="HTML"
             )
             try:
-                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك!", parse_mode="HTML")
+                await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
             except Exception as e:
                 logger.warning(f"USER DM ERROR: {e}")
         except Exception as e:
@@ -876,7 +937,7 @@ async def cb_admin_skip_ref(q: CallbackQuery):
             parse_mode="HTML"
         )
         try:
-            await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك!", parse_mode="HTML")
+            await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
         except Exception as e:
             logger.warning(f"USER DM ERROR: {e}")
     except Exception as e:
@@ -935,7 +996,7 @@ async def any_user_message_router(m: Message):
     uid = m.from_user.id
     if _support_waiting(uid):
         _support_clear(uid)
-        await m.answer("✅ تم استلام رسالتك. سيردّ عليك الدعم قريبًا.", parse_mode="HTML")
+        await m.answer("✅ تم استلام رسالتك. سيردّ عليك الدعم قريبًا — شكراً على ثقتك.", parse_mode="HTML")
         await _send_ticket_to_admins(m)
 
 # --- دعم: أول رسالة يرسلها الإداري بعد الضغط تُرسل للمستخدم ---
@@ -999,9 +1060,11 @@ async def cmd_submit(m: Message):
             dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
             end_at = approve_paid(s, m.from_user.id, plan, dur, tx_hash=txid or ref_or_url)
         return await m.answer(
-            "✅ <b>تم التحقق من الدفع</b>\n"
-            f"المبلغ المستلم: <b>{info} USDT</b>\n"
-            f"⏳ الاشتراك فعّال حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>", parse_mode="HTML")
+            "✅ <b>تم التحقق من الدفع بنجاح</b>\n"
+            f"💵 المبلغ المستلم: <b>{info} USDT</b>\n"
+            f"⏳ الاشتراك فعّال حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n"
+            "🚀 أهلاً بك في النسخة الكاملة — استمتع بالإشارات والتقرير اليومي!",
+            parse_mode="HTML")
     alert = (
         "🔔 <b>طلب تفعيل — فشل التحقق التلقائي</b>\n"
         f"User: <code>{m.from_user.id}</code>\n"
@@ -1011,9 +1074,13 @@ async def cmd_submit(m: Message):
     )
     await send_admins(alert)
     await m.answer(
-        "❗ لم أستطع التحقق تلقائيًا من الدفع.\n"
-        "سيتم مراجعته يدويًا قريبًا من قبل الدعم.\n"
-        "تلميح: تأكد أن الإرسال كان USDT على شبكة TRON (TRC20) وأن رقم المرجع صحيح.", parse_mode="HTML")
+        "❗ لم نتمكن من التحقق تلقائيًا من الدفع.\n"
+        "سيقوم فريق الدعم بالمراجعة اليدوية قريبًا.\n"
+        "💡 تأكد أن الإرسال كان USDT على شبكة TRON (TRC20) وأن رقم المرجع صحيح.",
+        parse_mode="HTML"
+    )
+    if SUPPORT_USERNAME:
+        await m.answer("تسريع المعالجة؟ راسلنا على الخاص:", reply_markup=support_dm_kb())
 
 # ---------------------------
 # أوامر الإدارة (التاريخية)
@@ -1043,7 +1110,7 @@ async def cmd_approve(m: Message):
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
     await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
     try:
-        await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك!", parse_mode="HTML")
+        await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
     except Exception as e:
         logger.warning(f"USER DM ERROR: {e}")
 
@@ -1055,7 +1122,7 @@ async def cmd_broadcast(m: Message):
     uids = list_active_user_ids(); sent = 0
     for uid in uids:
         try:
-            await bot.send_message(uid, txt, parse_mode="HTML")
+            await bot.send_message(uid, txt, parse_mode="HTML", disable_web_page_preview=True)
             sent += 1; await asyncio.sleep(0.02)
         except Exception:
             pass
@@ -1083,7 +1150,7 @@ async def check_channel_and_admin_dm():
 
     for admin_id in ADMIN_USER_IDS:
         try:
-            await bot.send_message(admin_id, "✅ البوت يعمل الآن.", parse_mode="HTML")
+            await bot.send_message(admin_id, "✅ البوت يعمل الآن. 🚀", parse_mode="HTML")
             logger.info(f"ADMIN DM OK: {admin_id}")
         except Exception as e:
             logger.warning(f"ADMIN DM FAILED for {admin_id}: {e}")
