@@ -1,8 +1,10 @@
-# bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + TRC20 + تقارير + مخاطر V2
-# تحسينات: منع تكرار الإشارات (Dedupe)، تسريع فحص الشموع (Batch + Concurrency)،
-# إصلاح إغلاق الصفقة (استدعاء واحد)، إعادة محاولة للتقرير اليومي، لوج أوضح.
-# جديد: صورة دليل الدفع + لوحة تفعيل يدوي مبسطة + زر مراسلة خاص مع الأدمن فقط.
-# إزالة "نظام الدعم" الداخلي واستبداله بزر يفتح الخاص + عرض معرّف الأدمن.
+# bot.py — مُشغِّل البوت (Aiogram v3) مع تفعيل يدوي مبسّط (2w / 4w) + تقارير + مخاطر + قفل قائد
+# تغييرات هذه النسخة:
+# - إزالة مسار الدفع الآلي عبر TRC20 / /submit_tx / دليل الدفع والصور.
+# - إضافة زر "🔑 طلب اشتراك" للمستخدم → يصل إشعار للأدمن مع أزرار تفعيل 2w / 4w / رفض.
+# - الحفاظ على /admin والتفعيل اليدوي (الإدخال اليدوي user_id) لمن يفضّل ذلك.
+# - الإبقاء على التجربة المجانية /start_trial (اختياري) + /status.
+# - لا تغيير على المنطق التشغيلي (الإشارات/التقارير/المخاطر/القفل).
 
 import asyncio
 import json
@@ -51,9 +53,11 @@ except Exception:
     class TelegramConflictError(Exception): ...
 
 from config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS, USDT_TRC20_WALLET,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS,
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
-    PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD, SUB_DURATION_2W, SUB_DURATION_4W
+    # القيم التالية اختيارية للعرض في الرسائل فقط (إن وُجدت في config):
+    PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD,
+    SUB_DURATION_2W, SUB_DURATION_4W
 )
 
 # قاعدة البيانات
@@ -93,16 +97,6 @@ if ENABLE_DB_LOCK:
 
 from strategy import check_signal
 from symbols import SYMBOLS
-
-# الدفع TRON
-from payments_tron import extract_txid, find_trc20_transfer_to_me, REFERENCE_HINT
-
-# Trust Layer (اختياري)
-try:
-    from trust_layer import format_signal_card, log_signal, log_close, make_audit_id
-    TRUST_LAYER = True
-except Exception:
-    TRUST_LAYER = False
 
 # ---------------------------
 # إعدادات عامة
@@ -159,17 +153,13 @@ AUDIT_IDS: Dict[int, str] = {}
 DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
 _LAST_SIGNAL_AT: Dict[str, float] = {}
 
-# ===== دعم خاص فقط (لا جلسات داخل البوت) =====
+# ===== دعم تواصل خاص مع الأدمن =====
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
 
-# ====== إعدادات صورة دليل الدفع ======
-PAY_GUIDE_FILE_ID = os.getenv("PAY_GUIDE_FILE_ID")        # file_id للصورة (اختياري)
-PAY_GUIDE_URL = os.getenv("PAY_GUIDE_URL")                # رابط مباشر (اختياري)
-PAY_GUIDE_LOCAL_PATH = os.getenv("PAY_GUIDE_LOCAL_PATH")  # مسار محلي داخل المشروع (اختياري)
-
 # ====== تدفق تفعيل يدوي للأدمن ======
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # {admin_id: {'stage': 'await_user'|'await_plan'|'await_ref', 'uid': int, 'plan': '2w'|'4w'}}
+# ملاحظة: سنستخدم أيضًا أزرار inline مباشرة من إشعار "طلب اشتراك" بدون هذا التدفق.
 
 # ---------------------------
 # أدوات مساعدة
@@ -188,14 +178,14 @@ async def send_channel(text: str):
     except Exception as e:
         logger.error(f"send_channel error: {e}")
 
-async def send_admins(text: str):
+async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = None):
     # تنبيهات داخلية للأدمن/غرفة إدارية (اختياري)
     targets = list(ADMIN_USER_IDS)
     if SUPPORT_CHAT_ID:
         targets.append(SUPPORT_CHAT_ID)
     for admin_id in targets:
         try:
-            await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
         except Exception as e:
             logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
@@ -219,7 +209,6 @@ async def notify_subscribers(text: str):
         except Exception:
             pass
 
-# ===== رسائل ترحيب/دفع تحفيزية =====
 def _contact_line() -> str:
     parts = []
     if SUPPORT_USERNAME:
@@ -231,17 +220,20 @@ def _contact_line() -> str:
     return "\n".join(parts) if parts else "—"
 
 async def welcome_text() -> str:
+    price_line = ""
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
     return (
         "👋 أهلاً بك في <b>عالم الفرص</b> — حيث تُلتقط الحركات القوية قبل أن يشاهدها الجميع!\n\n"
         "🔔 إشارات لحظية مبنية على منهجية صارمة (Score + Regime + إدارة مخاطر)\n"
         f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n"
         "💰 استراتيجيتنا تركز على <b>حماية رأس المال أولاً</b> ثم تعظيم العائد.\n\n"
         "خطط الاشتراك:\n"
-        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
-        f"محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
-        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n"
-        "💳 بعد الدفع أرسل رقم المرجع (TxID):\n"
-        "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n\n"
+        f"{price_line}"
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن لتفعيلك لمدة 2 أسابيع أو 4 أسابيع.\n\n"
+        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
         "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
     )
 
@@ -254,35 +246,7 @@ def support_dm_kb() -> InlineKeyboardMarkup:
         kb.button(text="💬 مراسلة الأدمن (خاص)", url=f"tg://user?id={SUPPORT_CHAT_ID}")
     return kb.as_markup()
 
-# ===== إرسال صورة دليل الدفع =====
-from aiogram.types import FSInputFile
-async def send_pay_guide(chat_id: int):
-    """إرسال صورة/إنفوغرافيك طريقة الدفع: ملف محلي ← file_id ← URL."""
-    if PAY_GUIDE_LOCAL_PATH and os.path.exists(PAY_GUIDE_LOCAL_PATH):
-        try:
-            msg = await bot.send_photo(chat_id, photo=FSInputFile(PAY_GUIDE_LOCAL_PATH), caption="📸 دليل الدفع المختصر")
-            logger.info(f"pay_guide sent (local) → msg_id={msg.message_id} chat_id={chat_id} path={PAY_GUIDE_LOCAL_PATH}")
-            return
-        except Exception as e:
-            logger.warning(f"PAY_GUIDE_LOCAL failed: {e}")
-    if PAY_GUIDE_FILE_ID:
-        try:
-            msg = await bot.send_photo(chat_id, PAY_GUIDE_FILE_ID, caption="📸 دليل الدفع المختصر")
-            logger.info(f"pay_guide sent (file_id) → msg_id={msg.message_id} chat_id={chat_id}")
-            return
-        except Exception as e:
-            logger.warning(f"PAY_GUIDE_FILE_ID failed: {e}")
-    if PAY_GUIDE_URL:
-        try:
-            msg = await bot.send_photo(chat_id, PAY_GUIDE_URL, caption="📸 دليل الدفع المختصر")
-            logger.info(f"pay_guide sent (url) → msg_id={msg.message_id} chat_id={chat_id} url={PAY_GUIDE_URL}")
-            return
-        except Exception as e:
-            logger.warning(f"PAY_GUIDE_URL failed: {e}")
-    await bot.send_message(chat_id, "⚠️ تعذّر إرفاق صورة دليل الدفع حاليًا.")
-    logger.warning("pay_guide: no valid source (local/file_id/url).")
-
-# ===== تنسيق رسائل الإشارة/الإغلاق بتحفيز =====
+# ===== تنسيق رسائل الإشارة/الإغلاق =====
 def format_signal_text_basic(sig: dict) -> str:
     extra = ""
     if "score" in sig or "regime" in sig:
@@ -465,14 +429,6 @@ def _should_skip_duplicate(sig: dict) -> bool:
 SCAN_LOCK = asyncio.Lock()
 
 async def _send_signal_to_channel(sig: dict, audit_id: str | None) -> None:
-    if TRUST_LAYER:
-        try:
-            text = format_signal_card(sig, risk_pct=0.005, daily_cap_r=MAX_DAILY_LOSS_R)
-            await send_channel(text)
-            _ = log_signal(sig, status="opened")
-            return
-        except Exception as e:
-            logger.exception(f"TRUST LAYER send error: {e}")
     await send_channel(format_signal_text_basic(sig))
 
 async def _scan_one_symbol(sym: str) -> Optional[dict]:
@@ -518,8 +474,7 @@ async def scan_and_dispatch():
                     except Exception:
                         pass
 
-                    audit_id = make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0)) if TRUST_LAYER \
-                               else _make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
+                    audit_id = _make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
                     try:
                         trade_id = add_trade_sig(s, sig, audit_id=audit_id, qty=None)
                     except Exception as e:
@@ -530,7 +485,6 @@ async def scan_and_dispatch():
 
                 try:
                     await _send_signal_to_channel(sig, audit_id)
-                    # دفعة تحفيزية قصيرة على الخاص
                     note = (
                         "🚀 <b>إشارة جديدة وصلت!</b>\n"
                         "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
@@ -590,13 +544,6 @@ async def monitor_open_trades():
                         close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
                     except Exception as e:
                         logger.warning(f"close_trade warn: {e}")
-
-                    audit_id = AUDIT_IDS.get(t.id) or _make_audit_id(t.symbol, float(t.entry), 0)
-                    if TRUST_LAYER:
-                        try:
-                            log_close(audit_id, t.symbol, float(exit_px), float(r_multiple), reason=result)
-                        except Exception:
-                            pass
 
                     msg = format_close_text(t, r_multiple)
                     msg += "\n💡 <i>الانضباط مع الوقف والأهداف يصنع الفرق على المدى الطويل.</i>"
@@ -660,36 +607,116 @@ async def daily_report_loop():
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     kb = InlineKeyboardBuilder()
+    kb.button(text="🔑 طلب اشتراك", callback_data="req_sub")
     kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
-    kb.button(text="💳 الدفع (USDT TRC20) + رقم المرجع", callback_data="subscribe_info")
+    kb.button(text="🧾 حالة اشتراكي", callback_data="status_btn")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
-    # زر مراسلة خاص مفصول ليتاح زر URL
     if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
         await m.answer("تحتاج مساعدة؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
+
+@dp.callback_query(F.data == "status_btn")
+async def cb_status_btn(q: CallbackQuery):
+    with get_session() as s:
+        ok = is_active(s, q.from_user.id)
+    await q.message.answer(
+        "✅ <b>اشتراكك نشط.</b>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
+        if ok else
+        "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اطلب التفعيل وسيقوم الأدمن بإتمامه.",
+        parse_mode="HTML"
+    )
+    await q.answer()
 
 @dp.callback_query(F.data == "start_trial")
 async def cb_trial(q: CallbackQuery):
     with get_session() as s:
         ok = start_trial(s, q.from_user.id)
     if ok:
-        await q.message.edit_text(
+        await q.message.answer(
             "✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁\n"
             "🚀 استعد لتجربة إشارات احترافية مع إدارة مخاطرة منضبطة.", parse_mode="HTML")
     else:
-        await q.message.edit_text(
+        await q.message.answer(
             "ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\n"
-            "✨ يمكنك الاشتراك الآن والاستفادة من كامل الميزات.", parse_mode="HTML")
+            "✨ يمكنك طلب الاشتراك الآن والاستفادة من كامل الميزات.", parse_mode="HTML")
     await q.answer()
+
+# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن مع أزرار تفعيل مباشرة ===
+@dp.callback_query(F.data == "req_sub")
+async def cb_req_sub(q: CallbackQuery):
+    u = q.from_user
+    uid = u.id
+    uname = (u.username and f"@{u.username}") or (u.full_name or "")
+    user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
+    kb.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
+    kb.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
+    kb.adjust(1)
+
+    await send_admins(
+        "🔔 <b>طلب اشتراك جديد</b>\n"
+        f"المستخدم: {user_line}\n"
+        "اختر نوع التفعيل:",
+        reply_markup=kb.as_markup()
+    )
+    await q.message.answer("📩 تم إرسال طلبك للأدمن. سيتم التفعيل قريبًا بإذن الله.")
+    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
+        await q.message.answer("للتواصل المباشر مع الأدمن:", reply_markup=support_dm_kb())
+    await q.answer()
+
+# موافقات الأدمن السريعة من إشعار "طلب اشتراك"
+@dp.callback_query(F.data.startswith("approve_inline:"))
+async def cb_approve_inline(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    try:
+        _, uid_str, plan = q.data.split(":")
+        uid = int(uid_str)
+        if plan not in ("2w", "4w"):
+            return await q.answer("خطة غير صالحة.", show_alert=True)
+        dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
+        with get_session() as s:
+            end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
+        await q.message.answer(
+            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
+            f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+            parse_mode="HTML"
+        )
+        try:
+            await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"USER DM ERROR: {e}")
+        await q.answer("تم.")
+    except Exception as e:
+        logger.exception(f"APPROVE_INLINE ERROR: {e}")
+        await q.answer("خطأ أثناء التفعيل.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("reject_inline:"))
+async def cb_reject_inline(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    try:
+        _, uid_str = q.data.split(":")
+        uid = int(uid_str)
+        await q.message.answer(f"❌ تم رفض طلب الاشتراك للمستخدم <code>{uid}</code>.", parse_mode="HTML")
+        try:
+            await bot.send_message(uid, "ℹ️ تم رفض طلب الاشتراك. تواصل مع الأدمن للتفاصيل.", parse_mode="HTML")
+        except Exception:
+            pass
+        await q.answer("تم.")
+    except Exception as e:
+        logger.exception(f"REJECT_INLINE ERROR: {e}")
+        await q.answer("خطأ أثناء الرفض.", show_alert=True)
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
     text = (
         "🤖 <b>أوامر المستخدم</b>\n"
         "• <code>/start</code> – البداية والقائمة الرئيسية\n"
-        "• <code>/pay</code> – الدفع وشرح رقم المرجع (TxID)\n"
-        "• <code>/submit_tx</code> – إرسال رقم المرجع لتفعيل الاشتراك\n"
-        "• <code>/status</code> – حالة الاشتراك\n\n"
+        "• <code>/status</code> – حالة الاشتراك\n"
+        "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
         "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
     await m.answer(text, parse_mode="HTML")
@@ -701,83 +728,9 @@ async def cmd_status(m: Message):
     await m.answer(
         "✅ <b>اشتراكك نشط.</b>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
         if ok else
-        "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اشترك اليوم وابدأ مع أول تقرير صباحي.",
+        "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اطلب التفعيل وسيقوم الأدمن بإتمامه.",
         parse_mode="HTML"
     )
-
-@dp.message(Command("pay"))
-async def cmd_pay(m: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📎 طريقة الإرسال ورقم المرجع (TxID)", callback_data="tx_help")
-    kb.button(text="💳 أسعار وخطط الاشتراك", callback_data="subscribe_info")
-    kb.adjust(1)
-    txt = (
-        "💳 <b>الدفع عبر USDT (TRC20)</b>\n"
-        f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>\n"
-        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n\n"
-        f"أرسل إلى المحفظة:\n<code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
-        "بعد التحويل أرسل رقم المرجع (TxID) مع الخطة:\n"
-        "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n\n"
-        "✅ يمكنك لصق <i>رابط Tronscan</i> مباشرة (سأستخرج رقم المرجع تلقائيًا).\n"
-        "📸 أرفقنا لك دليلًا بصريًا مختصرًا 👇"
-    )
-    await m.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
-    await send_pay_guide(m.chat.id)
-    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
-        await m.answer("تحتاج مساعدة بالدفع؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
-
-@dp.callback_query(F.data == "tx_help")
-async def cb_tx_help(q: CallbackQuery):
-    await q.message.answer(REFERENCE_HINT, parse_mode="HTML")
-    await send_pay_guide(q.message.chat.id)
-    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
-        await q.message.answer("لو واجهتك صعوبة، راسل الأدمن:", reply_markup=support_dm_kb())
-    await q.answer()
-
-@dp.callback_query(F.data == "subscribe_info")
-async def cb_sub_info(q: CallbackQuery):
-    await cmd_pay(q.message); await q.answer()
-
-# ---------------------------
-# مسار التفعيل عن طريق المرجع للمستخدم
-# ---------------------------
-@dp.message(Command("submit_tx"))
-async def cmd_submit(m: Message):
-    parts = (m.text or "").strip().split(maxsplit=2)
-    if len(parts) != 3 or parts[2] not in ("2w", "4w"):
-        return await m.answer(
-            "استخدم: <code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n"
-            "يمكنك أيضًا إلصاق <i>رابط Tronscan</i> بدل رقم المرجع.", parse_mode="HTML")
-    ref_or_url, plan = parts[1], parts[2]
-    min_amount = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
-    txid = extract_txid(ref_or_url)
-    ok, info = find_trc20_transfer_to_me(ref_or_url, min_amount)
-    if ok:
-        with get_session() as s:
-            dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
-            end_at = approve_paid(s, m.from_user.id, plan, dur, tx_hash=txid or ref_or_url)
-        return await m.answer(
-            "✅ <b>تم التحقق من الدفع بنجاح</b>\n"
-            f"💵 المبلغ المستلم: <b>{info} USDT</b>\n"
-            f"⏳ الاشتراك فعّال حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n"
-            "🚀 أهلاً بك في النسخة الكاملة — استمتع بالإشارات والتقرير اليومي!",
-            parse_mode="HTML")
-    alert = (
-        "🔔 <b>طلب تفعيل — فشل التحقق التلقائي</b>\n"
-        f"User: <code>{m.from_user.id}</code>\n"
-        f"Plan: <b>{plan}</b>\n"
-        f"Reference: <code>{_h(ref_or_url)}</code>\n"
-        f"Reason: {_h(info)}"
-    )
-    await send_admins(alert)
-    await m.answer(
-        "❗ لم نتمكن من التحقق تلقائيًا من الدفع.\n"
-        "سيقوم الأدمن بالمراجعة اليدوية قريبًا.\n"
-        "💡 تأكد أن الإرسال كان USDT على شبكة TRON (TRC20) وأن رقم المرجع صحيح.",
-        parse_mode="HTML"
-    )
-    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
-        await m.answer("تسريع المعالجة؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
 
 # ---------------------------
 # أوامر الأدمن
@@ -787,13 +740,11 @@ async def cmd_admin_help(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS: return
     txt = (
         "🛠️ <b>أوامر الأدمن</b>\n"
-        "• <code>/admin</code> – لوحة الأزرار (تفعيل يدوي سهل)\n"
+        "• <code>/admin</code> – لوحة الأزرار\n"
         "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – تفعيل مباشر\n"
         "• <code>/activate &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – مرادف لـ /approve\n"
         "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية للمشتركين النشطين\n"
-        "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
-        "• <code>/send_guide_test</code> – اختبار إرسال صورة دليل الدفع (لنفسك)\n"
-        "• (مخفية) أرسل «صورة/ملف» هنا لاستخراج <b>file_id</b> تلقائيًا"
+        "• <code>/force_report</code> – إرسال التقرير اليومي الآن"
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -801,8 +752,7 @@ async def cmd_admin_help(m: Message):
 async def cmd_admin(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS: return
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ تفعيل اشتراك يدوي", callback_data="admin_manual")
-    kb.button(text="📸 إرسال صورة دليل الدفع (اختبار)", callback_data="admin_send_guide")
+    kb.button(text="➕ تفعيل اشتراك يدوي (إدخال user_id)", callback_data="admin_manual")
     kb.button(text="ℹ️ أوامر الأدمن", callback_data="admin_help_btn")
     kb.adjust(1)
     await m.answer("لوحة الأدمن:", reply_markup=kb.as_markup())
@@ -812,12 +762,6 @@ async def cb_admin_help_btn(q: CallbackQuery):
     if q.from_user.id not in ADMIN_USER_IDS: return await q.answer()
     await cmd_admin_help(q.message)
     await q.answer()
-
-@dp.callback_query(F.data == "admin_send_guide")
-async def cb_admin_send_guide(q: CallbackQuery):
-    if q.from_user.id not in ADMIN_USER_IDS: return await q.answer()
-    await send_pay_guide(q.message.chat.id)
-    await q.answer("تم.")
 
 @dp.callback_query(F.data == "admin_manual")
 async def cb_admin_manual(q: CallbackQuery):
@@ -830,7 +774,7 @@ async def cb_admin_manual(q: CallbackQuery):
 
 @dp.message(F.text)
 async def admin_manual_router(m: Message):
-    """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> إدخال مرجع (اختياري) -> تفعيل."""
+    """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> (مرجع اختياري) -> تفعيل."""
     aid = m.from_user.id
     flow = ADMIN_FLOW.get(aid)
     if not flow or aid not in ADMIN_USER_IDS:
@@ -900,7 +844,7 @@ async def cb_admin_plan(q: CallbackQuery):
     kb.adjust(1)
 
     await q.message.answer(
-        "أرسل رقم المرجع (TxID) الآن لإرفاقه بالإيصال.\n"
+        "أرسل رقم مرجع (اختياري) لإرفاقه بالإيصال.\n"
         "أو اضغط «تخطي المرجع».", reply_markup=kb.as_markup()
     )
     await q.answer()
@@ -982,34 +926,6 @@ async def cmd_force_report(m: Message):
         stats_24 = get_stats_24h(s); stats_7d = get_stats_7d(s)
     await send_channel(_report_card(stats_24, stats_7d))
     await m.answer("تم إرسال التقرير للقناة.")
-
-# === Admin-only: استخراج file_id للصورة/الملف ===
-@dp.message(F.photo)
-async def _admin_grab_photo_file_id(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    fid = m.photo[-1].file_id
-    await m.answer(
-        f"🆔 <b>file_id</b> لهذه الصورة:\n<code>{fid}</code>\n"
-        "انسخه وضعه في <b>PAY_GUIDE_FILE_ID</b>.",
-        parse_mode="HTML"
-    )
-
-@dp.message(F.document)
-async def _admin_grab_document_file_id(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    fid = m.document.file_id
-    await m.answer(
-        f"🆔 <b>file_id</b> لهذا الملف:\n<code>{fid}</code>",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("send_guide_test"))
-async def _admin_send_guide_test(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    await send_pay_guide(m.chat.id)
 
 # ---------------------------
 # فحوصات التشغيل
