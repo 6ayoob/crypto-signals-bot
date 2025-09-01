@@ -1,9 +1,8 @@
 # bot.py — مُشغِّل البوت (Aiogram v3) مع OKX + اشتراكات + TRC20 + تقارير + مخاطر V2
 # تحسينات: منع تكرار الإشارات (Dedupe)، تسريع فحص الشموع (Batch + Concurrency)،
-# إصلاح إغلاق الصفقة (استدعاء واحد)، إعادة محاولة للتقرير اليومي، لوج أوضح، لمسات استقرار.
-# جديد: صورة دليل الدفع للمشترك + لوحة تفعيل يدوي للأدمن بخطوات سهلة.
-# مضاف حديثًا: Rate Limiter لطلبات OKX لمنع 50011 (Too Many Requests)
-# + زر "💬 مراسلة الدعم (خاص)" يفتح الخاص مباشرة + رسائل تحفيزية للمشتركين.
+# إصلاح إغلاق الصفقة (استدعاء واحد)، إعادة محاولة للتقرير اليومي، لوج أوضح.
+# جديد: صورة دليل الدفع + لوحة تفعيل يدوي مبسطة + زر مراسلة خاص مع الأدمن فقط.
+# إزالة "نظام الدعم" الداخلي واستبداله بزر يفتح الخاص + عرض معرّف الأدمن.
 
 import asyncio
 import json
@@ -146,8 +145,8 @@ MONITOR_INTERVAL_SEC = int(os.getenv("MONITOR_INTERVAL_SEC", "15"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
 # ضبط التوازي والدفعات لمسح الشموع
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "10"))   # 10 رموز بالدفعة
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))    # 5 مهام fetch متزامنة كحد أقصى
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "10"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
 
 # مخاطر V2
 RISK_STATE_FILE = Path("risk_state.json")
@@ -158,19 +157,16 @@ AUDIT_IDS: Dict[int, str] = {}
 
 # Dedupe نافذة لمنع تكرار الإشارات المتقاربة
 DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
-_LAST_SIGNAL_AT: Dict[str, float] = {}  # key=symbol, value=unix_ts
+_LAST_SIGNAL_AT: Dict[str, float] = {}
 
-# دعم/تواصل
+# ===== دعم خاص فقط (لا جلسات داخل البوت) =====
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
-SUPPORT_WAIT: Dict[int, float] = {}
-ADMIN_REPLY_TARGET: Dict[int, int] = {}
-SUPPORT_WAIT_MINUTES = int(os.getenv("SUPPORT_WAIT_MINUTES", "10"))
 
-# ====== إعدادات صورة دليل الدفع (اختياري) ======
-PAY_GUIDE_FILE_ID = os.getenv("PAY_GUIDE_FILE_ID")      # إن وُجد file_id لصورة سبق رفعها
-PAY_GUIDE_URL = os.getenv("PAY_GUIDE_URL")              # أو رابط مباشر للصورة
-PAY_GUIDE_LOCAL_PATH = os.getenv("PAY_GUIDE_LOCAL_PATH")# أو مسار محلي داخل المشروع (assets/payment_guide.jpg)
+# ====== إعدادات صورة دليل الدفع ======
+PAY_GUIDE_FILE_ID = os.getenv("PAY_GUIDE_FILE_ID")        # file_id للصورة (اختياري)
+PAY_GUIDE_URL = os.getenv("PAY_GUIDE_URL")                # رابط مباشر (اختياري)
+PAY_GUIDE_LOCAL_PATH = os.getenv("PAY_GUIDE_LOCAL_PATH")  # مسار محلي داخل المشروع (اختياري)
 
 # ====== تدفق تفعيل يدوي للأدمن ======
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # {admin_id: {'stage': 'await_user'|'await_plan'|'await_ref', 'uid': int, 'plan': '2w'|'4w'}}
@@ -186,24 +182,6 @@ def _make_audit_id(symbol: str, entry: float, score: int) -> str:
     h = hashlib.md5(base.encode()).hexdigest()[:6]
     return f"{base}_{h}"
 
-def _now_ts() -> float:
-    return time.time()
-
-def _support_set(uid: int):
-    SUPPORT_WAIT[uid] = _now_ts() + SUPPORT_WAIT_MINUTES * 60
-
-def _support_clear(uid: int):
-    SUPPORT_WAIT.pop(uid, None)
-
-def _support_waiting(uid: int) -> bool:
-    exp = SUPPORT_WAIT.get(uid)
-    if not exp:
-        return False
-    if _now_ts() > exp:
-        SUPPORT_WAIT.pop(uid, None)
-        return False
-    return True
-
 async def send_channel(text: str):
     try:
         await bot.send_message(TELEGRAM_CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=True)
@@ -211,12 +189,11 @@ async def send_channel(text: str):
         logger.error(f"send_channel error: {e}")
 
 async def send_admins(text: str):
+    # تنبيهات داخلية للأدمن/غرفة إدارية (اختياري)
+    targets = list(ADMIN_USER_IDS)
     if SUPPORT_CHAT_ID:
-        try:
-            await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-        except Exception as e:
-            logger.warning(f"SUPPORT_CHAT notify error: {e}")
-    for admin_id in ADMIN_USER_IDS:
+        targets.append(SUPPORT_CHAT_ID)
+    for admin_id in targets:
         try:
             await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
@@ -238,11 +215,21 @@ async def notify_subscribers(text: str):
     for uid in uids:
         try:
             await bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
-            await asyncio.sleep(0.02)  # rate-limit لطيف
+            await asyncio.sleep(0.02)
         except Exception:
             pass
 
 # ===== رسائل ترحيب/دفع تحفيزية =====
+def _contact_line() -> str:
+    parts = []
+    if SUPPORT_USERNAME:
+        parts.append(f"🔗 <a href='https://t.me/{SUPPORT_USERNAME}'>مراسلة الأدمن (خاص)</a>")
+    if SUPPORT_CHAT_ID:
+        parts.append(f"🆔 معرّف الأدمن: <code>{SUPPORT_CHAT_ID}</code>")
+    if SUPPORT_CHAT_ID and not SUPPORT_USERNAME:
+        parts.append(f"⚡️ أو افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
+    return "\n".join(parts) if parts else "—"
+
 async def welcome_text() -> str:
     return (
         "👋 أهلاً بك في <b>عالم الفرص</b> — حيث تُلتقط الحركات القوية قبل أن يشاهدها الجميع!\n\n"
@@ -252,24 +239,25 @@ async def welcome_text() -> str:
         "خطط الاشتراك:\n"
         f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
         f"محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
-        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b> وراقب قوة الإشارات بنفسك.\n"
+        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n"
         "💳 بعد الدفع أرسل رقم المرجع (TxID):\n"
         "<code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n\n"
-        "🚀 <i>كل صفقة مدروسة بإطار واضح: دخول، وقف، أهداف، ورسائل متابعة.</i>"
+        "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
     )
 
-# ===== زر مراسلة الدعم (خاص) =====
+# ===== زر مراسلة الأدمن (خاص) =====
 def support_dm_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if SUPPORT_USERNAME:
-        kb.button(text="💬 مراسلة الدعم (خاص)", url=f"https://t.me/{SUPPORT_USERNAME}")
+        kb.button(text="💬 مراسلة الأدمن (خاص)", url=f"https://t.me/{SUPPORT_USERNAME}")
+    elif SUPPORT_CHAT_ID:
+        kb.button(text="💬 مراسلة الأدمن (خاص)", url=f"tg://user?id={SUPPORT_CHAT_ID}")
     return kb.as_markup()
 
 # ===== إرسال صورة دليل الدفع =====
 from aiogram.types import FSInputFile
 async def send_pay_guide(chat_id: int):
-    """إرسال صورة/إنفوغرافيك طريقة الدفع إن توفّر ملف محلي أو file_id أو URL."""
-    # 1) ملف محلي
+    """إرسال صورة/إنفوغرافيك طريقة الدفع: ملف محلي ← file_id ← URL."""
     if PAY_GUIDE_LOCAL_PATH and os.path.exists(PAY_GUIDE_LOCAL_PATH):
         try:
             msg = await bot.send_photo(chat_id, photo=FSInputFile(PAY_GUIDE_LOCAL_PATH), caption="📸 دليل الدفع المختصر")
@@ -277,7 +265,6 @@ async def send_pay_guide(chat_id: int):
             return
         except Exception as e:
             logger.warning(f"PAY_GUIDE_LOCAL failed: {e}")
-    # 2) file_id
     if PAY_GUIDE_FILE_ID:
         try:
             msg = await bot.send_photo(chat_id, PAY_GUIDE_FILE_ID, caption="📸 دليل الدفع المختصر")
@@ -285,7 +272,6 @@ async def send_pay_guide(chat_id: int):
             return
         except Exception as e:
             logger.warning(f"PAY_GUIDE_FILE_ID failed: {e}")
-    # 3) URL
     if PAY_GUIDE_URL:
         try:
             msg = await bot.send_photo(chat_id, PAY_GUIDE_URL, caption="📸 دليل الدفع المختصر")
@@ -293,7 +279,6 @@ async def send_pay_guide(chat_id: int):
             return
         except Exception as e:
             logger.warning(f"PAY_GUIDE_URL failed: {e}")
-    # فشل
     await bot.send_message(chat_id, "⚠️ تعذّر إرفاق صورة دليل الدفع حاليًا.")
     logger.warning("pay_guide: no valid source (local/file_id/url).")
 
@@ -315,15 +300,14 @@ def format_signal_text_basic(sig: dict) -> str:
         f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
         f"{extra}\n"
         "━━━━━━━━━━━━━━\n"
-        "⚡️ <i>التزم بالخطة: حجم مخاطرة ثابت، لا تلحق بالسعر، والتزم بالوقف.</i>\n"
-        "💡 <i>نصيحة: إدخال هادئ أفضل من مطاردة شمعة سريعة.</i>"
+        "⚡️ <i>التزم بالخطة: مخاطرة ثابتة، لا تلحق بالسعر، والتزم بالوقف.</i>"
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
     emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(t.result or "", "ℹ️")
     result_label = {"tp1": "تحقق الهدف 1 — خطوة ممتازة!", "tp2": "تحقق الهدف 2 — إنجاز رائع!", "sl": "وقف الخسارة — حماية رأس المال"}.get(t.result or "", "إغلاق")
     r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
-    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (t.result == "sl") else "🎯 إدارة الربح أهم من الصفقات الكثيرة."
+    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (t.result == "sl") else "🎯 إدارة الربح أهم من كثرة الصفقات."
     return (
         f"{emoji} <b>إغلاق صفقة</b>\n"
         "━━━━━━━━━━━━━━\n"
@@ -428,7 +412,7 @@ async def load_okx_markets_and_filter():
         AVAILABLE_SYMBOLS = []
 
 # ---------------------------
-# جلب البيانات/الأسعار (مع Rate Limiter + Backoff)
+# جلب البيانات/الأسعار
 # ---------------------------
 async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300):
     for attempt in range(4):
@@ -463,16 +447,16 @@ async def fetch_ticker_price(symbol: str) -> float | None:
 # ---------------------------
 # Dedupe: منع تكرار الإشارات
 # ---------------------------
+_last_signal_at: Dict[str, float] = {}
 def _should_skip_duplicate(sig: dict) -> bool:
-    """منع إرسال إشارة متقاربة لنفس الرمز ضمن نافذة زمنية محددة."""
     sym = sig.get("symbol")
     if not sym:
         return False
-    now = _now_ts()
-    last_ts = _LAST_SIGNAL_AT.get(sym, 0)
+    now = time.time()
+    last_ts = _last_signal_at.get(sym, 0)
     if now - last_ts < DEDUPE_WINDOW_MIN * 60:
         return True
-    _LAST_SIGNAL_AT[sym] = now
+    _last_signal_at[sym] = now
     return False
 
 # ---------------------------
@@ -514,13 +498,10 @@ async def scan_and_dispatch():
                     logger.warning(f"scan symbol error {sym}: {e}")
                     return None
 
-        # تقسيم على دفعات
         for i in range(0, len(AVAILABLE_SYMBOLS), SCAN_BATCH_SIZE):
             batch = AVAILABLE_SYMBOLS[i:i+SCAN_BATCH_SIZE]
             sigs = await asyncio.gather(*[ _guarded_scan(s) for s in batch ])
-            # معالجة النتائج
             for sig in filter(None, sigs):
-                # منع التكرار
                 if _should_skip_duplicate(sig):
                     logger.info(f"DEDUPE SKIP {sig['symbol']}")
                     continue
@@ -549,10 +530,10 @@ async def scan_and_dispatch():
 
                 try:
                     await _send_signal_to_channel(sig, audit_id)
-                    # رسالة تحفيزية قصيرة على الخاص للمشتركين النشطين
+                    # دفعة تحفيزية قصيرة على الخاص
                     note = (
                         "🚀 <b>إشارة جديدة وصلت!</b>\n"
-                        "🔔 لا تتعجل — التزم بحجم مخاطرة ثابت وانتظر مناطق الدخول المحددة."
+                        "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
                     )
                     uids = list_active_user_ids()
                     for uid in uids:
@@ -565,8 +546,7 @@ async def scan_and_dispatch():
                 except Exception as e:
                     logger.exception(f"SEND SIGNAL ERROR: {e}")
 
-                await asyncio.sleep(0.05)  # لطيف على التليجرام/API
-            # فاصل بسيط بين الدفعات
+                await asyncio.sleep(0.05)
             await asyncio.sleep(0.1)
 
 async def loop_signals():
@@ -576,7 +556,6 @@ async def loop_signals():
             await scan_and_dispatch()
         except Exception as e:
             logger.exception(f"SCAN_LOOP ERROR: {e}")
-        # احترام الفترة المتبقية من الإطار الزمني للدورة
         elapsed = time.time() - started
         sleep_for = max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed)
         await asyncio.sleep(sleep_for)
@@ -606,7 +585,6 @@ async def monitor_open_trades():
                     if not result:
                         continue
 
-                    # حساب R ثم إغلاق باستدعاء واحد
                     r_multiple = on_trade_closed_update_risk(t, result, exit_px)
                     try:
                         close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
@@ -620,9 +598,8 @@ async def monitor_open_trades():
                         except Exception:
                             pass
 
-                    # إشعار تحفيزي
                     msg = format_close_text(t, r_multiple)
-                    msg += "\n💡 <i>انضباطك مع الوقف والأهداف يصنع الفرق على المدى الطويل.</i>"
+                    msg += "\n💡 <i>الانضباط مع الوقف والأهداف يصنع الفرق على المدى الطويل.</i>"
                     await notify_subscribers(msg)
                     await asyncio.sleep(0.05)
         except Exception as e:
@@ -630,7 +607,7 @@ async def monitor_open_trades():
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
 
 # ---------------------------
-# التقرير اليومي (مع إعادة محاولة)
+# التقرير اليومي
 # ---------------------------
 def _report_card(stats_24: dict, stats_7d: dict) -> str:
     return (
@@ -647,8 +624,7 @@ def _report_card(stats_24: dict, stats_7d: dict) -> str:
         f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>\n"
         f"• معدل نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>\n"
         "━━━━━━━━━━━━━━\n"
-        "💡 <i>الخطة أهم من الضجيج: إدارة مخاطرة ثابتة + التزام بالأهداف.</i>\n"
-        "🚀 <i>نستهدف فرصًا منتقاة بجودة أعلى بدل كثرة الإشارات.</i>"
+        "💡 <i>الخطة أهم من الضجيج: مخاطرة ثابتة + التزام بالأهداف.</i>"
     )
 
 async def daily_report_once():
@@ -686,11 +662,11 @@ async def cmd_start(m: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
     kb.button(text="💳 الدفع (USDT TRC20) + رقم المرجع", callback_data="subscribe_info")
-    kb.button(text="💬 تواصل الدعم", callback_data="support")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
-    if SUPPORT_USERNAME:
-        await m.answer("تحتاج مساعدة؟ فريق الدعم يرد بسرعة:", reply_markup=support_dm_kb())
+    # زر مراسلة خاص مفصول ليتاح زر URL
+    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
+        await m.answer("تحتاج مساعدة؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
 
 @dp.callback_query(F.data == "start_trial")
 async def cb_trial(q: CallbackQuery):
@@ -713,9 +689,8 @@ async def cmd_help(m: Message):
         "• <code>/start</code> – البداية والقائمة الرئيسية\n"
         "• <code>/pay</code> – الدفع وشرح رقم المرجع (TxID)\n"
         "• <code>/submit_tx</code> – إرسال رقم المرجع لتفعيل الاشتراك\n"
-        "• <code>/status</code> – حالة الاشتراك\n"
-        "• <code>/support</code> – فتح محادثة مع الدعم + زر مراسلة خاص\n"
-        "• <code>/cancel</code> – إلغاء محادثة الدعم الحالية"
+        "• <code>/status</code> – حالة الاشتراك\n\n"
+        "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
     await m.answer(text, parse_mode="HTML")
 
@@ -735,7 +710,6 @@ async def cmd_pay(m: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="📎 طريقة الإرسال ورقم المرجع (TxID)", callback_data="tx_help")
     kb.button(text="💳 أسعار وخطط الاشتراك", callback_data="subscribe_info")
-    kb.button(text="💬 تواصل الدعم", callback_data="support")
     kb.adjust(1)
     txt = (
         "💳 <b>الدفع عبر USDT (TRC20)</b>\n"
@@ -748,63 +722,88 @@ async def cmd_pay(m: Message):
         "📸 أرفقنا لك دليلًا بصريًا مختصرًا 👇"
     )
     await m.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
-    await send_pay_guide(m.chat.id)  # إرسال الصورة إن توفرت
-    if SUPPORT_USERNAME:
-        await m.answer("تحتاج مساعدة بالدفع؟ اضغط الزر لفتح الخاص:", reply_markup=support_dm_kb())
+    await send_pay_guide(m.chat.id)
+    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
+        await m.answer("تحتاج مساعدة بالدفع؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
 
 @dp.callback_query(F.data == "tx_help")
 async def cb_tx_help(q: CallbackQuery):
     await q.message.answer(REFERENCE_HINT, parse_mode="HTML")
     await send_pay_guide(q.message.chat.id)
-    if SUPPORT_USERNAME:
-        await q.message.answer("لو واجهتك صعوبة، راسلنا على الخاص:", reply_markup=support_dm_kb())
+    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
+        await q.message.answer("لو واجهتك صعوبة، راسل الأدمن:", reply_markup=support_dm_kb())
     await q.answer()
 
 @dp.callback_query(F.data == "subscribe_info")
 async def cb_sub_info(q: CallbackQuery):
     await cmd_pay(q.message); await q.answer()
 
-# --- دعم: فتح محادثة المستخدم ---
-@dp.message(Command("support"))
-async def cmd_support(m: Message):
-    _support_set(m.from_user.id)
+# ---------------------------
+# مسار التفعيل عن طريق المرجع للمستخدم
+# ---------------------------
+@dp.message(Command("submit_tx"))
+async def cmd_submit(m: Message):
+    parts = (m.text or "").strip().split(maxsplit=2)
+    if len(parts) != 3 or parts[2] not in ("2w", "4w"):
+        return await m.answer(
+            "استخدم: <code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n"
+            "يمكنك أيضًا إلصاق <i>رابط Tronscan</i> بدل رقم المرجع.", parse_mode="HTML")
+    ref_or_url, plan = parts[1], parts[2]
+    min_amount = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
+    txid = extract_txid(ref_or_url)
+    ok, info = find_trc20_transfer_to_me(ref_or_url, min_amount)
+    if ok:
+        with get_session() as s:
+            dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
+            end_at = approve_paid(s, m.from_user.id, plan, dur, tx_hash=txid or ref_or_url)
+        return await m.answer(
+            "✅ <b>تم التحقق من الدفع بنجاح</b>\n"
+            f"💵 المبلغ المستلم: <b>{info} USDT</b>\n"
+            f"⏳ الاشتراك فعّال حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n"
+            "🚀 أهلاً بك في النسخة الكاملة — استمتع بالإشارات والتقرير اليومي!",
+            parse_mode="HTML")
+    alert = (
+        "🔔 <b>طلب تفعيل — فشل التحقق التلقائي</b>\n"
+        f"User: <code>{m.from_user.id}</code>\n"
+        f"Plan: <b>{plan}</b>\n"
+        f"Reference: <code>{_h(ref_or_url)}</code>\n"
+        f"Reason: {_h(info)}"
+    )
+    await send_admins(alert)
     await m.answer(
-        "🆘 <b>تم فتح محادثة الدعم.</b>\n"
-        f"اكتب مشكلتك الآن (المهلة {SUPPORT_WAIT_MINUTES} دقائق). أرسل <code>/cancel</code> للإلغاء.\n\n"
-        "أو اضغط الزر لفتح الخاص مباشرة مع الدعم:",
-        parse_mode="HTML",
-        reply_markup=support_dm_kb()
+        "❗ لم نتمكن من التحقق تلقائيًا من الدفع.\n"
+        "سيقوم الأدمن بالمراجعة اليدوية قريبًا.\n"
+        "💡 تأكد أن الإرسال كان USDT على شبكة TRON (TRC20) وأن رقم المرجع صحيح.",
+        parse_mode="HTML"
     )
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(m: Message):
-    if _support_waiting(m.from_user.id):
-        _support_clear(m.from_user.id)
-        return await m.answer("✅ تم إلغاء محادثة الدعم. نحن هنا متى ما احتجتنا.", parse_mode="HTML")
-    await m.answer("ℹ️ لا توجد محادثة دعم جارية.", parse_mode="HTML")
-
-@dp.callback_query(F.data == "support")
-async def cb_support(q: CallbackQuery):
-    _support_set(q.from_user.id)
-    await q.message.answer(
-        "🆘 <b>تم فتح محادثة الدعم.</b>\n"
-        f"اكتب مشكلتك الآن (المهلة {SUPPORT_WAIT_MINUTES} دقائق). أرسل <code>/cancel</code> للإلغاء.\n\n"
-        "أو اضغط الزر لفتح الخاص مباشرة مع الدعم:",
-        parse_mode="HTML",
-        reply_markup=support_dm_kb()
-    )
-    await q.answer()
+    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
+        await m.answer("تسريع المعالجة؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
 
 # ---------------------------
-# تفعيل يدوي للأدمن — لوحة مبسطة
+# أوامر الأدمن
 # ---------------------------
+@dp.message(Command("admin_help"))
+async def cmd_admin_help(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS: return
+    txt = (
+        "🛠️ <b>أوامر الأدمن</b>\n"
+        "• <code>/admin</code> – لوحة الأزرار (تفعيل يدوي سهل)\n"
+        "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – تفعيل مباشر\n"
+        "• <code>/activate &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – مرادف لـ /approve\n"
+        "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية للمشتركين النشطين\n"
+        "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
+        "• <code>/send_guide_test</code> – اختبار إرسال صورة دليل الدفع (لنفسك)\n"
+        "• (مخفية) أرسل «صورة/ملف» هنا لاستخراج <b>file_id</b> تلقائيًا"
+    )
+    await m.answer(txt, parse_mode="HTML")
+
 @dp.message(Command("admin"))
 async def cmd_admin(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS: return
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ تفعيل اشتراك يدوي", callback_data="admin_manual")
-    kb.button(text="📸 إرسال صورة دليل الدفع", callback_data="admin_send_guide")
-    kb.button(text="ℹ️ مساعدة الأوامر", callback_data="admin_help_btn")
+    kb.button(text="📸 إرسال صورة دليل الدفع (اختبار)", callback_data="admin_send_guide")
+    kb.button(text="ℹ️ أوامر الأدمن", callback_data="admin_help_btn")
     kb.adjust(1)
     await m.answer("لوحة الأدمن:", reply_markup=kb.as_markup())
 
@@ -826,28 +825,19 @@ async def cb_admin_manual(q: CallbackQuery):
     if aid not in ADMIN_USER_IDS:
         return await q.answer("غير مُصرّح.", show_alert=True)
     ADMIN_FLOW[aid] = {"stage": "await_user"}
-    await q.message.answer("أرسل الآن <code>user_id</code> للمشترك الذي تريد تفعيله:", parse_mode="HTML")
+    await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
     await q.answer()
 
 @dp.message(F.text)
 async def admin_manual_router(m: Message):
-    """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> إدخال مرجع اختياري -> تفعيل."""
+    """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> إدخال مرجع (اختياري) -> تفعيل."""
     aid = m.from_user.id
-    # لو الإدمن في وضع "الرد على المستخدم" لا نتدخل
-    if aid in ADMIN_REPLY_TARGET:
-        return
-
     flow = ADMIN_FLOW.get(aid)
-    if not flow:
-        return  # لا يوجد تدفق تفعيل جارٍ لهذا الأدمن
-
-    if aid not in ADMIN_USER_IDS:
-        ADMIN_FLOW.pop(aid, None)
+    if not flow or aid not in ADMIN_USER_IDS:
         return
 
     stage = flow.get("stage")
 
-    # 1) انتظار user_id
     if stage == "await_user":
         try:
             uid = int(m.text.strip())
@@ -863,7 +853,6 @@ async def admin_manual_router(m: Message):
             await m.answer("الرجاء إرسال رقم user_id صحيح (أرقام فقط).")
         return
 
-    # 2) انتظار المرجع (اختياري)
     if stage == "await_ref":
         ref = m.text.strip()
         if ref.lower() in ("/skip", "skip", "تخطي", "تخطى"):
@@ -953,150 +942,7 @@ async def cb_admin_cancel(q: CallbackQuery):
     await q.message.answer("تم إلغاء جلسة التفعيل اليدوي.")
     await q.answer("تم.")
 
-# --- دعم: نقل رسائل المستخدم إلى الدعم كـ «تذكرة» ---
-async def _send_ticket_to_admins(user_msg: Message):
-    uid = user_msg.from_user.id
-    username = f"@{user_msg.from_user.username}" if user_msg.from_user.username else "-"
-    with get_session() as s:
-        u = s.query(User).filter(User.tg_user_id == uid).first()
-    plan = u.plan if (u and u.plan) else "-"
-    end_at = u.end_at.strftime("%Y-%m-%d %H:%M UTC") if (u and u.end_at) else "-"
-    is_active_txt = "نعم" if (u and u.end_at and u.end_at > datetime.now(timezone.utc)) else "لا"
-    last_tx = u.last_tx_hash if (u and u.last_tx_hash) else "-"
-
-    header = (
-        "📩 <b>بلاغ دعم جديد</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"👤 المستخدم: <code>{uid}</code> ({_h(username)})\n"
-        f"🔖 الخطة: <b>{_h(plan)}</b> | نشط: <b>{is_active_txt}</b>\n"
-        f"⏳ صالح حتى: <code>{_h(end_at)}</code>\n"
-        f"🧾 آخر مرجع: <code>{_h(last_tx)}</code>\n"
-        "━━━━━━━━━━━━━━\n"
-        "⬇️ محتوى البلاغ:"
-    )
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="↩️ الرد على المستخدم", callback_data=f"reply_to:{uid}")
-    kb.adjust(1)
-
-    await send_admins(header)
-    targets = list(ADMIN_USER_IDS)
-    if SUPPORT_CHAT_ID:
-        targets.append(SUPPORT_CHAT_ID)
-    for chat_id in targets:
-        try:
-            await bot.copy_message(chat_id=chat_id, from_chat_id=user_msg.chat.id, message_id=user_msg.message_id)
-            await bot.send_message(chat_id, "—", reply_markup=kb.as_markup())
-        except Exception as e:
-            logger.warning(f"copy ticket to {chat_id} failed: {e}")
-
-# --- دعم: تحويل أي رسالة أثناء الانتظار إلى «تذكرة» ---
-@dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
-async def any_user_message_router(m: Message):
-    uid = m.from_user.id
-    if _support_waiting(uid):
-        _support_clear(uid)
-        await m.answer("✅ تم استلام رسالتك. سيردّ عليك الدعم قريبًا — شكراً على ثقتك.", parse_mode="HTML")
-        await _send_ticket_to_admins(m)
-
-# --- دعم: أول رسالة يرسلها الإداري بعد الضغط تُرسل للمستخدم ---
-@dp.callback_query(F.data.startswith("reply_to:"))
-async def cb_reply_to(q: CallbackQuery):
-    if q.from_user.id not in ADMIN_USER_IDS:
-        return await q.answer("غير مُصرّح.", show_alert=True)
-    try:
-        uid = int(q.data.split(":", 1)[1])
-    except Exception:
-        return await q.answer("بيانات غير صالحة.", show_alert=True)
-
-    ADMIN_REPLY_TARGET[q.from_user.id] = uid
-    await q.message.answer(
-        f"✍️ أرسل رسالتك الآن هنا أو على الخاص، وسيتم إرسالها للمستخدم <code>{uid}</code>.",
-        parse_mode="HTML"
-    )
-    try:
-        await bot.send_message(
-            q.from_user.id,
-            f"✍️ أرسل ردك الآن ليُرسل للمستخدم <code>{uid}</code>.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-    await q.answer("اكتب ردك الآن.")
-
-@dp.message(F.text | F.photo | F.document | F.video | F.voice | F.audio)
-async def admin_reply_bridge(m: Message):
-    aid = m.from_user.id
-    if aid not in ADMIN_USER_IDS:
-        return
-    target = ADMIN_REPLY_TARGET.get(aid)
-    if not target:
-        return
-    try:
-        await bot.send_message(target, "📩 <b>رد من الدعم</b>:", parse_mode="HTML")
-        await bot.copy_message(chat_id=target, from_chat_id=m.chat.id, message_id=m.message_id)
-        await m.answer("✅ تم إرسال ردك إلى المستخدم.")
-    except Exception as e:
-        await m.answer(f"❌ تعذّر إرسال الرد: {e}")
-    finally:
-        ADMIN_REPLY_TARGET.pop(aid, None)
-
-# ---------------------------
-# مسار التفعيل عن طريق المرجع للمستخدم
-# ---------------------------
-@dp.message(Command("submit_tx"))
-async def cmd_submit(m: Message):
-    parts = (m.text or "").strip().split(maxsplit=2)
-    if len(parts) != 3 or parts[2] not in ("2w", "4w"):
-        return await m.answer(
-            "استخدم: <code>/submit_tx رقم_المرجع 2w</code> أو <code>/submit_tx رقم_المرجع 4w</code>\n"
-            "يمكنك أيضًا إلصاق <i>رابط Tronscan</i> بدل رقم المرجع.", parse_mode="HTML")
-    ref_or_url, plan = parts[1], parts[2]
-    min_amount = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
-    txid = extract_txid(ref_or_url)
-    ok, info = find_trc20_transfer_to_me(ref_or_url, min_amount)
-    if ok:
-        with get_session() as s:
-            dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
-            end_at = approve_paid(s, m.from_user.id, plan, dur, tx_hash=txid or ref_or_url)
-        return await m.answer(
-            "✅ <b>تم التحقق من الدفع بنجاح</b>\n"
-            f"💵 المبلغ المستلم: <b>{info} USDT</b>\n"
-            f"⏳ الاشتراك فعّال حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>\n\n"
-            "🚀 أهلاً بك في النسخة الكاملة — استمتع بالإشارات والتقرير اليومي!",
-            parse_mode="HTML")
-    alert = (
-        "🔔 <b>طلب تفعيل — فشل التحقق التلقائي</b>\n"
-        f"User: <code>{m.from_user.id}</code>\n"
-        f"Plan: <b>{plan}</b>\n"
-        f"Reference: <code>{_h(ref_or_url)}</code>\n"
-        f"Reason: {_h(info)}"
-    )
-    await send_admins(alert)
-    await m.answer(
-        "❗ لم نتمكن من التحقق تلقائيًا من الدفع.\n"
-        "سيقوم فريق الدعم بالمراجعة اليدوية قريبًا.\n"
-        "💡 تأكد أن الإرسال كان USDT على شبكة TRON (TRC20) وأن رقم المرجع صحيح.",
-        parse_mode="HTML"
-    )
-    if SUPPORT_USERNAME:
-        await m.answer("تسريع المعالجة؟ راسلنا على الخاص:", reply_markup=support_dm_kb())
-
-# ---------------------------
-# أوامر الإدارة (التاريخية)
-# ---------------------------
-@dp.message(Command("admin_help"))
-async def cmd_admin_help(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS: return
-    txt = (
-        "🛠️ <b>أوامر الأدمن</b>\n"
-        "• <code>/admin</code> – لوحة الأزرار (تفعيل يدوي سهل)\n"
-        "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code>\n"
-        "• <code>/broadcast &lt;text&gt;</code>\n"
-        "• <code>/force_report</code>"
-    )
-    await m.answer(txt, parse_mode="HTML")
-
+# مرادف للأمر /approve
 @dp.message(Command("approve"))
 async def cmd_approve(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS: return
@@ -1109,10 +955,11 @@ async def cmd_approve(m: Message):
     with get_session() as s:
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
     await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
-    try:
-        await bot.send_message(uid, "✅ تم تفعيل اشتراكك. أهلاً بك! 🚀", parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"USER DM ERROR: {e}")
+
+@dp.message(Command("activate"))
+async def cmd_activate(m: Message):
+    # مرادف لـ /approve
+    await cmd_approve(m)
 
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(m: Message):
@@ -1136,6 +983,34 @@ async def cmd_force_report(m: Message):
     await send_channel(_report_card(stats_24, stats_7d))
     await m.answer("تم إرسال التقرير للقناة.")
 
+# === Admin-only: استخراج file_id للصورة/الملف ===
+@dp.message(F.photo)
+async def _admin_grab_photo_file_id(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    fid = m.photo[-1].file_id
+    await m.answer(
+        f"🆔 <b>file_id</b> لهذه الصورة:\n<code>{fid}</code>\n"
+        "انسخه وضعه في <b>PAY_GUIDE_FILE_ID</b>.",
+        parse_mode="HTML"
+    )
+
+@dp.message(F.document)
+async def _admin_grab_document_file_id(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    fid = m.document.file_id
+    await m.answer(
+        f"🆔 <b>file_id</b> لهذا الملف:\n<code>{fid}</code>",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("send_guide_test"))
+async def _admin_send_guide_test(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    await send_pay_guide(m.chat.id)
+
 # ---------------------------
 # فحوصات التشغيل
 # ---------------------------
@@ -1157,20 +1032,6 @@ async def check_channel_and_admin_dm():
     return ok
 
 # ---------------------------
-# Leader heartbeat task
-# ---------------------------
-async def _leader_heartbeat_task(name: str, holder: str):
-    while True:
-        try:
-            ok = heartbeat_leader_lock(name, holder)
-            if not ok:
-                logger.error("Leader lock lost! Exiting worker loop.")
-                os._exit(1)
-        except Exception as e:
-            logger.warning(f"Heartbeat error: {e}")
-        await asyncio.sleep(HEARTBEAT_INTERVAL)
-
-# ---------------------------
 # التشغيل
 # ---------------------------
 async def main():
@@ -1183,6 +1044,16 @@ async def main():
         if not ok:
             logger.error("Another instance holds the leader DB lock. Exiting.")
             return
+        async def _leader_heartbeat_task(name: str, holder: str):
+            while True:
+                try:
+                    ok = heartbeat_leader_lock(name, holder)
+                    if not ok:
+                        logger.error("Leader lock lost! Exiting worker loop.")
+                        os._exit(1)
+                except Exception as e:
+                    logger.warning(f"Heartbeat error: {e}")
+                await asyncio.sleep( max(10, LEADER_TTL // 2) )
         hb_task = asyncio.create_task(_leader_heartbeat_task(LEADER_LOCK_NAME, holder))
 
     await load_okx_markets_and_filter()
