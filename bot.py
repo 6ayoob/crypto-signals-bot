@@ -1,10 +1,9 @@
-# bot.py — مُشغِّل البوت (Aiogram v3) مع تفعيل يدوي مبسّط (2w / 4w) + تقارير + مخاطر + قفل قائد
-# تغييرات هذه النسخة:
-# - إزالة مسار الدفع الآلي عبر TRC20 / /submit_tx / دليل الدفع والصور.
-# - إضافة زر "🔑 طلب اشتراك" للمستخدم → يصل إشعار للأدمن مع أزرار تفعيل 2w / 4w / رفض.
-# - الحفاظ على /admin والتفعيل اليدوي (الإدخال اليدوي user_id) لمن يفضّل ذلك.
-# - الإبقاء على التجربة المجانية /start_trial (اختياري) + /status.
-# - لا تغيير على المنطق التشغيلي (الإشارات/التقارير/المخاطر/القفل).
+# bot.py — مُشغِّل البوت (Aiogram v3) مع تفعيل يدوي مبسّط (2w/4w) + تقارير + مخاطر + Leader Lock
+# محدث ليتوافق مع database.py المرفق:
+# - طلب اشتراك للمستخدم → إشعار للأدمن بأزرار: تفعيل 2w / 4w / رفض.
+# - أوامر أدمن مُحدَّثة: /approve, /activate, /extend, /deactivate, /user_status, /active_count, /broadcast, /force_report
+# - أوامر مستخدم: /start, /status (+ زر حالة), تجربة يومية /start_trial (اختياري)
+# - إزالة أي مسارات دفع آلي (TRC20) — تفعيل يدوي فقط.
 
 import asyncio
 import json
@@ -55,17 +54,17 @@ except Exception:
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS,
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
-    # القيم التالية اختيارية للعرض في الرسائل فقط (إن وُجدت في config):
+    # اختيارية للعرض فقط إن وُجدت:
     PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD,
     SUB_DURATION_2W, SUB_DURATION_4W
 )
 
-# قاعدة البيانات
+# قاعدة البيانات (مطابقة للملف المرسل)
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
-    count_open_trades, add_trade, close_trade,
-    add_trade_sig, has_open_trade_on_symbol,
-    get_stats_24h, get_stats_7d, User, Trade
+    count_open_trades, add_trade, close_trade, add_trade_sig, has_open_trade_on_symbol,
+    get_stats_24h, get_stats_7d, User, Trade, list_active_user_ids as db_list_active_user_ids,
+    acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock
 )
 
 # ---------- Leader Lock ----------
@@ -74,26 +73,6 @@ LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
 LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # ثواني
 HEARTBEAT_INTERVAL = max(10, LEADER_TTL // 2)
-
-acquire_or_steal_leader_lock = heartbeat_leader_lock = release_leader_lock = None
-if ENABLE_DB_LOCK:
-    try:
-        from database import acquire_or_steal_leader_lock as _acq
-        from database import heartbeat_leader_lock as _hb
-        from database import release_leader_lock as _rel
-        acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock = _acq, _hb, _rel
-    except Exception:
-        try:
-            from database import try_acquire_leader_lock as _try_acq
-            def acquire_or_steal_leader_lock(name, holder, ttl_seconds=300):
-                return _try_acq(name, holder)
-            def heartbeat_leader_lock(name, holder):
-                return True
-            def release_leader_lock(name, holder):
-                pass
-        except Exception:
-            ENABLE_DB_LOCK = False
-# -----------------------------------
 
 from strategy import check_signal
 from symbols import SYMBOLS
@@ -153,13 +132,12 @@ AUDIT_IDS: Dict[int, str] = {}
 DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
 _LAST_SIGNAL_AT: Dict[str, float] = {}
 
-# ===== دعم تواصل خاص مع الأدمن =====
+# ===== دعم تواصل خاص مع الأدمن (اختياري) =====
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
 
 # ====== تدفق تفعيل يدوي للأدمن ======
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # {admin_id: {'stage': 'await_user'|'await_plan'|'await_ref', 'uid': int, 'plan': '2w'|'4w'}}
-# ملاحظة: سنستخدم أيضًا أزرار inline مباشرة من إشعار "طلب اشتراك" بدون هذا التدفق.
 
 # ---------------------------
 # أدوات مساعدة
@@ -179,7 +157,6 @@ async def send_channel(text: str):
         logger.error(f"send_channel error: {e}")
 
 async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = None):
-    # تنبيهات داخلية للأدمن/غرفة إدارية (اختياري)
     targets = list(ADMIN_USER_IDS)
     if SUPPORT_CHAT_ID:
         targets.append(SUPPORT_CHAT_ID)
@@ -192,9 +169,7 @@ async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = Non
 def list_active_user_ids() -> list[int]:
     try:
         with get_session() as s:
-            now = datetime.now(timezone.utc)
-            rows = s.query(User.tg_user_id).filter(User.end_at != None, User.end_at > now).all()  # noqa: E711
-            return [r[0] for r in rows if r[0]]
+            return db_list_active_user_ids(s)
     except Exception as e:
         logger.warning(f"list_active_user_ids warn: {e}")
         return []
@@ -226,18 +201,16 @@ async def welcome_text() -> str:
     except Exception:
         pass
     return (
-        "👋 أهلاً بك في <b>عالم الفرص</b> — حيث تُلتقط الحركات القوية قبل أن يشاهدها الجميع!\n\n"
-        "🔔 إشارات لحظية مبنية على منهجية صارمة (Score + Regime + إدارة مخاطر)\n"
-        f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n"
-        "💰 استراتيجيتنا تركز على <b>حماية رأس المال أولاً</b> ثم تعظيم العائد.\n\n"
+        "👋 أهلاً بك في <b>عالم الفرص</b>\n\n"
+        "🔔 إشارات لحظية + إدارة مخاطر منضبطة\n"
+        f"🕘 تقرير يومي الساعة <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
         "خطط الاشتراك:\n"
         f"{price_line}"
-        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن لتفعيلك لمدة 2 أسابيع أو 4 أسابيع.\n\n"
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيقوم الأدمن بتفعيلك (2 أسابيع أو 4 أسابيع).\n\n"
         "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
         "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
     )
 
-# ===== زر مراسلة الأدمن (خاص) =====
 def support_dm_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if SUPPORT_USERNAME:
@@ -485,12 +458,8 @@ async def scan_and_dispatch():
 
                 try:
                     await _send_signal_to_channel(sig, audit_id)
-                    note = (
-                        "🚀 <b>إشارة جديدة وصلت!</b>\n"
-                        "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
-                    )
-                    uids = list_active_user_ids()
-                    for uid in uids:
+                    note = "🚀 <b>إشارة جديدة وصلت!</b>\n🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
+                    for uid in list_active_user_ids():
                         try:
                             await bot.send_message(uid, note, parse_mode="HTML", disable_web_page_preview=True)
                             await asyncio.sleep(0.02)
@@ -733,16 +702,23 @@ async def cmd_status(m: Message):
     )
 
 # ---------------------------
-# أوامر الأدمن
+# أوامر الأدمن — محدّثة بالكامل
 # ---------------------------
+def _is_admin(uid: int) -> bool:
+    return uid in ADMIN_USER_IDS
+
 @dp.message(Command("admin_help"))
 async def cmd_admin_help(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS: return
+    if not _is_admin(m.from_user.id): return
     txt = (
         "🛠️ <b>أوامر الأدمن</b>\n"
         "• <code>/admin</code> – لوحة الأزرار\n"
-        "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – تفعيل مباشر\n"
+        "• <code>/approve &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – تفعيل مباشرة\n"
         "• <code>/activate &lt;user_id&gt; &lt;2w|4w&gt; [reference]</code> – مرادف لـ /approve\n"
+        "• <code>/extend &lt;user_id&gt; &lt;days&gt; [reference]</code> – تمديد لعدد أيام محدد\n"
+        "• <code>/deactivate &lt;user_id&gt;</code> – إيقاف الاشتراك فورًا\n"
+        "• <code>/user_status &lt;user_id&gt;</code> – عرض حالة مستخدم\n"
+        "• <code>/active_count</code> – عدد المشتركين النشطين الآن\n"
         "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية للمشتركين النشطين\n"
         "• <code>/force_report</code> – إرسال التقرير اليومي الآن"
     )
@@ -750,24 +726,23 @@ async def cmd_admin_help(m: Message):
 
 @dp.message(Command("admin"))
 async def cmd_admin(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS: return
+    if not _is_admin(m.from_user.id): return
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ تفعيل اشتراك يدوي (إدخال user_id)", callback_data="admin_manual")
+    kb.button(text="➕ تفعيل يدوي (إدخال user_id)", callback_data="admin_manual")
     kb.button(text="ℹ️ أوامر الأدمن", callback_data="admin_help_btn")
     kb.adjust(1)
     await m.answer("لوحة الأدمن:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data == "admin_help_btn")
 async def cb_admin_help_btn(q: CallbackQuery):
-    if q.from_user.id not in ADMIN_USER_IDS: return await q.answer()
+    if not _is_admin(q.from_user.id): return await q.answer()
     await cmd_admin_help(q.message)
     await q.answer()
 
 @dp.callback_query(F.data == "admin_manual")
 async def cb_admin_manual(q: CallbackQuery):
     aid = q.from_user.id
-    if aid not in ADMIN_USER_IDS:
-        return await q.answer("غير مُصرّح.", show_alert=True)
+    if not _is_admin(aid): return await q.answer("غير مُصرّح.", show_alert=True)
     ADMIN_FLOW[aid] = {"stage": "await_user"}
     await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
     await q.answer()
@@ -777,7 +752,7 @@ async def admin_manual_router(m: Message):
     """تدفق الإدخال للأدمن: user_id -> اختيار الخطة -> (مرجع اختياري) -> تفعيل."""
     aid = m.from_user.id
     flow = ADMIN_FLOW.get(aid)
-    if not flow or aid not in ADMIN_USER_IDS:
+    if not flow or not _is_admin(aid):
         return
 
     stage = flow.get("stage")
@@ -825,8 +800,7 @@ async def admin_manual_router(m: Message):
 @dp.callback_query(F.data.startswith("admin_plan:"))
 async def cb_admin_plan(q: CallbackQuery):
     aid = q.from_user.id
-    if aid not in ADMIN_USER_IDS:
-        return await q.answer("غير مُصرّح.", show_alert=True)
+    if not _is_admin(aid): return await q.answer("غير مُصرّح.", show_alert=True)
     flow = ADMIN_FLOW.get(aid)
     if not flow or flow.get("stage") != "await_plan":
         return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
@@ -852,8 +826,7 @@ async def cb_admin_plan(q: CallbackQuery):
 @dp.callback_query(F.data == "admin_skip_ref")
 async def cb_admin_skip_ref(q: CallbackQuery):
     aid = q.from_user.id
-    if aid not in ADMIN_USER_IDS:
-        return await q.answer("غير مُصرّح.", show_alert=True)
+    if not _is_admin(aid): return await q.answer("غير مُصرّح.", show_alert=True)
     flow = ADMIN_FLOW.get(aid)
     if not flow or flow.get("stage") != "await_ref":
         return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
@@ -886,10 +859,10 @@ async def cb_admin_cancel(q: CallbackQuery):
     await q.message.answer("تم إلغاء جلسة التفعيل اليدوي.")
     await q.answer("تم.")
 
-# مرادف للأمر /approve
+# مرادفات وأوامر أدمن إضافية محدّثة
 @dp.message(Command("approve"))
 async def cmd_approve(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS: return
+    if not _is_admin(m.from_user.id): return
     parts = (m.text or "").strip().split()
     if len(parts) not in (3, 4) or parts[2] not in ("2w", "4w"):
         return await m.answer("استخدم: /approve <user_id> <2w|4w> [reference]")
@@ -898,16 +871,88 @@ async def cmd_approve(m: Message):
     dur = SUB_DURATION_2W if plan == "2w" else SUB_DURATION_4W
     with get_session() as s:
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
-    await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+    await m.answer(f"✅ تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
 
 @dp.message(Command("activate"))
 async def cmd_activate(m: Message):
     # مرادف لـ /approve
     await cmd_approve(m)
 
+@dp.message(Command("extend")))
+async def cmd_extend(m: Message):
+    if not _is_admin(m.from_user.id): return
+    parts = (m.text or "").strip().split()
+    if len(parts) not in (3, 4):
+        return await m.answer("استخدم: /extend <user_id> <days> [reference]")
+    try:
+        uid = int(parts[1]); days = int(parts[2])
+    except Exception:
+        return await m.answer("صيغة غير صحيحة. مثال: /extend 123456789 7")
+    txh = parts[3] if len(parts) == 4 else None
+    # تمديد بدون تغيير الخطة: نحافظ على plan الحالي إن وجد
+    with get_session() as s:
+        u = s.query(User).filter(User.tg_user_id == uid).first()
+        if not u:
+            return await m.answer("المستخدم غير موجود.")
+        base = u.end_at if (u.end_at and (u.end_at.tzinfo or timezone.utc)) else None
+        now = datetime.now(timezone.utc)
+        base = base if (base and base > now) else now
+        u.end_at = base + timedelta(days=days)
+        if txh:
+            u.last_tx_hash = txh
+        s.flush()
+        end_at = u.end_at
+    await m.answer(f"⏫ تم التمديد للمستخدم {uid} {days} يوم. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+
+@dp.message(Command("deactivate"))
+async def cmd_deactivate(m: Message):
+    if not _is_admin(m.from_user.id): return
+    parts = (m.text or "").strip().split()
+    if len(parts) != 2:
+        return await m.answer("استخدم: /deactivate <user_id>")
+    uid = int(parts[1])
+    with get_session() as s:
+        u = s.query(User).filter(User.tg_user_id == uid).first()
+        if not u:
+            return await m.answer("المستخدم غير موجود.")
+        u.end_at = datetime.now(timezone.utc)  # ينتهي فورًا
+        s.flush()
+    await m.answer(f"⛔ تم إيقاف اشتراك المستخدم {uid}.")
+
+@dp.message(Command("user_status"))
+async def cmd_user_status(m: Message):
+    if not _is_admin(m.from_user.id): return
+    parts = (m.text or "").strip().split()
+    if len(parts) != 2:
+        return await m.answer("استخدم: /user_status <user_id>")
+    uid = int(parts[1])
+    with get_session() as s:
+        u = s.query(User).filter(User.tg_user_id == uid).first()
+        if not u:
+            return await m.answer("لا يوجد سجل للمستخدم.")
+        end_at = u.end_at.strftime('%Y-%m-%d %H:%M UTC') if u.end_at else "—"
+        active = is_active(s, uid)
+        plan = u.plan or "—"
+        txh = u.last_tx_hash or "—"
+    await m.answer(
+        "👤 <b>حالة المستخدم</b>\n"
+        f"• ID: <code>{uid}</code>\n"
+        f"• الخطة: <b>{plan}</b>\n"
+        f"• فعال حتى: <code>{end_at}</code>\n"
+        f"• نشط الآن؟ <b>{'نعم' if active else 'لا'}</b>\n"
+        f"• آخر مرجع: <code>{_h(txh)}</code>",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("active_count"))
+async def cmd_active_count(m: Message):
+    if not _is_admin(m.from_user.id): return
+    count = len(list_active_user_ids())
+    await m.answer(f"📈 عدد المشتركين النشطين الآن: <b>{count}</b>", parse_mode="HTML")
+
 @dp.message(Command("broadcast"))
 async def cmd_broadcast(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS: return
+    if not _is_admin(m.from_user.id): return
     txt = m.text.partition(" ")[2].strip()
     if not txt: return await m.answer("استخدم: /broadcast <text>")
     uids = list_active_user_ids(); sent = 0
@@ -921,11 +966,24 @@ async def cmd_broadcast(m: Message):
 
 @dp.message(Command("force_report"))
 async def cmd_force_report(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS: return
+    if not _is_admin(m.from_user.id): return
     with get_session() as s:
         stats_24 = get_stats_24h(s); stats_7d = get_stats_7d(s)
     await send_channel(_report_card(stats_24, stats_7d))
     await m.answer("تم إرسال التقرير للقناة.")
+
+# === Admin-only: التقاط file_id للصور/الملفات (اختياري لاحقًا)
+@dp.message(F.photo)
+async def _admin_grab_photo_file_id(m: Message):
+    if not _is_admin(m.from_user.id): return
+    fid = m.photo[-1].file_id
+    await m.answer(f"🆔 file_id: <code>{fid}</code>", parse_mode="HTML")
+
+@dp.message(F.document)
+async def _admin_grab_document_file_id(m: Message):
+    if not _is_admin(m.from_user.id): return
+    fid = m.document.file_id
+    await m.answer(f"🆔 file_id: <code>{fid}</code>", parse_mode="HTML")
 
 # ---------------------------
 # فحوصات التشغيل
