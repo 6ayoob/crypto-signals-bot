@@ -1,10 +1,9 @@
 # bot.py — مُشغِّل البوت (Aiogram v3) مع تفعيل يدوي مبسّط (2w / 4w) + تقارير + مخاطر + قفل قائد
-# تغييرات هذه النسخة:
-# - إزالة مسار الدفع الآلي عبر TRC20 / /submit_tx / دليل الدفع والصور.
-# - إضافة زر "🔑 طلب اشتراك" للمستخدم → يصل إشعار للأدمن مع أزرار تفعيل 2w / 4w / رفض.
-# - الحفاظ على /admin والتفعيل اليدوي (الإدخال اليدوي user_id) لمن يفضّل ذلك.
-# - الإبقاء على التجربة المجانية /start_trial (اختياري) + /status.
-# - لا تغيير على المنطق التشغيلي (الإشارات/التقارير/المخاطر/القفل).
+# هذه النسخة:
+# - لا تحتوي على أي دفع آلي (TRC20) أو أوامر /submit_tx.
+# - عند "🔑 طلب اشتراك": تُرسل للمستخدم المحفظة والأسعار والخطوات + زر خاص لمراسلة الأدمن،
+#   وتُرسل للأدمن إشعارًا بأزرار تفعيل 2w/4w/رفض (الأدمن يتأكد يدويًا من المبلغ قبل التفعيل).
+# - التجربة المجانية معطّلة افتراضيًا ويمكن تفعيلها عبر ENV: ENABLE_TRIAL=1.
 
 import asyncio
 import json
@@ -55,9 +54,10 @@ except Exception:
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS,
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
-    # القيم التالية اختيارية للعرض في الرسائل فقط (إن وُجدت في config):
+    SUB_DURATION_2W, SUB_DURATION_4W,
+    # القيم التالية اختيارية للعرض في الرسائل فقط:
     PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD,
-    SUB_DURATION_2W, SUB_DURATION_4W
+    USDT_TRC20_WALLET,
 )
 
 # قاعدة البيانات
@@ -112,7 +112,7 @@ dp = Dispatcher()
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: List[str] = []
 
-# ==== Rate Limiter لواجهات OKX العامة ====
+# ==== محدّد المعدّل لواجهات OKX العامة ====
 OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))      # طلبات لكل نافذة
 OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))  # مدة النافذة بالثواني
 class SlidingRateLimiter:
@@ -157,9 +157,11 @@ _LAST_SIGNAL_AT: Dict[str, float] = {}
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
 
+# ===== إعداد: تمكين/تعطيل التجربة المجانية عبر ENV =====
+ENABLE_TRIAL = os.getenv("ENABLE_TRIAL", "0") == "1"
+
 # ====== تدفق تفعيل يدوي للأدمن ======
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # {admin_id: {'stage': 'await_user'|'await_plan'|'await_ref', 'uid': int, 'plan': '2w'|'4w'}}
-# ملاحظة: سنستخدم أيضًا أزرار inline مباشرة من إشعار "طلب اشتراك" بدون هذا التدفق.
 
 # ---------------------------
 # أدوات مساعدة
@@ -179,7 +181,6 @@ async def send_channel(text: str):
         logger.error(f"send_channel error: {e}")
 
 async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = None):
-    # تنبيهات داخلية للأدمن/غرفة إدارية (اختياري)
     targets = list(ADMIN_USER_IDS)
     if SUPPORT_CHAT_ID:
         targets.append(SUPPORT_CHAT_ID)
@@ -219,6 +220,19 @@ def _contact_line() -> str:
         parts.append(f"⚡️ أو افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
     return "\n".join(parts) if parts else "—"
 
+def _price_wallet_block() -> str:
+    parts = []
+    try:
+        parts.append(f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>")
+    except Exception:
+        pass
+    try:
+        if USDT_TRC20_WALLET:
+            parts.append(f"محفظة USDT (TRC20):\n<code>{_h(USDT_TRC20_WALLET)}</code>")
+    except Exception:
+        pass
+    return "\n".join(parts) if parts else "—"
+
 async def welcome_text() -> str:
     price_line = ""
     try:
@@ -232,9 +246,9 @@ async def welcome_text() -> str:
         "💰 استراتيجيتنا تركز على <b>حماية رأس المال أولاً</b> ثم تعظيم العائد.\n\n"
         "خطط الاشتراك:\n"
         f"{price_line}"
-        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن لتفعيلك لمدة 2 أسابيع أو 4 أسابيع.\n\n"
-        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
-        "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصلك عنوان المحفظة وخطوات الدفع، ثم يتحقق الأدمن ويفعّل الاشتراك (2w/4w).\n\n"
+        + ("✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n" if ENABLE_TRIAL else "")
+        + "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
     )
 
 # ===== زر مراسلة الأدمن (خاص) =====
@@ -608,7 +622,8 @@ async def daily_report_loop():
 async def cmd_start(m: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="🔑 طلب اشتراك", callback_data="req_sub")
-    kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
+    if ENABLE_TRIAL:
+        kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
     kb.button(text="🧾 حالة اشتراكي", callback_data="status_btn")
     kb.adjust(1)
     await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
@@ -629,6 +644,8 @@ async def cb_status_btn(q: CallbackQuery):
 
 @dp.callback_query(F.data == "start_trial")
 async def cb_trial(q: CallbackQuery):
+    if not ENABLE_TRIAL:
+        return await q.answer("التجربة غير مفعلة حاليًا.", show_alert=True)
     with get_session() as s:
         ok = start_trial(s, q.from_user.id)
     if ok:
@@ -641,7 +658,7 @@ async def cb_trial(q: CallbackQuery):
             "✨ يمكنك طلب الاشتراك الآن والاستفادة من كامل الميزات.", parse_mode="HTML")
     await q.answer()
 
-# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن مع أزرار تفعيل مباشرة ===
+# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن + عرض المحفظة/الأسعار/الخطوات للمستخدم ===
 @dp.callback_query(F.data == "req_sub")
 async def cb_req_sub(q: CallbackQuery):
     u = q.from_user
@@ -649,21 +666,32 @@ async def cb_req_sub(q: CallbackQuery):
     uname = (u.username and f"@{u.username}") or (u.full_name or "")
     user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
-    kb.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
-    kb.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
-    kb.adjust(1)
-
+    # 1) إشعار للأدمن مع أزرار الموافقة
+    kb_admin = InlineKeyboardBuilder()
+    kb_admin.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
+    kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
+    kb_admin.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
+    kb_admin.adjust(1)
     await send_admins(
         "🔔 <b>طلب اشتراك جديد</b>\n"
         f"المستخدم: {user_line}\n"
-        "اختر نوع التفعيل:",
-        reply_markup=kb.as_markup()
+        "الرجاء التحقق يدويًا من المبلغ/الإثبات قبل التفعيل:",
+        reply_markup=kb_admin.as_markup()
     )
-    await q.message.answer("📩 تم إرسال طلبك للأدمن. سيتم التفعيل قريبًا بإذن الله.")
-    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
-        await q.message.answer("للتواصل المباشر مع الأدمن:", reply_markup=support_dm_kb())
+
+    # 2) رد للمستخدم: الأسعار + عنوان المحفظة + خطوات + زر مراسلة خاص
+    text_user = (
+        "🧾 <b>خطوات الاشتراك اليدوي</b>\n"
+        "1) حوِّل المبلغ حسب الخطة المرغوبة إلى المحفظة أدناه.\n"
+        "2) راسل الأدمن في الخاص وأرسل <b>الإثبات</b> (صورة التحويل أو TxID).\n"
+        "3) بعد التحقق، سيقوم الأدمن بتفعيل اشتراكك.\n\n"
+        f"{_price_wallet_block()}\n\n"
+        "📨 بعد التحويل، راسل الأدمن مباشرة من الزر التالي."
+    )
+    await q.message.answer(text_user, parse_mode="HTML", reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None)
+
+    # 3) إشعار قصير أن الطلب أرسل للأدمن
+    await q.message.answer("📩 تم إرسال طلبك للأدمن. سيتم التفعيل بعد التحقق من التحويل بإذن الله.")
     await q.answer()
 
 # موافقات الأدمن السريعة من إشعار "طلب اشتراك"
