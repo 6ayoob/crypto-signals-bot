@@ -2,6 +2,11 @@
 # تحسينات: منع تكرار الإشارات (Dedupe)، تسريع فحص الشموع (Batch + Concurrency)،
 # إصلاح إغلاق الصفقة (استدعاء واحد)، إعادة محاولة للتقرير اليومي، لوج أوضح، لمسات استقرار.
 # جديد: صورة دليل الدفع للمشترك + لوحة تفعيل يدوي للأدمن بخطوات سهلة.
+# مضاف حديثًا: Rate Limiter لطلبات OKX لمنع 50011 (Too Many Requests)
+#  بيئة الاختيارات:
+#   OKX_PUBLIC_RATE_MAX      افتراض 18  (عدد الطلبات لكل نافذة)
+#   OKX_PUBLIC_RATE_WINDOW   افتراض 2.0 (مدة النافذة بالثواني)
+
 import asyncio
 import json
 import hashlib
@@ -12,6 +17,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
+from collections import deque
+import random
 
 import ccxt
 import pytz
@@ -113,6 +120,29 @@ dp = Dispatcher()
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: List[str] = []
+
+# ==== Rate Limiter لواجهات OKX العامة ====
+OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))      # طلبات لكل نافذة
+OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))  # مدة النافذة بالثواني
+class SlidingRateLimiter:
+    def __init__(self, max_calls: int, window_sec: float):
+        self.max_calls = max_calls
+        self.window = window_sec
+        self.calls = deque()
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            while self.calls and (now - self.calls[0]) > self.window:
+                self.calls.popleft()
+            if len(self.calls) >= self.max_calls:
+                sleep_for = self.window - (now - self.calls[0]) + 0.05
+                await asyncio.sleep(max(sleep_for, 0.05))
+                return await self.wait()
+            self.calls.append(now)
+
+RATE = SlidingRateLimiter(OKX_PUBLIC_MAX, OKX_PUBLIC_WIN)
 
 # جداول المسح
 SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "300"))
@@ -368,27 +398,37 @@ async def load_okx_markets_and_filter():
         AVAILABLE_SYMBOLS = []
 
 # ---------------------------
-# جلب البيانات/الأسعار
+# جلب البيانات/الأسعار (مع Rate Limiter + Backoff)
 # ---------------------------
-async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=400):
-    try:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        )
-    except Exception as e:
-        logger.warning(f"FETCH_OHLCV ERROR {symbol}: {e}")
-        return []
+async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300):
+    for attempt in range(4):
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            )
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+            await asyncio.sleep(0.6 * (attempt + 1) + random.random() * 0.3)
+        except Exception as e:
+            logger.warning(f"FETCH_OHLCV ERROR {symbol}: {e}")
+            return []
+    return []
 
 async def fetch_ticker_price(symbol: str) -> float | None:
-    try:
-        loop = asyncio.get_event_loop()
-        ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
-        price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
-        return float(price) if price is not None else None
-    except Exception as e:
-        logger.warning(f"FETCH_TICKER ERROR {symbol}: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+            price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
+            return float(price) if price is not None else None
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+            await asyncio.sleep(0.5 * (attempt + 1))
+        except Exception as e:
+            logger.warning(f"FETCH_TICKER ERROR {symbol}: {e}")
+            return None
+    return None
 
 # ---------------------------
 # Dedupe: منع تكرار الإشارات
