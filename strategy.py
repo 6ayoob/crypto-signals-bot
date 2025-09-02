@@ -1,19 +1,14 @@
-# strategy.py — SCALP+ (S/R + Fibonacci + MACD/RSI) بأهداف ثابتة 3%/5% ووقف 2%
+# strategy.py — SCALP+ (AUTO Profiles + 3 TPs + Motivational messages)
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
-# ========= أهداف/وقف ثابتة =========
-TP1_PCT = 0.03     # +3%
-TP2_PCT = 0.05     # +5%
-SL_PCT  = 0.02     # -2%
-
-# ========= حساسية/سيولة/تذبذب =========
-MIN_QUOTE_VOL = 20_000    # حد سيولة (volume*close) بالدولار للشمعة المغلقة
-RVOL_MIN_HARD = 0.90      # RVOL ≥ هذا الحد (مخفف لسكالب)
-ATR_PCT_MIN   = 0.0015    # 0.15% حد أدنى تذبذب
-ATR_PCT_MAX   = 0.06      # 6%   حد أقصى تذبذب
-HOLDOUT_BARS  = 2         # تبريد إشارات لنفس الرمز
+# ========= حساسية/سيولة/تذبذب (كما هي) =========
+MIN_QUOTE_VOL = 20_000
+RVOL_MIN_HARD = 0.90
+ATR_PCT_MIN   = 0.0015
+ATR_PCT_MAX   = 0.06
+HOLDOUT_BARS  = 2
 
 # ========= مؤشرات أساسية =========
 EMA_FAST, EMA_SLOW, EMA_TREND, EMA_LONG = 9, 21, 50, 200
@@ -22,24 +17,61 @@ VOL_MA, ATR_PERIOD = 20, 14
 # ========= S/R =========
 USE_SR = True
 SR_WINDOW = 40
-RES_BLOCK_NEAR = 0.004   # 0.4%: تجنب الشراء تحت مقاومة قريبة
-SUP_BLOCK_NEAR = 0.003   # 0.3%: تجنب الشراء فوق دعم قريب جدًا (للارتداد ضع سماحية أكبر قليلًا)
-BREAKOUT_BUFFER = 0.0015 # 0.15% فوق HHV لاختبار اختراق
+RES_BLOCK_NEAR = 0.004
+SUP_BLOCK_NEAR = 0.003
+BREAKOUT_BUFFER = 0.0015
 
 # ========= Fibonacci =========
 USE_FIB = True
 SWING_LOOKBACK = 60
-FIB_LEVELS = (0.382, 0.618)   # منطقة الارتداد الذهبي
-FIB_TOL    = 0.004            # ±0.4% سماحية حول مستويات الفيبوناتشي
+FIB_LEVELS = (0.382, 0.618)
+FIB_TOL    = 0.004
 
 # ========= MACD/RSI Policy =========
-# "lenient": يكفي شرط واحد (RSI>50 أو MACD_hist>0/↑)
-# "balanced": يحتاج شرطين على الأقل
-# "strict": يحتاج RSI>50 و MACD_hist>0 و MACD_hist↑
-MACD_RSI_POLICY = "balanced"
+MACD_RSI_POLICY = "balanced"  # "lenient" | "balanced" | "strict"
 
 _LAST_ENTRY_BAR_TS: dict[str, int] = {}
 _LAST_SIGNAL_BAR_IDX: dict[str, int] = {}
+
+# ========= إعدادات AUTO + أهداف/وقف ورسائل =========
+ENTRY_PROFILE = "auto"   # "auto" أو "msb3" أو "vpc3" أو "dal3"
+
+# MSB3 (Breakout سكالب) — نسب ثابتة قريبة
+FIXED_TP_PCTS   = [0.008, 0.016, 0.024]  # 0.8% / 1.6% / 2.4%
+FIXED_SL_PCT_MAX= 0.009                   # 0.9% (يُقارن مع ATR)
+
+# VPC3 (Pullback ترند)
+VPC3_TP_PCTS = [0.007, 0.013, 0.020]
+VPC3_SL_ATR  = 0.8
+
+# DAL3 (ديناميكي ATR)
+DAL3_TP_ATR = [1.0, 1.8, 2.8]
+DAL3_SL_ATR = 0.9
+
+# تقسيم الكمية على الأهداف الثلاثة
+PARTIAL_FRACTIONS = [0.40, 0.35, 0.25]
+
+# تريلينغ بعد TP2
+TRAIL_AFTER_TP2 = True
+TRAIL_AFTER_TP2_ATR = 1.0  # SL = max(SL, current - 1×ATR)
+
+# خروج زمني إن لم يُصب TP1 سريعًا (6 شموع 5m ≈ 30 دقيقة)
+USE_MAX_BARS_TO_TP1 = True
+MAX_BARS_TO_TP1 = 6
+
+# تبريد بعد النتائج (يوظَّف من مدير الصفقات الخارجي)
+COOLDOWN_AFTER_SL_MIN = 15
+COOLDOWN_AFTER_TP_MIN = 5
+
+# رسائل تحفيزية جاهزة
+MOTIVATION = {
+    "entry": "🔥 دخول {symbol}! نبدأ بخطة ثلاثية الأهداف — فرصة سريعة 💪",
+    "tp1":   "🎯 TP1 تحقق على {symbol}! أرباح مثبتة ونقلنا SL للتعادل — مستمرّون 👟",
+    "tp2":   "🚀 TP2 على {symbol}! فعّلنا تريلينغ لحماية المكسب — نقترب من الختام 🏁",
+    "tp3":   "🏁 TP3 على {symbol}! إغلاق جميل — صفقة مكتملة، رائع ✨",
+    "sl":    "🛑 SL على {symbol}. الأهم حماية رأس المال — فرص أقوى قادمة 🔄",
+    "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎",
+}
 
 # ---------- مؤشرات ----------
 def ema(series, period):
@@ -93,7 +125,6 @@ def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
     return float(support), float(resistance)
 
 def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
-    """آخر قمة/قاع في نافذة سابقة (بدون الشمعة الحالية المغلقة)."""
     if len(df) < lookback + 5:
         return None, None
     seg = df.iloc[-(lookback+1):-1]
@@ -104,11 +135,9 @@ def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
     return float(hhv), float(llv)
 
 def near_any_fib(price: float, hhv: float, llv: float, tol: float) -> Tuple[bool, str]:
-    """هل السعر قريب من أحد مستويات فيبو (ارتداد) ضمن ±tol؟"""
     rng = hhv - llv
-    if rng <= 0: 
+    if rng <= 0:
         return False, ""
-    # مستويات ارتداد صاعدة من موجة LLV→HHV:
     fib382 = hhv - rng * 0.382
     fib618 = hhv - rng * 0.618
     for lvl, name in ((fib382, "Fib 0.382"), (fib618, "Fib 0.618")):
@@ -122,6 +151,59 @@ def detect_regime(df) -> str:
         e50 = df["ema50"]
         return "trend" if (c.iloc[-1] > e50.iloc[-1] and e50.diff(10).iloc[-1] > 0) else "mean"
     return "trend" if (c.iloc[-1] > e200.iloc[-1] and e200.diff(10).iloc[-1] > 0) else "mean"
+
+# ---------- اختيار البروفايل تلقائيًا ----------
+def _decide_profile_from_df(df) -> str:
+    closed = df.iloc[-2]
+    price  = float(closed["close"])
+    atr    = float(df["atr"].iloc[-2]) if "atr" in df else None
+    atr_pct = (atr / price) if (atr and price > 0) else 0.0
+
+    vma = float(closed.get("vol_ma20") or 0.0)
+    rvol = (float(closed["volume"]) / vma) if vma > 0 else 0.0
+
+    ema50_now  = float(closed.get("ema50") or price)
+    ema50_prev = float(df["ema50"].iloc[-7]) if len(df) >= 7 else ema50_now
+    trend_ok = (price > ema50_now) and ((ema50_now - ema50_prev) > 0)
+
+    ema21 = float(closed.get("ema21") or price)
+    near_ema21 = abs(price - ema21) / max(price, 1e-9) <= 0.0025  # ±0.25%
+
+    if atr_pct >= 0.008 or rvol >= 2.0:
+        return "dal3"
+    if trend_ok and near_ema21:
+        return "vpc3"
+    return "msb3"
+
+def _build_targets(entry_price: float, atr_val: Optional[float], profile: str) -> Tuple[float, float, float, float]:
+    atr = float(atr_val or 0.0)
+    p = (profile or "msb3").lower()
+
+    if p == "dal3" and atr > 0:
+        tp1 = entry_price + atr * DAL3_TP_ATR[0]
+        tp2 = entry_price + atr * DAL3_TP_ATR[1]
+        tp3 = entry_price + atr * DAL3_TP_ATR[2]
+        sl  = entry_price - atr * DAL3_SL_ATR
+    elif p == "vpc3" and atr > 0:
+        tp1 = entry_price * (1 + VPC3_TP_PCTS[0])
+        tp2 = entry_price * (1 + VPC3_TP_PCTS[1])
+        tp3 = entry_price * (1 + VPC3_TP_PCTS[2])
+        sl_atr = entry_price - atr * VPC3_SL_ATR
+        sl_pct = entry_price * (1 - FIXED_SL_PCT_MAX)
+        sl  = min(sl_atr, sl_pct)
+    else:  # msb3
+        tp1 = entry_price * (1 + FIXED_TP_PCTS[0])
+        tp2 = entry_price * (1 + FIXED_TP_PCTS[1])
+        tp3 = entry_price * (1 + FIXED_TP_PCTS[2])
+        if atr > 0:
+            sl_atr = entry_price - atr * 0.8
+            sl_pct = entry_price * (1 - FIXED_SL_PCT_MAX)
+            sl  = min(sl_atr, sl_pct)
+        else:
+            sl  = entry_price * (1 - FIXED_SL_PCT_MAX)
+
+    tp1, tp2, tp3 = sorted([tp1, tp2, tp3])
+    return float(sl), float(tp1), float(tp2), float(tp3)
 
 # ---------- MACD/RSI Gate ----------
 def macd_rsi_gate(prev_row, closed_row) -> Tuple[bool, list]:
@@ -144,11 +226,11 @@ def macd_rsi_gate(prev_row, closed_row) -> Tuple[bool, list]:
         ok = k >= 1
     elif MACD_RSI_POLICY == "strict":
         ok = ("RSI>50" in ok_flags) and ("MACD_hist>0" in ok_flags) and ("MACD_hist↑" in ok_flags)
-    else:  # balanced
+    else:
         ok = k >= 2
 
     if ok:
-        reasons.extend(ok_flags[:2])  # نختصر السبب
+        reasons.extend(ok_flags[:2])
     return ok, reasons
 
 # ---------- مولّد الإشارة ----------
@@ -223,24 +305,21 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
     if res is not None:
         hhv = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
         breakout_ok = price > hhv * (1.0 + BREAKOUT_BUFFER)
-        # لا نسمح بالشراء إن كان تحت المقاومة مباشرة
         near_res_block = (price >= res * (1 - RES_BLOCK_NEAR)) and (price <= res * (1 + RES_BLOCK_NEAR))
         if breakout_ok and not near_res_block:
             entry_ok = True
             entry_tag = "Breakout SR"
             reasons.append("Breakout SR")
         elif not breakout_ok and near_res_block:
-            return None  # قريب جدًا من المقاومة بدون اختراق
+            return None
 
     # (ب) ارتداد في منطقة 0.382–0.618
     if not entry_ok and USE_FIB:
         hhv, llv = recent_swing(df, SWING_LOOKBACK)
         if hhv and llv:
             near_fib, which = near_any_fib(price, hhv, llv, FIB_TOL)
-            # نسمح بالارتداد فقط إن لم يكن السعر ملتصقًا بالدعم جدًا (لتجنب كسرة كاذبة)
             near_sup_block = sup is not None and price <= sup * (1 + SUP_BLOCK_NEAR)
             if near_fib and not near_sup_block:
-                # تأكيد بسيط: RSI يصعد أو MACD_hist↑
                 if (float(closed["rsi"]) > float(prev["rsi"])) or (float(closed["macd_hist"]) > float(prev["macd_hist"])):
                     entry_ok = True
                     entry_tag = which
@@ -251,46 +330,58 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
     if not entry_ok:
         return None
 
-    # ========= أهداف/وقف =========
-    entry = price
-    sl    = entry * (1.0 - SL_PCT)
-    tp1   = entry * (1.0 + TP1_PCT)
-    tp2   = entry * (1.0 + TP2_PCT)
+    # ===== بروفايل وأهداف/وقف =====
+    profile = _decide_profile_from_df(df) if ENTRY_PROFILE == "auto" else ENTRY_PROFILE.lower()
+    sl, tp1, tp2, tp3 = _build_targets(price, atr, profile)
 
-    # حماية شكلية بالـ swing_low
+    # حماية بالـ swing_low
     try:
         swing_low = float(df.iloc[:-1]["low"].rolling(6, min_periods=3).min().iloc[-1])
-        if swing_low < entry:
+        if swing_low < price:
             sl = min(sl, swing_low)
     except Exception:
         pass
 
-    if not (sl < entry < tp1 < tp2):
+    if not (sl < price < tp1 < tp2 < tp3):
         return None
 
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
     _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
-    # أسباب إضافية للتوثيق
+    # أسباب مختصرة
     if price > float(closed["ema50"]): reasons.append("Price>EMA50")
     if float(closed["ema9"]) > float(closed["ema21"]): reasons.append("EMA9>EMA21")
     reasons.append(f"RVOL≥{round(RVOL_MIN_HARD,2)}")
-    reasons.append(f"{entry_tag or 'FixedTP/SL'}")
-    reasons = reasons[:6]  # نختصر
+    reasons.append(entry_tag or profile.upper())
+    reasons = reasons[:6]
+
+    # تجهيز رسائل تحفيزية ليستعملها كود التنفيذ/الإدارة
+    messages = {
+        "entry": MOTIVATION["entry"].format(symbol=symbol),
+        "tp1":   MOTIVATION["tp1"].format(symbol=symbol),
+        "tp2":   MOTIVATION["tp2"].format(symbol=symbol),
+        "tp3":   MOTIVATION["tp3"].format(symbol=symbol),
+        "sl":    MOTIVATION["sl"].format(symbol=symbol),
+        "time":  MOTIVATION["time"].format(symbol=symbol),
+    }
 
     return {
         "symbol": symbol,
         "side": "BUY",
-        "entry": round(entry, 6),
+        "entry": round(price, 6),
         "sl":    round(sl, 6),
         "tp1":   round(tp1, 6),
         "tp2":   round(tp2, 6),
-        "tp_final": round(tp2, 6),  # مساوي لـ TP2 في السكالب
+        "tp3":   round(tp3, 6),
+        "tp_final": round(tp3, 6),
+
         "atr":   round(atr, 6),
-        "r":     round(entry - sl, 6),
-        "score": 65,                # قيمة إرشادية
+        "r":     round(price - sl, 6),
+        "score": 65,
         "regime": regime,
         "reasons": reasons,
+
+        # خصائص إضافية
         "features": {
             "rsi": float(closed["rsi"]),
             "rvol": rvol,
@@ -301,6 +392,18 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
             "sup": float(sup) if sup is not None else None,
             "res": float(res) if res is not None else None,
         },
-        "trail_atr_mult": None,
+
+        # إدارة لاحقة
+        "partials": PARTIAL_FRACTIONS,
+        "trail_after_tp2": TRAIL_AFTER_TP2,
+        "trail_atr_mult": TRAIL_AFTER_TP2_ATR if TRAIL_AFTER_TP2 else None,
+        "max_bars_to_tp1": MAX_BARS_TO_TP1 if USE_MAX_BARS_TO_TP1 else None,
+        "cooldown_after_sl_min": COOLDOWN_AFTER_SL_MIN,
+        "cooldown_after_tp_min": COOLDOWN_AFTER_TP_MIN,
+
+        # بروفايل ورسائل
+        "profile": profile,
+        "messages": messages,
+
         "timestamp": datetime.utcnow().isoformat()
     }
