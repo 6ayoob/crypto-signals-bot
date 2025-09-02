@@ -1,6 +1,8 @@
 # database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
 # متوافق مع bot.py V2 + Leader Lock (TTL)
-# مضاف created_at/updated_at لجدول trades + ضبط users سابقًا
+# تحديثات مهمة:
+# - فهرس/قيد فريد على users.tg_user_id + تنظيف التكرارات آليًا قبل الإنشاء.
+# - تحسين تهيئة الـ logging بدون فرض basicConfig إذا كان مضبوطًا مسبقًا.
 
 import os
 import logging
@@ -16,7 +18,8 @@ from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger("db")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 # ---------------------------
 # اتصال قاعدة البيانات
@@ -59,7 +62,7 @@ def _as_aware(dt: datetime | None) -> datetime | None:
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)
+    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)  # نجعلها فريدة عبر فهرس في الهجرة
     trial_used = Column(Boolean, default=False, nullable=False)
     end_at = Column(DateTime, nullable=True)             # UTC
     plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w"
@@ -91,7 +94,7 @@ class Trade(Base):
     result = Column(String(8), nullable=True)  # tp1 | tp2 | sl
     opened_at = Column(DateTime, default=_utcnow, nullable=False)
     closed_at = Column(DateTime, nullable=True)
-    # جديد لتوافق القاعدة لديك
+    # created/updated
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
@@ -140,8 +143,8 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "qty": "DOUBLE PRECISION",
             "exit_price": "DOUBLE PRECISION",
             "r_multiple": "DOUBLE PRECISION",
-            "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",   # NEW
-            "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",   # NEW
+            "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         }
         mapping_sq = {
             "result": "VARCHAR(8)",
@@ -156,8 +159,8 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "qty": "REAL",
             "exit_price": "REAL",
             "r_multiple": "REAL",
-            "created_at": "TIMESTAMP",  # NEW
-            "updated_at": "TIMESTAMP",  # NEW
+            "created_at": "TIMESTAMP",
+            "updated_at": "TIMESTAMP",
         }
         typ = mapping_pg[col] if dialect == "postgresql" else mapping_sq[col]
     else:
@@ -168,12 +171,61 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
     return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'  # SQLite
 
 def _ensure_indexes(connection, dialect: str):
+    # مؤشرات عامة
     if dialect == "postgresql":
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
+    else:
+        # SQLite لا يدعم IF NOT EXISTS لكل شيء، لكن لهذه المؤشرات يكفي
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);'))
+
+def _dedupe_users_on_tg_user_id(connection, dialect: str):
+    """
+    يحذف النسخ المكررة لنفس tg_user_id (يُبقي الأقدم id فقط).
+    يُستدعى مرة واحدة قبل إنشاء الفهرس/القيد الفريد.
+    """
+    # اعثر على tg_user_id المكررة
+    dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' \
+        if dialect == "postgresql" else \
+        'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
+    result = connection.execute(text(dup_sql)).fetchall()
+    dups = [r[0] for r in result if r[0] is not None]
+    for tg_id in dups:
+        # احذف كل الصفوف الأحدث وأبقِ الأقدم
+        if dialect == "postgresql":
+            del_sql = '''
+                DELETE FROM "users"
+                WHERE tg_user_id = :tg AND id NOT IN (
+                    SELECT id FROM "users" WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
+                );
+            '''
+        else:
+            del_sql = '''
+                DELETE FROM users
+                WHERE tg_user_id = :tg AND id NOT IN (
+                    SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
+                );
+            '''
+        connection.execute(text(del_sql), {"tg": tg_id})
+
+def _ensure_unique_index_users_tg_user_id(connection, dialect: str):
+    """
+    ينشئ فهرسًا فريدًا على users(tg_user_id).
+    في Postgres نستخدم CREATE UNIQUE INDEX IF NOT EXISTS.
+    في SQLite نستخدم CREATE UNIQUE INDEX IF NOT EXISTS أيضًا.
+    """
+    _dedupe_users_on_tg_user_id(connection, dialect)
+    if dialect == "postgresql":
+        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);'))
+    else:
+        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);'))
 
 def _lightweight_migrate():
     Base.metadata.create_all(bind=engine)
@@ -212,7 +264,7 @@ def _lightweight_migrate():
             "result", "opened_at", "closed_at", "status",
             "tp_final", "audit_id", "score", "regime", "reasons",
             "qty", "exit_price", "r_multiple",
-            "created_at", "updated_at",  # NEW
+            "created_at", "updated_at",
         ]
         for c in required_trades:
             if c not in cols_trades:
@@ -233,10 +285,17 @@ def _lightweight_migrate():
             except Exception as e:
                 logger.warning(f"trades created/updated defaults adjust failed: {e}")
 
+        # مؤشرات عامة
         try:
             _ensure_indexes(conn, dialect)
         except Exception as e:
             logger.warning(f"CREATE INDEX failed: {e}")
+
+        # الفهرس/القيد الفريد على users.tg_user_id (مع تنظيف التكرارات)
+        try:
+            _ensure_unique_index_users_tg_user_id(conn, dialect)
+        except Exception as e:
+            logger.warning(f"Ensure unique users.tg_user_id failed: {e}")
 
 def init_db():
     try:
@@ -265,11 +324,23 @@ def get_session():
 # وظائف الاشتراك
 # ---------------------------
 def _get_or_create_user(s, tg_user_id: int) -> User:
-    u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
-    if not u:
+    # نتعامل مع احتمال وجود تكرارات قديمة
+    users = s.execute(
+        select(User).where(User.tg_user_id == tg_user_id).order_by(User.id.asc())
+    ).scalars().all()
+    if not users:
         u = User(tg_user_id=tg_user_id, trial_used=False, end_at=None)
         s.add(u); s.flush()
-    return u
+        return u
+    # لو فيه أكثر من سجل، نحافظ على الأقدم ونحذف البقية
+    keep = users[0]
+    for extra in users[1:]:
+        try:
+            s.delete(extra)
+        except Exception:
+            pass
+    s.flush()
+    return keep
 
 def is_active(s, tg_user_id: int) -> bool:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
@@ -431,3 +502,5 @@ def release_leader_lock(name: str, holder: str) -> None:
             s.delete(row)
             try: s.commit()
             except Exception: s.rollback()
+
+# انتهى
