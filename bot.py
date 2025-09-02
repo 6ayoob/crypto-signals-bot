@@ -149,12 +149,13 @@ MAX_LOSSES_STREAK = int(os.getenv("MAX_LOSSES_STREAK", "3"))
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "6"))
 AUDIT_IDS: Dict[int, str] = {}
 
-# NEW: يحفظ إضافات الإشارة لكل صفقة (tp3/رسائل/بروفايل…)
-EXTRAS_BY_TRADE: Dict[int, Dict[str, Any]] = {}
-
 # Dedupe نافذة لمنع تكرار الإشارات المتقاربة
 DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
 _LAST_SIGNAL_AT: Dict[str, float] = {}
+
+# === NEW === رسائل تحفيزية للصفقات + تتبّع وصول TP1 دون إغلاق
+MESSAGES_CACHE: Dict[int, Dict[str, str]] = {}
+HIT_TP1: Dict[int, bool] = {}
 
 # ===== دعم تواصل خاص مع الأدمن =====
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
@@ -274,28 +275,19 @@ def support_dm_kb() -> InlineKeyboardMarkup:
 
 # ===== تنسيق رسائل الإشارة/الإغلاق =====
 def format_signal_text_basic(sig: dict) -> str:
-    profile_line = ""
-    if "profile" in sig:
-        profile_line = f"\n💠 البروفايل: <b>{_h(str(sig['profile']).upper())}</b>"
-
     extra = ""
     if "score" in sig or "regime" in sig:
-        extra = (
-            f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
-        )
+        extra = f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
         if sig.get("reasons"):
             extra += f"\n🧠 أسباب مختصرة: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
-
-    tp3_line = f"\n🏁 الهدف 3: <code>{sig['tp3']}</code>" if "tp3" in sig and sig["tp3"] else ""
     return (
         "🚀 <b>إشارة شراء جديدة!</b>\n"
         "━━━━━━━━━━━━━━\n"
-        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>{profile_line}\n"
+        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
         f"💵 الدخول: <code>{sig['entry']}</code>\n"
-        f"📉 الوقف:  <code>{sig['sl']}</code>\n"
+        f"📉 الوقف: <code>{sig['sl']}</code>\n"
         f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
-        f"🏆 الهدف 2: <code>{sig['tp2']}</code>"
-        f"{tp3_line}\n"
+        f"🏁 الهدف 2: <code>{sig['tp2']}</code>\n"
         f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
         f"{extra}\n"
         "━━━━━━━━━━━━━━\n"
@@ -303,15 +295,8 @@ def format_signal_text_basic(sig: dict) -> str:
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
-    emoji_map = {"tp1": "🎯", "tp2": "🏆", "tp3": "🏁", "sl": "🛑"}
-    label_map = {
-        "tp1": "تحقق الهدف 1 — خطوة ممتازة!",
-        "tp2": "تحقق الهدف 2 — إنجاز رائع!",
-        "tp3": "تحقق الهدف 3 — إغلاق مثالي!",
-        "sl":  "وقف الخسارة — حماية رأس المال",
-    }
-    emoji = emoji_map.get(t.result or "", "ℹ️")
-    result_label = label_map.get(t.result or "", "إغلاق")
+    emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(t.result or "", "ℹ️")
+    result_label = {"tp1": "تحقق الهدف 1 — خطوة ممتازة!", "tp2": "تحقق الهدف 2 — إنجاز رائع!", "sl": "وقف الخسارة — حماية رأس المال"}.get(t.result or "", "إغلاق")
     r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
     tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (t.result == "sl") else "🎯 إدارة الربح أهم من كثرة الصفقات."
     return (
@@ -319,8 +304,8 @@ def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
         "━━━━━━━━━━━━━━\n"
         f"🔹 الأصل: <b>{_h(t.symbol)}</b>\n"
         f"💵 الدخول: <code>{t.entry}</code>\n"
-        f"📉 الوقف:  <code>{t.sl}</code>\n"
-        f"🎯 TP1: <code>{t.tp1}</code> | 🏆 TP2: <code>{t.tp2}</code>\n"
+        f"📉 الوقف: <code>{t.sl}</code>\n"
+        f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>\n"
         f"📌 النتيجة: <b>{result_label}</b>{r_line}\n"
         f"⏰ الإغلاق (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
         "━━━━━━━━━━━━━━\n"
@@ -525,29 +510,23 @@ async def scan_and_dispatch():
 
                     AUDIT_IDS[trade_id] = audit_id
 
-                    # NEW: خزّن الإضافات (TP3 والرسائل والبروفايل...) لهذه الصفقة
-                    extras = {
-                        "tp3": sig.get("tp3"),
-                        "messages": sig.get("messages", {}),
-                        "profile": sig.get("profile"),
-                        "partials": sig.get("partials"),
-                        "trail_after_tp2": sig.get("trail_after_tp2"),
-                        "trail_atr_mult": sig.get("trail_atr_mult"),
-                        "max_bars_to_tp1": sig.get("max_bars_to_tp1"),
-                    }
-                    EXTRAS_BY_TRADE[trade_id] = extras
-
-                try:
-                    await _send_signal_to_channel(sig, audit_id)
-
-                    # NEW: رسالة تحفيزية للدخول (إن توفرت من strategy)
-                    entry_msg = sig.get("messages", {}).get("entry")
-                    if entry_msg:
+                    # === NEW === خزّن رسائل الصفقة (إن وُجدت في الإشارة)
+                    if sig.get("messages"):
                         try:
-                            await notify_subscribers(entry_msg)
+                            MESSAGES_CACHE[trade_id] = dict(sig["messages"])
                         except Exception:
                             pass
 
+                try:
+                    # رسالة الإشارة الأساسية
+                    await _send_signal_to_channel(sig, audit_id)
+
+                    # === NEW === رسالة "الدخول" التحفيزية (اختيارية)
+                    entry_msg = (sig.get("messages") or {}).get("entry")
+                    if entry_msg:
+                        await notify_subscribers(entry_msg)
+
+                    # ملاحظة قصيرة للمشتركين (كما في نسختك)
                     note = (
                         "🚀 <b>إشارة جديدة وصلت!</b>\n"
                         "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
@@ -581,6 +560,7 @@ async def loop_signals():
 # مراقبة الصفقات
 # ---------------------------
 async def monitor_open_trades():
+    from types import SimpleNamespace  # === NEW === لاستخدامه في رسالة TP1 التصويرية
     while True:
         try:
             with get_session() as s:
@@ -590,52 +570,61 @@ async def monitor_open_trades():
                     if price is None:
                         continue
 
-                    # NEW: قراءة TP3 من الإضافات إن وجدت + فحص النتائج بأولوية TP3 → TP2 → TP1 → SL
-                    extras = EXTRAS_BY_TRADE.get(t.id, {})
-                    tp3_val = extras.get("tp3")
-                    hit_tp3 = (tp3_val is not None) and (price >= float(tp3_val))
-
                     hit_tp2 = price >= t.tp2
                     hit_tp1 = price >= t.tp1
                     hit_sl  = price <= t.sl
 
+                    # === NEW === منطق الإغلاق: TP2 أو SL فقط (TP1 إشعار بلا إغلاق)
                     result, exit_px = None, None
-                    if hit_tp3:
-                        result, exit_px = "tp3", float(tp3_val)
+                    if hit_sl:
+                        result, exit_px = "sl", float(t.sl)
                     elif hit_tp2:
                         result, exit_px = "tp2", float(t.tp2)
-                    elif hit_tp1:
-                        result, exit_px = "tp1", float(t.tp1)
-                    elif hit_sl:
-                        result, exit_px = "sl",  float(t.sl)
 
-                    if not result:
-                        continue
+                    if result:
+                        r_multiple = on_trade_closed_update_risk(t, result, exit_px)
+                        try:
+                            close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
+                        except Exception as e:
+                            logger.warning(f"close_trade warn: {e}")
 
-                    r_multiple = on_trade_closed_update_risk(t, result, exit_px)
-                    try:
-                        close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
-                    except Exception as e:
-                        logger.warning(f"close_trade warn: {e}")
+                        msg = format_close_text(t, r_multiple)
+                        # أضف الرسالة التحفيزية لو وُجدت
+                        try:
+                            extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
+                            if extra:
+                                msg += "\n\n" + extra
+                        except Exception:
+                            pass
 
-                    # NEW: رسائل تحفيزية عند الأهداف/الوقف
-                    mot = extras.get("messages", {}) if extras else {}
-                    try:
-                        if result == "tp1" and mot.get("tp1"):
-                            await notify_subscribers(mot["tp1"])
-                        elif result == "tp2" and mot.get("tp2"):
-                            await notify_subscribers(mot["tp2"])
-                        elif result == "tp3" and mot.get("tp3"):
-                            await notify_subscribers(mot["tp3"])
-                        elif result == "sl"  and mot.get("sl"):
-                            await notify_subscribers(mot["sl"])
-                    except Exception:
-                        pass
+                        await notify_subscribers(msg)
+                        await asyncio.sleep(0.05)
+                        continue  # انتهت هذه الصفقة (أُغلقت)
 
-                    msg = format_close_text(t, r_multiple)
-                    msg += "\n💡 <i>الانضباط مع الوقف والأهداف يصنع الفرق على المدى الطويل.</i>"
-                    await notify_subscribers(msg)
-                    await asyncio.sleep(0.05)
+                    # TP1 — إشعار مرة واحدة فقط، دون إغلاق
+                    if hit_tp1 and not HIT_TP1.get(t.id):
+                        HIT_TP1[t.id] = True
+
+                        # نبني رسالة "إغلاق تصويرية" لعرض تقدم الصفقة بدون إغلاق فعلي
+                        tmp = SimpleNamespace(
+                            symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1"
+                        )
+                        msg = format_close_text(tmp, None)
+
+                        # رسالة تحفيزية مخصصة لـ TP1 (إن وجدت)
+                        try:
+                            extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp1")
+                            if extra:
+                                msg += "\n\n" + extra
+                        except Exception:
+                            pass
+
+                        # نصيحة اختيارية: نقل الوقف للتعادل (تنفيذ يدوي من المستخدم)
+                        msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
+
+                        await notify_subscribers(msg)
+                        await asyncio.sleep(0.05)
+
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
@@ -854,7 +843,7 @@ async def cmd_help(m: Message):
         "• <code>/trial</code> – تجربة مجانية ليوم\n"
         "• <code>/status</code> – حالة الاشتراك\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
-        "📞 <ب>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
+        "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
     await m.answer(text, parse_mode="HTML")
 
