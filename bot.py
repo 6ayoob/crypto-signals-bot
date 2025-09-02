@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import time
+import signal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
@@ -195,7 +196,7 @@ async def get_trial_invite_link(user_id: int) -> Optional[str]:
         inv = await bot.create_chat_invite_link(
             TELEGRAM_CHANNEL_ID,
             name=f"trial_{user_id}",
-            expire_date=expires_at,
+            expire_date=int(expires_at.replace(tzinfo=timezone.utc).timestamp()),
             member_limit=1,
             creates_join_request=False
         )
@@ -448,7 +449,7 @@ async def load_okx_markets_and_filter():
         filtered = [s for s in SYMBOLS if s in mkts]
         skipped = [s for s in SYMBOLS if s not in mkts]
         AVAILABLE_SYMBOLS = filtered
-        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped {len(skipped)}: {skipped}")
+        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped 0: {skipped}")
     except Exception as e:
         logger.exception(f"load_okx_markets error: {e}")
         AVAILABLE_SYMBOLS = []
@@ -1163,6 +1164,7 @@ async def cmd_approve(m: Message):
     with get_session() as s:
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
     await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+
     # إرسال دعوة (مدفوع)
     invite = await get_paid_invite_link(uid)
     if invite:
@@ -1219,18 +1221,42 @@ async def check_channel_and_admin_dm():
     return ok
 
 # ---------------------------
-# التشغيل
+# التشغيل (تحسين قفل القائد: SIGTERM + إعادة محاولات)
 # ---------------------------
 async def main():
     init_db()
 
     hb_task = None
     holder = f"{SERVICE_NAME}:{os.getpid()}"
+
+    # حرّر القفل عند SIGTERM
+    def _on_sigterm(*_):
+        try:
+            logger.info("SIGTERM received → releasing leader lock and shutting down…")
+            if ENABLE_DB_LOCK and release_leader_lock:
+                release_leader_lock(LEADER_LOCK_NAME, holder)
+        except Exception as e:
+            logger.warning(f"release_leader_lock on SIGTERM warn: {e}")
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
+
+    # محاولة الاستحواذ على القفل مع إعادة محاولات
     if ENABLE_DB_LOCK and acquire_or_steal_leader_lock:
-        ok = acquire_or_steal_leader_lock(LEADER_LOCK_NAME, holder, ttl_seconds=LEADER_TTL)
-        if not ok:
-            logger.error("Another instance holds the leader DB lock. Exiting.")
+        got = False
+        for attempt in range(20):  # ~5 دقائق كحد أقصى إذا TTL كبير
+            ok = acquire_or_steal_leader_lock(LEADER_LOCK_NAME, holder, ttl_seconds=LEADER_TTL)
+            if ok:
+                got = True
+                break
+            wait_s = 15
+            logger.error(f"Another instance holds the leader DB lock. Retrying in {wait_s}s… (try {attempt+1})")
+            await asyncio.sleep(wait_s)
+        if not got:
+            logger.error("Timeout waiting for leader lock. Exiting.")
             return
+
         async def _leader_heartbeat_task(name: str, holder: str):
             while True:
                 try:
@@ -1240,7 +1266,7 @@ async def main():
                         os._exit(1)
                 except Exception as e:
                     logger.warning(f"Heartbeat error: {e}")
-                await asyncio.sleep( max(10, LEADER_TTL // 2) )
+                await asyncio.sleep(max(10, LEADER_TTL // 2))
         hb_task = asyncio.create_task(_leader_heartbeat_task(LEADER_LOCK_NAME, holder))
 
     await load_okx_markets_and_filter()
@@ -1276,6 +1302,7 @@ async def main():
         if ENABLE_DB_LOCK and release_leader_lock:
             try:
                 release_leader_lock(LEADER_LOCK_NAME, holder)
+                logger.info("Leader lock released.")
             except Exception:
                 pass
         if hb_task:
