@@ -123,15 +123,17 @@ class SlidingRateLimiter:
         self.calls = deque()
         self._lock = asyncio.Lock()
     async def wait(self):
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            while self.calls and (now - self.calls[0]) > self.window:
-                self.calls.popleft()
-            if len(self.calls) >= self.max_calls:
+        # تجنّب الانتظار المتكرر داخل القفل
+        while True:
+            async with self._lock:
+                now = asyncio.get_running_loop().time()
+                while self.calls and (now - self.calls[0]) > self.window:
+                    self.calls.popleft()
+                if len(self.calls) < self.max_calls:
+                    self.calls.append(now)
+                    return
                 sleep_for = self.window - (now - self.calls[0]) + 0.05
-                await asyncio.sleep(max(sleep_for, 0.05))
-                return await self.wait()
-            self.calls.append(now)
+            await asyncio.sleep(max(sleep_for, 0.05))
 RATE = SlidingRateLimiter(OKX_PUBLIC_MAX, OKX_PUBLIC_WIN)
 
 # جداول المسح
@@ -189,7 +191,6 @@ async def get_trial_invite_link(user_id: int) -> Optional[str]:
     يتطلب أن يكون البوت مشرفًا في القناة.
     """
     if CHANNEL_INVITE_LINK:
-        # لو عندك رابط ثابت للتجربة أيضًا (غير مفضل لأنه دائم)، لكن نسمح به كـ fallback.
         return CHANNEL_INVITE_LINK
     try:
         expires_at = datetime.utcnow() + timedelta(hours=TRIAL_INVITE_HOURS)
@@ -449,7 +450,7 @@ async def load_okx_markets_and_filter():
         filtered = [s for s in SYMBOLS if s in mkts]
         skipped = [s for s in SYMBOLS if s not in mkts]
         AVAILABLE_SYMBOLS = filtered
-        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped 0: {skipped}")
+        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped {len(skipped)}: {skipped}")
     except Exception as e:
         logger.exception(f"load_okx_markets error: {e}")
         AVAILABLE_SYMBOLS = []
@@ -1221,6 +1222,27 @@ async def check_channel_and_admin_dm():
     return ok
 
 # ---------------------------
+# Polling متين ضد انقطاعات الشبكة
+# ---------------------------
+async def resilient_polling():
+    """يشغّل polling مع إعادة محاولة تلقائية عند مشاكل الشبكة المؤقتة."""
+    delay = 5
+    while True:
+        try:
+            await dp.start_polling(bot)
+        except asyncio.CancelledError:
+            # إيقاف حقيقي (SIGTERM)، اخرج من اللوب
+            raise
+        except Exception as e:
+            logger.warning(f"Polling failed: {e} — retrying in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)  # Backoff حتى 60s
+        else:
+            # خرج طبيعي (نادراً)، أعد التشغيل بعد مهلة قصيرة
+            delay = 5
+            await asyncio.sleep(3)
+
+# ---------------------------
 # التشغيل (تحسين قفل القائد: SIGTERM + إعادة محاولات)
 # ---------------------------
 async def main():
@@ -1279,7 +1301,8 @@ async def main():
 
     await check_channel_and_admin_dm()
 
-    t1 = asyncio.create_task(dp.start_polling(bot))
+    # استخدم Polling المتين بدلًا من start_polling مباشرة
+    t1 = asyncio.create_task(resilient_polling())
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
     t4 = asyncio.create_task(monitor_open_trades())
