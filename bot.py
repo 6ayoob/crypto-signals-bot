@@ -1,9 +1,9 @@
-# bot.py — تشغيل Aiogram v3 | تفعيل يدوي + دعوة قناة + تجربة يومية + تقارير + مخاطر + قفل قائد
-# الجديد:
-# - زر "🔑 طلب اشتراك": يرسل إشعارًا للأدمن + يرسل للمستخدم عنوان المحفظة والانتقال لمراسلة الأدمن.
-# - بعد أي تفعيل (Approve): إرسال رابط دعوة للقناة تلقائيًا (توليد/ثابت).
-# - إضافة أمر /trial بجانب زر التجربة في /start، ومعه إرسال رابط القناة عند النجاح.
-# - لا يوجد دفع أوتوماتيكي/TxID.
+# bot.py — تشغيل Aiogram v3 | تفعيل يدوي + دعوة قناة (تجربة/مدفوع) + إزالة المنتهين + تذكير قبل الانتهاء
+# - زر "🔑 طلب اشتراك": يرسل إشعارًا للأدمن + يرسل للمستخدم عنوان المحفظة والاتصال بالأدمن.
+# - التجربة: رابط ينتهي خلال 24h ومحدود لعضو واحد.
+# - المدفوع: رابط دائم.
+# - تذكير قبل الانتهاء + إزالة تلقائية من القناة عند الانتهاء.
+# - إشعارات الصفقة: إشعار فقط عند TP1 (بدون إغلاق)، وإغلاق عند TP2/SL.
 # المتطلبات: اجعل البوت "مشرفًا" في القناة ليتمكن من create_chat_invite_link، أو وفّر CHANNEL_INVITE_LINK ثابت.
 
 import asyncio
@@ -153,7 +153,7 @@ AUDIT_IDS: Dict[int, str] = {}
 DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
 _LAST_SIGNAL_AT: Dict[str, float] = {}
 
-# === NEW === رسائل تحفيزية للصفقات + تتبّع وصول TP1 دون إغلاق
+# === رسائل تحفيزية للصفقات + تتبّع وصول TP1 دون إغلاق
 MESSAGES_CACHE: Dict[int, Dict[str, str]] = {}
 HIT_TP1: Dict[int, bool] = {}
 
@@ -162,17 +162,64 @@ SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv(
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")  # اسم المستخدم بدون @ لزر الخاص
 
 # ===== روابط دعوة القناة =====
-CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # إن وفّرت رابطًا ثابتًا
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # إن وفّرت رابطًا ثابتًا (fallback)
+
+# إعدادات التجربة/التذكير/الإزالة
+TRIAL_INVITE_HOURS = int(os.getenv("TRIAL_INVITE_HOURS", "24"))      # مدة رابط التجربة
+KICK_CHECK_INTERVAL_SEC = int(os.getenv("KICK_CHECK_INTERVAL_SEC", "3600"))  # كل كم ثانية نفحص المنتهين
+REMINDER_BEFORE_HOURS = int(os.getenv("REMINDER_BEFORE_HOURS", "4"))          # تذكير قبل الانتهاء
+_SENT_SOON_REM: set[int] = set()  # منع تكرار التذكير
+
+# --------- توليد روابط دعوة ----------
 async def get_channel_invite_link() -> Optional[str]:
-    # 1) إن وُجد رابط ثابت في .env استخدمه
+    """Fallback عام (يستخدم الرابط الثابت إن وُجد، وإلا يُولد رابطًا دائمًا)."""
     if CHANNEL_INVITE_LINK:
         return CHANNEL_INVITE_LINK
-    # 2) توليد رابط جديد (يتطلب أن يكون البوت مشرفًا في القناة)
     try:
         inv = await bot.create_chat_invite_link(TELEGRAM_CHANNEL_ID, creates_join_request=False)
         return inv.invite_link
     except Exception as e:
         logger.warning(f"INVITE_LINK create failed: {e}")
+        return None
+
+async def get_trial_invite_link(user_id: int) -> Optional[str]:
+    """
+    رابط دعوة للتجربة: ينتهي خلال TRIAL_INVITE_HOURS ومحدود لعضو واحد.
+    يتطلب أن يكون البوت مشرفًا في القناة.
+    """
+    if CHANNEL_INVITE_LINK:
+        # لو عندك رابط ثابت للتجربة أيضًا (غير مفضل لأنه دائم)، لكن نسمح به كـ fallback.
+        return CHANNEL_INVITE_LINK
+    try:
+        expires_at = datetime.utcnow() + timedelta(hours=TRIAL_INVITE_HOURS)
+        inv = await bot.create_chat_invite_link(
+            TELEGRAM_CHANNEL_ID,
+            name=f"trial_{user_id}",
+            expire_date=expires_at,
+            member_limit=1,
+            creates_join_request=False
+        )
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK(TRIAL) create failed: {e}")
+        return None
+
+async def get_paid_invite_link(user_id: int) -> Optional[str]:
+    """
+    رابط دائم للمشترك المدفوع (غير منتهي ولا محدود).
+    إن وُجد CHANNEL_INVITE_LINK نستخدمه مباشرة.
+    """
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
+    try:
+        inv = await bot.create_chat_invite_link(
+            TELEGRAM_CHANNEL_ID,
+            name=f"paid_{user_id}",
+            creates_join_request=False
+        )
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK(PAID) create failed: {e}")
         return None
 
 def invite_kb(url: str) -> InlineKeyboardMarkup:
@@ -295,19 +342,23 @@ def format_signal_text_basic(sig: dict) -> str:
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
-    emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(t.result or "", "ℹ️")
-    result_label = {"tp1": "تحقق الهدف 1 — خطوة ممتازة!", "tp2": "تحقق الهدف 2 — إنجاز رائع!", "sl": "وقف الخسارة — حماية رأس المال"}.get(t.result or "", "إغلاق")
+    emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(getattr(t, "result", "") or "", "ℹ️")
+    result_label = {
+        "tp1": "تحقق الهدف 1 — خطوة ممتازة!",
+        "tp2": "تحقق الهدف 2 — إنجاز رائع!",
+        "sl":  "وقف الخسارة — حماية رأس المال"
+    }.get(getattr(t, "result", "") or "", "إغلاق")
     r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
-    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (t.result == "sl") else "🎯 إدارة الربح أهم من كثرة الصفقات."
+    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (getattr(t, "result", "") == "sl") else "🎯 إدارة الربح أهم من كثرة الصفقات."
     return (
-        f"{emoji} <b>إغلاق صفقة</b>\n"
+        f"{emoji} <b>حالة صفقة</b>\n"
         "━━━━━━━━━━━━━━\n"
-        f"🔹 الأصل: <b>{_h(t.symbol)}</b>\n"
+        f"🔹 الأصل: <b>{_h(str(t.symbol))}</b>\n"
         f"💵 الدخول: <code>{t.entry}</code>\n"
         f"📉 الوقف: <code>{t.sl}</code>\n"
         f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>\n"
-        f"📌 النتيجة: <b>{result_label}</b>{r_line}\n"
-        f"⏰ الإغلاق (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
+        f"📌 الحالة: <b>{result_label}</b>{r_line}\n"
+        f"⏰ (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
         "━━━━━━━━━━━━━━\n"
         f"{tip}"
     )
@@ -510,7 +561,7 @@ async def scan_and_dispatch():
 
                     AUDIT_IDS[trade_id] = audit_id
 
-                    # === NEW === خزّن رسائل الصفقة (إن وُجدت في الإشارة)
+                    # خزّن رسائل الصفقة (إن وُجدت في الإشارة)
                     if sig.get("messages"):
                         try:
                             MESSAGES_CACHE[trade_id] = dict(sig["messages"])
@@ -521,12 +572,12 @@ async def scan_and_dispatch():
                     # رسالة الإشارة الأساسية
                     await _send_signal_to_channel(sig, audit_id)
 
-                    # === NEW === رسالة "الدخول" التحفيزية (اختيارية)
+                    # رسالة "الدخول" التحفيزية (اختيارية)
                     entry_msg = (sig.get("messages") or {}).get("entry")
                     if entry_msg:
                         await notify_subscribers(entry_msg)
 
-                    # ملاحظة قصيرة للمشتركين (كما في نسختك)
+                    # ملاحظة قصيرة للمشتركين
                     note = (
                         "🚀 <b>إشارة جديدة وصلت!</b>\n"
                         "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
@@ -557,10 +608,10 @@ async def loop_signals():
         await asyncio.sleep(sleep_for)
 
 # ---------------------------
-# مراقبة الصفقات
+# مراقبة الصفقات (TP1 إشعار فقط / TP2 & SL إغلاق)
 # ---------------------------
 async def monitor_open_trades():
-    from types import SimpleNamespace  # === NEW === لاستخدامه في رسالة TP1 التصويرية
+    from types import SimpleNamespace  # لرسالة TP1 التصويرية
     while True:
         try:
             with get_session() as s:
@@ -574,7 +625,7 @@ async def monitor_open_trades():
                     hit_tp1 = price >= t.tp1
                     hit_sl  = price <= t.sl
 
-                    # === NEW === منطق الإغلاق: TP2 أو SL فقط (TP1 إشعار بلا إغلاق)
+                    # الإغلاق عند SL أو TP2 فقط
                     result, exit_px = None, None
                     if hit_sl:
                         result, exit_px = "sl", float(t.sl)
@@ -605,7 +656,7 @@ async def monitor_open_trades():
                     if hit_tp1 and not HIT_TP1.get(t.id):
                         HIT_TP1[t.id] = True
 
-                        # نبني رسالة "إغلاق تصويرية" لعرض تقدم الصفقة بدون إغلاق فعلي
+                        # نبني رسالة "حالة صفقة" لعرض تقدم الصفقة بدون إغلاق فعلي
                         tmp = SimpleNamespace(
                             symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1"
                         )
@@ -628,6 +679,83 @@ async def monitor_open_trades():
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
+
+# ---------------------------
+# مهام الاشتراكات: إزالة المنتهين + تذكير قبل الانتهاء
+# ---------------------------
+async def kick_expired_members_loop():
+    """
+    يزيل من انتهت تجربته/اشتراكه من القناة (ban ثم unban لإخراجه)،
+    ويرسل له رسالة خاصة لطيفة للترقية.
+    يعمل كل KICK_CHECK_INTERVAL_SEC ثانية.
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            with get_session() as s:
+                expired = (
+                    s.query(User)
+                    .filter(User.end_at != None, User.end_at <= now)  # noqa: E711
+                    .all()
+                )
+            for u in expired:
+                try:
+                    member = await bot.get_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+                    status = getattr(member, "status", None)
+                    if status in ("member", "administrator", "creator"):
+                        await bot.ban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+                        await asyncio.sleep(0.3)
+                        await bot.unban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+                        # إشعار خاص لطيف
+                        try:
+                            await bot.send_message(
+                                u.tg_user_id,
+                                "⏳ انتهت صلاحية الوصول.\n"
+                                "✨ فعّل اشتراكك الآن للاستمرار باستلام الإشارات والتقرير اليومي.\n"
+                                "استخدم /start لطلب التفعيل أو مراسلة الأدمن."
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.debug(f"kick_expired: {e}")
+        except Exception as e:
+            logger.exception(f"KICK_EXPIRED_LOOP ERROR: {e}")
+
+        await asyncio.sleep(max(60, KICK_CHECK_INTERVAL_SEC))
+
+async def notify_trial_expiring_soon_loop():
+    """
+    يذكّر المنتهين خلال REMINDER_BEFORE_HOURS القادمة (مرّة واحدة فقط لكل مستخدم).
+    """
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            soon = now + timedelta(hours=REMINDER_BEFORE_HOURS)
+            with get_session() as s:
+                rows = (
+                    s.query(User)
+                    .filter(User.end_at != None, User.end_at > now, User.end_at <= soon)  # noqa: E711
+                    .all()
+                )
+            for u in rows:
+                if u.tg_user_id in _SENT_SOON_REM:
+                    continue
+                try:
+                    left_min = max(1, int((u.end_at - now).total_seconds() // 60))
+                    await bot.send_message(
+                        u.tg_user_id,
+                        f"⏰ تبقّى حوالي {left_min} دقيقة على نهاية صلاحيتك.\n"
+                        "✅ فعّل اشتراكك الآن لتستمر الإشارات بدون انقطاع. استخدم /start."
+                    )
+                    _SENT_SOON_REM.add(u.tg_user_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.debug(f"notify_expiring_soon: {e}")
+
+        await asyncio.sleep(900)  # كل 15 دقيقة
 
 # ---------------------------
 # التقرير اليومي
@@ -711,8 +839,8 @@ async def cb_trial(q: CallbackQuery):
         await q.message.answer(
             "✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁\n"
             "🚀 استمتع بالإشارات والتقرير اليومي.", parse_mode="HTML")
-        # إرسال دعوة للقناة
-        invite = await get_channel_invite_link()
+        # إرسال دعوة للقناة (تجربة)
+        invite = await get_trial_invite_link(q.from_user.id)
         if invite:
             try:
                 await bot.send_message(q.from_user.id, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
@@ -731,7 +859,7 @@ async def cmd_trial(m: Message):
         ok = start_trial(s, m.from_user.id)
     if ok:
         await m.answer("✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁", parse_mode="HTML")
-        invite = await get_channel_invite_link()
+        invite = await get_trial_invite_link(m.from_user.id)
         if invite:
             try:
                 await bot.send_message(m.from_user.id, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
@@ -804,8 +932,8 @@ async def cb_approve_inline(q: CallbackQuery):
             f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
             parse_mode="HTML"
         )
-        # إرسال رابط دعوة للمستخدم
-        invite = await get_channel_invite_link()
+        # إرسال رابط دعوة للمستخدم (مدفوع)
+        invite = await get_paid_invite_link(uid)
         try:
             if invite:
                 await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
@@ -939,8 +1067,8 @@ async def admin_manual_router(m: Message):
                 f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
                 parse_mode="HTML"
             )
-            # إرسال الدعوة
-            invite = await get_channel_invite_link()
+            # إرسال الدعوة (مدفوع)
+            invite = await get_paid_invite_link(uid)
             try:
                 if invite:
                     await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
@@ -1000,8 +1128,8 @@ async def cb_admin_skip_ref(q: CallbackQuery):
             f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
             parse_mode="HTML"
         )
-        # إرسال الدعوة
-        invite = await get_channel_invite_link()
+        # إرسال الدعوة (مدفوع)
+        invite = await get_paid_invite_link(uid)
         try:
             if invite:
                 await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
@@ -1035,8 +1163,8 @@ async def cmd_approve(m: Message):
     with get_session() as s:
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
     await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
-    # إرسال دعوة
-    invite = await get_channel_invite_link()
+    # إرسال دعوة (مدفوع)
+    invite = await get_paid_invite_link(uid)
     if invite:
         try:
             await bot.send_message(uid, "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:", reply_markup=invite_kb(invite))
@@ -1129,9 +1257,11 @@ async def main():
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
     t4 = asyncio.create_task(monitor_open_trades())
+    t5 = asyncio.create_task(kick_expired_members_loop())
+    t6 = asyncio.create_task(notify_trial_expiring_soon_loop())
 
     try:
-        await asyncio.gather(t1, t2, t3, t4)
+        await asyncio.gather(t1, t2, t3, t4, t5, t6)
     except TelegramConflictError:
         logger.error("❌ Conflict: يبدو أن نسخة أخرى من البوت تعمل وتستخدم getUpdates. أوقف النسخة الأخرى أو غيّر التوكن.")
         return
