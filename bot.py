@@ -171,7 +171,38 @@ CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # إن وفّرت راب
 TRIAL_INVITE_HOURS = int(os.getenv("TRIAL_INVITE_HOURS", "24"))      # مدة رابط التجربة
 KICK_CHECK_INTERVAL_SEC = int(os.getenv("KICK_CHECK_INTERVAL_SEC", "3600"))  # كل كم ثانية نفحص المنتهين
 REMINDER_BEFORE_HOURS = int(os.getenv("REMINDER_BEFORE_HOURS", "4"))          # تذكير قبل الانتهاء
-_SENT_SOON_REM: set[int] = set()  # منع تكرار التذكير
+
+# منع تكرار التنبيهات داخل نفس الجلسة
+_SENT_SOON_REM: set[int] = set()     # تذكير "قرب الانتهاء"
+_SENT_EXPIRED_DM: set[int] = set()   # إشعار "انتهت"
+
+# --------- أدوات وقت وتعرّف التجربة ----------
+def _fmt_dt_local(dt_utc: datetime) -> str:
+    try:
+        tz = pytz.timezone(TIMEZONE)
+        return dt_utc.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+
+def _user_is_trial(u) -> bool:
+    """
+    يحاول تحديد ما إذا كان المستخدم على خطة تجربة:
+    - إذا كان لديه حقل plan أو subscription_plan يحوي 'trial'
+    - أو حقل Boolean اسمه is_trial
+    وإلا يعيد False بدون كسر.
+    """
+    try:
+        v = getattr(u, "plan", None) or getattr(u, "subscription_plan", None)
+        if isinstance(v, str) and "trial" in v.lower():
+            return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(u, "is_trial", False)):
+            return True
+    except Exception:
+        pass
+    return False
 
 # --------- توليد روابط دعوة ----------
 async def get_channel_invite_link() -> Optional[str]:
@@ -701,6 +732,29 @@ async def kick_expired_members_loop():
                     .all()
                 )
             for u in expired:
+                # أرسل إشعار انتهاء لمرة واحدة (حتى لو لم يكن عضوًا في القناة حاليًا)
+                if u.tg_user_id not in _SENT_EXPIRED_DM:
+                    is_trial = _user_is_trial(u)
+                    try:
+                        end_local = _fmt_dt_local(u.end_at) if getattr(u, "end_at", None) else "-"
+                        if is_trial:
+                            txt = (
+                                "⛔️ <b>انتهت الفترة التجريبية المجانية</b>.\n"
+                                f"📅 تاريخ الانتهاء: <b>{end_local}</b>\n\n"
+                                "للاستمرار في استقبال الإشارات والتقرير اليومي، فعّل اشتراكك الآن ✅"
+                            )
+                        else:
+                            txt = (
+                                "⛔️ <b>انتهت صلاحية اشتراكك</b>.\n"
+                                f"📅 تاريخ الانتهاء: <b>{end_local}</b>\n\n"
+                                "يمكنك التجديد لمواصلة الخدمة 🙌"
+                            )
+                        await bot.send_message(u.tg_user_id, txt, parse_mode="HTML", disable_web_page_preview=True)
+                        _SENT_EXPIRED_DM.add(u.tg_user_id)
+                    except Exception:
+                        pass
+
+                # إن كان ما يزال عضوًا، أخرجه من القناة
                 try:
                     member = await bot.get_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
                     status = getattr(member, "status", None)
@@ -708,16 +762,6 @@ async def kick_expired_members_loop():
                         await bot.ban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
                         await asyncio.sleep(0.3)
                         await bot.unban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
-                        # إشعار خاص لطيف
-                        try:
-                            await bot.send_message(
-                                u.tg_user_id,
-                                "⏳ انتهت صلاحية الوصول.\n"
-                                "✨ فعّل اشتراكك الآن للاستمرار باستلام الإشارات والتقرير اليومي.\n"
-                                "استخدم /start لطلب التفعيل أو مراسلة الأدمن."
-                            )
-                        except Exception:
-                            pass
                         await asyncio.sleep(0.1)
                 except Exception as e:
                     logger.debug(f"kick_expired: {e}")
@@ -728,7 +772,7 @@ async def kick_expired_members_loop():
 
 async def notify_trial_expiring_soon_loop():
     """
-    يذكّر المنتهين خلال REMINDER_BEFORE_HOURS القادمة (مرّة واحدة فقط لكل مستخدم).
+    يذكّر المنتهين خلال REMINDER_BEFORE_HOURS القادمة — للتجربة المجانية فقط.
     """
     while True:
         try:
@@ -741,14 +785,21 @@ async def notify_trial_expiring_soon_loop():
                     .all()
                 )
             for u in rows:
+                # نريد التجربة المجانية فقط
+                if not _user_is_trial(u):
+                    continue
                 if u.tg_user_id in _SENT_SOON_REM:
                     continue
                 try:
                     left_min = max(1, int((u.end_at - now).total_seconds() // 60))
+                    end_local = _fmt_dt_local(u.end_at)
                     await bot.send_message(
                         u.tg_user_id,
-                        f"⏰ تبقّى حوالي {left_min} دقيقة على نهاية صلاحيتك.\n"
-                        "✅ فعّل اشتراكك الآن لتستمر الإشارات بدون انقطاع. استخدم /start."
+                        f"⏰ تبقّى حوالي <b>{left_min}</b> دقيقة على نهاية <b>الفترة التجريبية المجانية</b>.\n"
+                        f"📅 ينتهي الوصول عند: <b>{end_local}</b>\n\n"
+                        "✅ فعّل اشتراكك الآن لتستمر الإشارات بدون انقطاع. استخدم /start.",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
                     )
                     _SENT_SOON_REM.add(u.tg_user_id)
                 except Exception:
