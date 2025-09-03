@@ -76,12 +76,20 @@ MOTIVATION = {
 
 # ========= Engagement Mode (اختياري) =========
 # يزيد وتيرة الإشعارات بشكل منضبط عبر تخفيفات طفيفة ومحسوبة — دون تغيير القيم الأصلية أعلاه
-ENGAGEMENT_MODE = True            # شغّال افتراضيًا حسب طلبك — أوقفه إلى False إن رغبت
+ENGAGEMENT_MODE = True            # شغّال افتراضيًا — يضبطه bot.py تلقائيًا
 ENG_POLICY_OVERRIDE = True        # عند التفعيل: نجعل بوابة MACD/RSI "lenient" داخليًا فقط أثناء الفحص
 ENG_RVOL_MIN_HARD = 0.85          # أخف من 0.90 لفتح فرص أكثر قليلًا
 ENG_ATR_PCT_MIN   = 0.0012        # قبول ATR% أدنى قليلًا
 ENG_BREAKOUT_BUFFER = 0.0012      # هامش اختراق أخف
 ENG_HOLDOUT_BARS    = 1           # تكرار أسرع للإشارات بين الشموع
+
+# === Mode toggle helpers (يستعملها bot.py) ===
+def set_engagement_mode(value: bool) -> None:
+    global ENGAGEMENT_MODE
+    ENGAGEMENT_MODE = bool(value)
+
+def get_mode_label() -> str:
+    return "تحفيزي" if ENGAGEMENT_MODE else "قياسي"
 
 # ---------- مؤشرات ----------
 def ema(series, period):
@@ -331,8 +339,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
             entry_ok = True
             entry_tag = "Breakout SR"
             reasons.append("Breakout SR")
-        elif not breakout_ok and near_res_block:
-            pass  # نكمل لاحقًا إلى بدائل أخرى
 
     # (ب) ارتداد في منطقة 0.382–0.618
     if not entry_ok and USE_FIB:
@@ -348,7 +354,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
 
     # (ج) مسار تعزيز الإشعارات (Fallback خفيف) — لا يعمل إلا مع ENGAGEMENT_MODE
     if not entry_ok and ENGAGEMENT_MODE:
-        # اختراق أخف بشرط زخم بسيط
         try:
             hhv_soft = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
             soft_break = price > hhv_soft * (1.0 + max(0.0009, eff_bb*0.8))
@@ -361,13 +366,12 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
             entry_tag = entry_tag or "Breakout (eng)"
             reasons.append("Engaged")
         else:
-            # أو قبول ارتداد فيبو مع شرط زخم أبسط
             if USE_FIB:
                 hhv3, llv3 = recent_swing(df, SWING_LOOKBACK)
                 if hhv3 and llv3:
                     near_fib2, which2 = near_any_fib(price, hhv3, llv3, FIB_TOL)
                     near_sup_block2 = sup is not None and price <= sup * (1 + SUP_BLOCK_NEAR)
-                    rsi_up_only = float(closed["rsi"]) > float(prev["rsi"])  # نكتفي بتحسّن RSI
+                    rsi_up_only = float(closed["rsi"]) > float(prev["rsi"])
                     if near_fib2 and rsi_up_only and not near_sup_block2:
                         entry_ok = True
                         entry_tag = entry_tag or (which2 + " (eng)")
@@ -408,7 +412,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
         "tp2":   MOTIVATION["tp2"].format(symbol=symbol),
         "tp3":   MOTIVATION["tp3"].format(symbol=symbol),
         "sl":    MOTIVATION["sl"].format(symbol=symbol),
-        "time":  MOTIVATION["time"].format(symbol=symbol),
+        "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎".format(symbol=symbol),
     }
 
     return {
