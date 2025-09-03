@@ -383,4 +383,124 @@ def add_trade_sig(s, sig: dict, audit_id: str | None = None, qty: float | None =
     t = Trade(
         symbol=sig["symbol"],
         side=sig["side"],
-        entry=float(s
+        entry=float(sig["entry"]),
+        sl=float(sig["sl"]),
+        tp1=float(sig["tp1"]),
+        tp2=float(sig["tp2"]),
+        tp_final=float(sig.get("tp_final")) if sig.get("tp_final") is not None else None,
+        score=int(sig.get("score")) if sig.get("score") is not None else None,
+        regime=str(sig.get("regime")) if sig.get("regime") is not None else None,
+        reasons=",".join(sig.get("reasons", [])) if isinstance(sig.get("reasons"), list) else (sig.get("reasons") or None),
+        audit_id=audit_id,
+        qty=float(qty) if qty is not None else None,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    s.add(t); s.flush()
+    return t.id
+
+def has_open_trade_on_symbol(s, symbol: str) -> bool:
+    return (s.execute(select(func.count(Trade.id)).where(Trade.symbol == symbol, Trade.status == "open")).scalar() or 0) > 0
+
+def count_open_trades(s) -> int:
+    return s.execute(select(func.count(Trade.id)).where(Trade.status == "open")).scalar() or 0
+
+def close_trade(s, trade_id: int, result: str, exit_price: float | None = None, r_multiple: float | None = None):
+    t = s.get(Trade, trade_id)
+    if not t:
+        return
+    t.status = "closed"
+    t.result = result
+    t.closed_at = _utcnow()
+    if exit_price is not None:
+        try: t.exit_price = float(exit_price)
+        except Exception: pass
+    if r_multiple is not None:
+        try: t.r_multiple = float(r_multiple)
+        except Exception: pass
+    s.flush()
+
+def list_active_user_ids(s) -> list[int]:
+    now = _utcnow()
+    rows = s.execute(select(User.tg_user_id).where(User.end_at != None, User.end_at > now)).all()
+    return [r[0] for r in rows if r[0]]
+
+# ---------------------------
+# إحصائيات التقارير
+# ---------------------------
+def _period_stats(s, since: datetime) -> dict:
+    signals = s.execute(select(func.count(Trade.id)).where(Trade.opened_at >= since)).scalar() or 0
+    open_now = s.execute(select(func.count(Trade.id)).where(Trade.status == "open")).scalar() or 0
+    tp1 = s.execute(select(func.count(Trade.id)).where(Trade.result == "tp1", Trade.closed_at >= since)).scalar() or 0
+    tp2 = s.execute(select(func.count(Trade.id)).where(Trade.result == "tp2", Trade.closed_at >= since)).scalar() or 0
+    sl = s.execute(select(func.count(Trade.id)).where(Trade.result == "sl", Trade.closed_at >= since)).scalar() or 0
+
+    r_sum = 0.0
+    for t in s.execute(select(Trade).where(Trade.status == "closed", Trade.closed_at >= since)).scalars().all():
+        if t.r_multiple is not None:
+            r_sum += float(t.r_multiple); continue
+        try:
+            risk = max(float(t.entry) - float(t.sl), 1e-9)
+            if t.result == "tp1":   r_sum += (float(t.tp1) - float(t.entry)) / risk
+            elif t.result == "tp2": r_sum += (float(t.tp2) - float(t.entry)) / risk
+            elif t.result == "sl":  r_sum += -1.0
+        except Exception:
+            pass
+
+    wins = tp1 + tp2
+    losses = sl
+    total = wins + losses
+    win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
+
+    return {"signals": signals, "open": open_now, "tp1": tp1, "tp2": tp2, "tp_total": tp1 + tp2, "sl": sl, "win_rate": win_rate, "r_sum": round(r_sum, 2)}
+
+def get_stats_24h(s) -> dict:
+    return _period_stats(s, _utcnow() - timedelta(hours=24))
+
+def get_stats_7d(s) -> dict:
+    return _period_stats(s, _utcnow() - timedelta(days=7))
+
+# ---------------------------
+# Leader Lock APIs
+# ---------------------------
+def try_acquire_leader_lock(name: str, holder: str) -> bool:
+    with SessionLocal() as s:
+        if s.get(Lock, name): return False
+        s.add(Lock(name=name, holder=holder))
+        try: s.commit(); return True
+        except IntegrityError:
+            s.rollback(); return False
+
+def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300) -> bool:
+    now = _utcnow(); expiry = now - timedelta(seconds=int(ttl_seconds))
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row is None:
+            s.add(Lock(name=name, holder=holder, created_at=now))
+            try: s.commit(); return True
+            except Exception: s.rollback(); return False
+        row_ct = _as_aware(row.created_at)
+        if row_ct is not None and row_ct < expiry:
+            row.holder = holder; row.created_at = now
+            try: s.commit(); return True
+            except Exception: s.rollback(); return False
+        return False
+
+def heartbeat_leader_lock(name: str, holder: str) -> bool:
+    now = _utcnow()
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row is None or row.holder != holder: return False
+        row.created_at = now
+        try: s.commit(); return True
+        except Exception: s.rollback(); return False
+
+def release_leader_lock(name: str, holder: str) -> None:
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row and row.holder == holder:
+            s.delete(row)
+            try: s.commit()
+            except Exception: s.rollback()
+
+# انتهى
