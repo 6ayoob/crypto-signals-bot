@@ -1,10 +1,3 @@
-# bot.py — Telegram Bot (إشارات + إدارة + إحالات + pep message + تحسين HTF)
-# ملاحظات:
-# - لا نوقف الصفقات عند بلوغ الهدف اليومي؛ فقط نرسل تنبيه اختياري للمشتركين.
-# - تنبيه التهدئة عند خسارة يومية (R-) يُرسل للآدمن فقط إذا COOLDOWN_ALERT_ADMIN_ONLY=1.
-# - رسالة صباحية تحفيزية تُرسل مرة واحدة يوميًا (اضبط نص/وقت الرسالة من config.py).
-# - نظام إحالة: المُحيل يحصل على يوم مجاني عند تفعيل المُحال بخطة مدفوعة.
-
 import asyncio
 import json
 import hashlib
@@ -12,24 +5,24 @@ import logging
 import os
 import sys
 import time
+import signal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 from collections import deque
-
+import random
 import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ====== قفل ملف محلي لمنع نسختين على نفس الجهاز ======
 LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
 _LOCK_FP = None
 
 def _acquire_single_instance_lock():
-    """قفل خفيف يمنع تشغيل نسختين على نفس الجهاز/السيرفر."""
     global _LOCK_FP
     try:
         _LOCK_FP = open(LOCKFILE_PATH, "w")
@@ -46,43 +39,75 @@ def _acquire_single_instance_lock():
 
 _acquire_single_instance_lock()
 
-# ===== إعدادات/واردات المشروع =====
+# ============================================
+# تلغرام Conflict (قد لا يتوفر في بعض الإصدارات)
+try:
+    from aiogram.exceptions import TelegramConflictError
+except Exception:
+    class TelegramConflictError(Exception): ...
+
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS,
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
     PRICE_2_WEEKS_USD, PRICE_4_WEEKS_USD,
     SUB_DURATION_2W, SUB_DURATION_4W,
-    USDT_TRC20_WALLET,
-    DAILY_PEP_MSG_ENABLED, DAILY_PEP_MSG_HOUR_LOCAL, DAILY_PEP_MSG_TEXT,
-    REF_REWARD_MODE, GIFT_ONE_DAY_HOURS,
-    COOLDOWN_ALERT_ADMIN_ONLY,
+    USDT_TRC20_WALLET
 )
+
+# قاعدة البيانات
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
     count_open_trades, add_trade, close_trade, add_trade_sig,
     has_open_trade_on_symbol, get_stats_24h, get_stats_7d,
-    User, Trade,
-    ensure_ref_code, set_referred_by, get_user_by_tg, grant_free_hours, mark_referral_rewarded,
-    get_user_by_ref_code,  # ← تمت إضافتها هنا
+    User, Trade
 )
 
-from strategy import check_signal
+# ---------- Leader Lock ----------
+ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
+LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
+LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # ثواني
+HEARTBEAT_INTERVAL = max(10, LEADER_TTL // 2)
+acquire_or_steal_leader_lock = heartbeat_leader_lock = release_leader_lock = None
+if ENABLE_DB_LOCK:
+    try:
+        from database import acquire_or_steal_leader_lock as _acq
+        from database import heartbeat_leader_lock as _hb
+        from database import release_leader_lock as _rel
+        acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock = _acq, _hb, _rel
+    except Exception:
+        try:
+            from database import try_acquire_leader_lock as _try_acq
+            def acquire_or_steal_leader_lock(name, holder, ttl_seconds=300):
+                return _try_acq(name, holder)
+            def heartbeat_leader_lock(name, holder):
+                return True
+            def release_leader_lock(name, holder):
+                pass
+        except Exception:
+            ENABLE_DB_LOCK = False
+
+# -----------------------------------
+from strategy import check_signal  # NOTE: الاستراتيجية الآن أكثر ثقة (STRICT filters)
 from symbols import SYMBOLS
 
-# ===== تهيئة لوجينج وبوت =====
+# ---------------------------
+# إعدادات عامة
+# ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# ===== OKX/CCXT =====
+# OKX
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: List[str] = []
 
-OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))
-OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))
+# ==== Rate Limiter لواجهات OKX العامة ====
+OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))  # طلبات لكل نافذة
+OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))  # مدة النافذة بالثواني
 
 class SlidingRateLimiter:
     def __init__(self, max_calls: int, window_sec: float):
@@ -90,7 +115,9 @@ class SlidingRateLimiter:
         self.window = window_sec
         self.calls = deque()
         self._lock = asyncio.Lock()
+
     async def wait(self):
+        # تجنّب الانتظار المتكرر داخل القفل
         while True:
             async with self._lock:
                 now = asyncio.get_running_loop().time()
@@ -104,61 +131,50 @@ class SlidingRateLimiter:
 
 RATE = SlidingRateLimiter(OKX_PUBLIC_MAX, OKX_PUBLIC_WIN)
 
+# جداول المسح
 SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "300"))
 MONITOR_INTERVAL_SEC = int(os.getenv("MONITOR_INTERVAL_SEC", "15"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
+# ضبط التوازي والدفعات لمسح الشموع
 SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "10"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
 
-DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
-_LAST_SIGNAL_AT: Dict[str, float] = {}  # لكل رمز آخر وقت إرسال
-
-# ===== حالة المخاطر اليومية (R) =====
+# مخاطر V2
 RISK_STATE_FILE = Path("risk_state.json")
 MAX_DAILY_LOSS_R = float(os.getenv("MAX_DAILY_LOSS_R", "2.0"))
 MAX_LOSSES_STREAK = int(os.getenv("MAX_LOSSES_STREAK", "3"))
 COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "6"))
 
-# هيكل: {"date":"YYYY-MM-DD", "r_sum": float, "losses_streak": int, "notified_loss": bool, "notified_gain": bool}
-def load_risk_state() -> dict:
-    if RISK_STATE_FILE.exists():
-        try: return json.loads(RISK_STATE_FILE.read_text(encoding="utf-8"))
-        except Exception: pass
-    return {"date": "", "r_sum": 0.0, "losses_streak": 0, "notified_loss": False, "notified_gain": False}
+AUDIT_IDS: Dict[int, str] = {}
 
-def save_risk_state(state: dict):
-    try: RISK_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception: pass
+# Dedupe نافذة لمنع تكرار الإشارات المتقاربة
+DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
+_LAST_SIGNAL_AT: Dict[str, float] = {}
 
-def reset_if_new_day(state: dict, tz_str: str = TIMEZONE) -> dict:
-    tz = pytz.timezone(tz_str)
-    today = datetime.now(tz).strftime("%Y-%m-%d")
-    if state.get("date") != today:
-        state = {"date": today, "r_sum": 0.0, "losses_streak": 0, "notified_loss": False, "notified_gain": False}
-    return state
+# === رسائل تحفيزية للصفقات + تتبّع وصول TP1 دون إغلاق
+MESSAGES_CACHE: Dict[int, Dict[str, str]] = {}
+HIT_TP1: Dict[int, bool] = {}
 
-# ===== مساعدات رسائل =====
-def _h(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+# ===== دعم تواصل خاص مع الأدمن =====
+SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")
 
-async def send_channel(text: str):
-    try:
-        await bot.send_message(TELEGRAM_CHANNEL_ID, text, disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"send_channel error: {e}")
+# ===== روابط دعوة القناة =====
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # إن وفّرت رابطًا ثابتًا (fallback)
 
-async def send_admins(text: str):
-    targets = list(ADMIN_USER_IDS or [])
-    for admin_id in targets:
-        try: await bot.send_message(admin_id, text, disable_web_page_preview=True)
-        except Exception as e: logger.warning(f"ADMIN NOTIFY ERROR: {e}")
+# إعدادات التجربة/التذكير/الإزالة
+TRIAL_INVITE_HOURS = int(os.getenv("TRIAL_INVITE_HOURS", "24"))  # مدة رابط التجربة
+KICK_CHECK_INTERVAL_SEC = int(os.getenv("KICK_CHECK_INTERVAL_SEC", "3600"))
+REMINDER_BEFORE_HOURS = int(os.getenv("REMINDER_BEFORE_HOURS", "4"))
+_SENT_SOON_REM: set[int] = set()
 
-# ===== روابط دعوة (اختياري) =====
-CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")
-TRIAL_INVITE_HOURS = int(os.getenv("TRIAL_INVITE_HOURS", "24"))
+# ===== إعداد خيار اليوم المجاني (هدية) للأدمن =====
+GIFT_ONE_DAY_HOURS = int(os.getenv("GIFT_ONE_DAY_HOURS", "24"))
 
+# --------- توليد روابط دعوة ----------
 async def get_channel_invite_link() -> Optional[str]:
+    """Fallback عام (يستخدم الرابط الثابت إن وُجد، وإلا يُولد رابطًا دائمًا)."""
     if CHANNEL_INVITE_LINK:
         return CHANNEL_INVITE_LINK
     try:
@@ -169,6 +185,7 @@ async def get_channel_invite_link() -> Optional[str]:
         return None
 
 async def get_trial_invite_link(user_id: int) -> Optional[str]:
+    """رابط دعوة للتجربة: ينتهي خلال TRIAL_INVITE_HOURS ومحدود لعضو واحد."""
     if CHANNEL_INVITE_LINK:
         return CHANNEL_INVITE_LINK
     try:
@@ -185,453 +202,1169 @@ async def get_trial_invite_link(user_id: int) -> Optional[str]:
         logger.warning(f"INVITE_LINK(TRIAL) create failed: {e}")
         return None
 
-# ===== نصوص ثابتة قصيرة =====
-def prices_text() -> str:
-    parts = [f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b>", f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>"]
-    wallet = f"\nمحفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>" if USDT_TRC20_WALLET else ""
-    return "الأسعار:\n" + "\n".join(parts) + wallet
-
-async def welcome_text() -> str:
-    return (
-        "👋 أهلاً بك في <b>الربح التراكمي</b>\n\n"
-        "🔔 إشارات لحظية + إدارة مخاطر + تقرير يومي.\n"
-        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
-        "✨ جرّب النسخة الكاملة مجانًا ليوم واحد عبر /trial\n\n" + prices_text()
-    )
-
-# ===== تنسيق الإشارة =====
-def format_signal(sig: dict) -> str:
-    lines = [
-        f"🚨 <b>إشارة دخول</b> • { _h(sig['symbol']) }",
-        f"⏱️ {_h(sig.get('timestamp',''))}",
-        f"👈 BUY @ <code>{sig['entry']}</code>",
-        f"🛡️ SL: <code>{sig['sl']}</code>",
-        f"🎯 TP1/TP2/TP3: <code>{sig['tp1']}</code> / <code>{sig['tp2']}</code> / <code>{sig['tp3']}</code>",
-        "—",
-        "📌 التزم بـ TP1/SL، والتعادل بعد TP1. لا مطاردة للشموع.",
-    ]
-    if sig.get("reasons"):
-        lines.append(f"🧠 أسباب: <i>{_h(', '.join(sig['reasons'][:6]))}</i>")
-    return "\n".join(lines)
-
-def format_tp_update(symbol: str, which: str, price: float, msg: str) -> str:
-    label = "TP1" if which == "tp1" else "TP2" if which == "tp2" else "TP3"
-    return f"{msg}\n\n<b>{_h(symbol)}</b> • {label} @ <code>{price}</code>"
-
-def format_sl_update(symbol: str, price: float, msg: str) -> str:
-    return f"{msg}\n\n<b>{_h(symbol)}</b> • SL @ <code>{price}</code>"
-
-# =====/start + إحالات =====
-BOT_USERNAME_CACHE: Optional[str] = None
-async def get_bot_username() -> str:
-    global BOT_USERNAME_CACHE
-    if BOT_USERNAME_CACHE:
-        return BOT_USERNAME_CACHE
-    me = await bot.get_me()
-    BOT_USERNAME_CACHE = me.username
-    return BOT_USERNAME_CACHE
-
-def parse_start_payload(text: str) -> Optional[str]:
-    # يدعم: /start ref=RCODE  أو  /start RCODE
+async def get_paid_invite_link(user_id: int) -> Optional[str]:
+    """رابط دائم للمشترك المدفوع (غير منتهي ولا محدود)."""
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
     try:
-        parts = (text or "").split(maxsplit=1)
-        if len(parts) < 2: return None
-        payload = parts[1].strip()
-        if payload.startswith("ref="):
-            return payload[4:].strip()
-        return payload
-    except Exception:
+        inv = await bot.create_chat_invite_link(
+            TELEGRAM_CHANNEL_ID,
+            name=f"paid_{user_id}",
+            creates_join_request=False,
+        )
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK(PAID) create failed: {e}")
         return None
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    uid = message.from_user.id
-    payload = parse_start_payload(message.text or "")
-    with get_session() as s:
-        # توليد كود إحالة للمستخدم إذا لا يملك
-        code = ensure_ref_code(s, uid)
-        # لو وصلنا مع كود إحالة صالح ولم يكن هذا المستخدم مرتبطًا من قبل
-        if payload:
-            if set_referred_by(s, uid, payload):
-                # زد عداد المُحيل
-                ref_u = get_user_by_ref_code(s, payload)
-                if ref_u:
-                    try:
-                        ref_u.referrals_count = int(ref_u.referrals_count or 0) + 1
-                        s.flush()
-                    except Exception:
-                        pass
 
-    text = await welcome_text()
-    # لو فيه كود إحالة خاص بالمستخدم نذكره مختصرًا
-    username = await get_bot_username()
-    my_link = f"https://t.me/{username}?start=ref={code}"
-    text += f"\n\n🔗 رابط إحالتك: <code>{_h(my_link)}</code>\n🎁 عند تفعيل صديقك اشتراكًا مدفوعًا ستحصل على <b>يوم مجاني</b> تلقائيًا."
-    await message.answer(text)
+def invite_kb(url: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📣 ادخل القناة الآن", url=url)
+    return kb.as_markup()
 
-@dp.message(Command("ref"))
-async def cmd_ref(message: Message):
-    uid = message.from_user.id
-    with get_session() as s:
-        code = ensure_ref_code(s, uid)
-    username = await get_bot_username()
-    my_link = f"https://t.me/{username}?start=ref={code}"
-    await message.answer(
-        "🎯 <b>نظام الإحالة</b>\n"
-        "أرسل هذا الرابط لأصدقائك. عند تفعيلهم خطة مدفوعة، تحصل على <b>يوم مجاني</b>:\n"
-        f"<code>{_h(my_link)}</code>"
-    )
+# ====== تدفق تفعيل يدوي للأدمن ======
+ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
 
-# ===== اشتراك تجريبي يوم واحد =====
-@dp.message(Command("trial"))
-async def cmd_trial(message: Message):
-    uid = message.from_user.id
-    with get_session() as s:
-        ok = start_trial(s, uid)
-    if not ok:
-        await message.answer("⚠️ لقد استخدمت التجربة من قبل. تواصل معنا للترقية إلى خطة مدفوعة.")
-        return
-    link = await get_trial_invite_link(uid)
-    if link:
-        await message.answer("✅ تم تفعيل التجربة ليوم واحد.\nادخل القناة:\n" + link)
-    else:
-        await message.answer("✅ تم تفعيل التجربة ليوم واحد.\nأرسل /id لاستلام رابط دعوة.")
+# ---------------------------
+# أدوات مساعدة
+# ---------------------------
 
-@dp.message(Command("id"))
-async def cmd_id(message: Message):
-    uid = message.from_user.id
-    with get_session() as s:
-        u = get_user_by_tg(s, uid)
-        active = is_active(s, uid)
-        end_at = u.end_at.strftime("%Y-%m-%d %H:%M UTC") if (u and u.end_at) else "—"
-    await message.answer(
-        f"🪪 حسابك: <code>{uid}</code>\n"
-        f"الحالة: {'✅ فعّال' if active else '❌ غير فعّال'}\n"
-        f"ينتهي: <b>{end_at}</b>"
-    )
+def _h(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
-    uid = message.from_user.id
-    with get_session() as s:
-        active = is_active(s, uid)
-        st24 = get_stats_24h(s)
-        st7  = get_stats_7d(s)
-    await message.answer(
-        f"📊 آخر 24 ساعة: إشارات {st24['signals']} | TP {st24['tp_total']} | SL {st24['sl']} | Win% {st24['win_rate']} | ΣR {st24['r_sum']}\n"
-        f"📈 7 أيام: TP {st7['tp_total']} | SL {st7['sl']} | Win% {st7['win_rate']} | ΣR {st7['r_sum']}\n"
-        f"الحالة: {'✅ فعّال' if active else '❌ غير فعّال'}"
-    )
 
-@dp.message(Command("pay"))
-async def cmd_pay(message: Message):
-    await message.answer("💳 الدفع/الترقية:\n" + prices_text())
+def _make_audit_id(symbol: str, entry: float, score: int) -> str:
+    base = f"{datetime.utcnow().strftime('%Y-%m-%d')}_{symbol}_{round(float(entry), 4)}_{int(score or 0)}"
+    h = hashlib.md5(base.encode()).hexdigest()[:6]
+    return f"{base}_{h}"
 
-# ===== أوامر أدمن بسيطة =====
-def _is_admin(uid: int) -> bool:
-    return uid in set(ADMIN_USER_IDS or [])
-
-@dp.message(Command("approve"))
-async def cmd_approve(message: Message):
-    """استخدام: /approve <user_id> <plan:2w|4w> [tx_hash]"""
-    if not _is_admin(message.from_user.id):
-        return
+async def send_channel(text: str):
     try:
-        _, u_id, plan, *rest = (message.text or "").split()
-        u_id = int(u_id)
-        txh = rest[0] if rest else None
-        days = SUB_DURATION_2W if plan.lower() == "2w" else SUB_DURATION_4W
-    except Exception:
-        await message.answer("صيغة: /approve <user_id> <2w|4w> [tx_hash]")
-        return
+        await bot.send_message(TELEGRAM_CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"send_channel error: {e}")
 
-    with get_session() as s:
-        new_end = approve_paid(s, u_id, plan.lower(), days, txh)
-        # مكافأة إحالة (إن وجدت) ولم تُمنح سابقًا
-        new_user = get_user_by_tg(s, u_id)
-        if new_user and new_user.referred_by and not new_user.referral_rewarded:
-            if REF_REWARD_MODE == "paid":  # نكافئ فقط عند خطة مدفوعة
-                ref_u = get_user_by_ref_code(s, new_user.referred_by)
-                if ref_u and ref_u.tg_user_id:
-                    grant_free_hours(s, ref_u.tg_user_id, GIFT_ONE_DAY_HOURS)
-                    mark_referral_rewarded(s, new_user.tg_user_id)
-                    try:
-                        asyncio.create_task(bot.send_message(ref_u.tg_user_id,
-                            f"🎁 مبروك! صديقك فعّل خطة مدفوعة — حصلت على يوم مجاني ✅"))
-                    except Exception:
-                        pass
+async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = None):
+    targets = list(ADMIN_USER_IDS)
+    if SUPPORT_CHAT_ID:
+        targets.append(SUPPORT_CHAT_ID)
+    for admin_id in targets:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
-    await message.answer(f"تمت الترقية. ينتهي اشتراك المستخدم في: <b>{new_end.strftime('%Y-%m-%d %H:%M UTC')}</b>")
 
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    if not _is_admin(message.from_user.id):
-        return
-    txt = message.text.partition(" ")[2].strip()
-    if not txt:
-        await message.answer("اكتب: /broadcast نص الرسالة")
-        return
-    # إرسالة إلى القناة + المشتركين الفعّالين
-    await send_channel(txt)
+def list_active_user_ids() -> list[int]:
     try:
         with get_session() as s:
             now = datetime.now(timezone.utc)
-            uids = [r[0] for r in s.query(User.tg_user_id).filter(User.end_at != None, User.end_at > now).all() if r[0]]
-        for uid in uids:
-            try: await bot.send_message(uid, txt, disable_web_page_preview=True)
-            except Exception: pass
-            await asyncio.sleep(0.02)
+            rows = s.query(User.tg_user_id).filter(User.end_at != None, User.end_at > now).all()  # noqa: E711
+            return [r[0] for r in rows if r[0]]
     except Exception as e:
-        logger.warning(f"broadcast warn: {e}")
+        logger.warning(f"list_active_user_ids warn: {e}")
+        return []
 
-# ===== التحميل الأولي لأسواق OKX =====
-async def load_okx_markets():
+async def notify_subscribers(text: str):
+    await send_channel(text)
+    uids = list_active_user_ids()
+    for uid in uids:
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
+            await asyncio.sleep(0.02)
+        except Exception:
+            pass
+
+
+def _contact_line() -> str:
+    parts = []
+    if SUPPORT_USERNAME:
+        parts.append(f"🔗 <a href='https://t.me/{SUPPORT_USERNAME}'>مراسلة الأدمن (خاص)</a>")
+    if SUPPORT_CHAT_ID:
+        parts.append(f"🆔 معرّف الأدمن: <code>{SUPPORT_CHAT_ID}</code>")
+    if SUPPORT_CHAT_ID and not SUPPORT_USERNAME:
+        parts.append(f"⚡️ افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
+    return "\n".join(parts) if parts else "—"
+
+
+async def welcome_text() -> str:
+    price_line = ""
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
+    wallet_line = ""
+    try:
+        if USDT_TRC20_WALLET:
+            wallet_line = f"محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n"
+    except Exception:
+        pass
+    return (
+        "👋 أهلاً بك في <b>عالم الفرص</b>\n\n"
+        "🔔 إشارات لحظية + تقرير يومي + إدارة مخاطر.\n"
+        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
+        "خطط الاشتراك:\n"
+        f"{price_line}"
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن لتفعيلك لمدة 2 أسابيع أو 4 أسابيع.\n\n"
+        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
+        f"{wallet_line}"
+        "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
+    )
+
+# ===== زر مراسلة الأدمن (خاص) =====
+
+def support_dm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if SUPPORT_USERNAME:
+        kb.button(text="💬 مراسلة الأدمن (خاص)", url=f"https://t.me/{SUPPORT_USERNAME}")
+    elif SUPPORT_CHAT_ID:
+        kb.button(text="💬 مراسلة الأدمن (خاص)", url=f"tg://user?id={SUPPORT_CHAT_ID}")
+    return kb.as_markup()
+
+# ===== تنسيق رسائل الإشارة/الإغلاق =====
+
+def format_signal_text_basic(sig: dict) -> str:
+    extra = ""
+    if "score" in sig or "regime" in sig:
+        extra = f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
+        if sig.get("reasons"):
+            extra += f"\n🧠 أسباب مختصرة: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+    tp3_line = f"\n🏁 الهدف 3: <code>{sig.get('tp3')}</code>" if sig.get("tp3") is not None else ""
+    return (
+        "🚀 <b>إشارة شراء جديدة!</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
+        f"💵 الدخول: <code>{sig['entry']}</code>\n"
+        f"📉 الوقف: <code>{sig['sl']}</code>\n"
+        f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
+        f"🏁 الهدف 2: <code>{sig['tp2']}</code>"
+        f"{tp3_line}\n"
+        f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
+        f"{extra}\n"
+        "━━━━━━━━━━━━━━\n"
+        "⚡️ <i>التزم بالخطة: مخاطرة ثابتة، لا تلحق بالسعر، والتزم بالوقف.</i>"
+    )
+
+
+def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
+    emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(getattr(t, "result", "") or "", "ℹ️")
+    result_label = {
+        "tp1": "تحقق الهدف 1 — خطوة ممتازة!",
+        "tp2": "تحقق الهدف 2 — إنجاز رائع!",
+        "sl": "وقف الخسارة — حماية رأس المال",
+    }.get(getattr(t, "result", "") or "", "إغلاق")
+    r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
+    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (getattr(t, "result", "") == "sl") else "🎯 إدارة الربح أهم من كثرة الصفقات."
+    return (
+        f"{emoji} <b>حالة صفقة</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔹 الأصل: <b>{_h(str(t.symbol))}</b>\n"
+        f"💵 الدخول: <code>{t.entry}</code>\n"
+        f"📉 الوقف: <code>{t.sl}</code>\n"
+        f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>\n"
+        f"📌 الحالة: <b>{result_label}</b>{r_line}\n"
+        f"⏰ (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"{tip}"
+    )
+
+# ---------------------------
+# إدارة المخاطر
+# ---------------------------
+
+def _load_risk_state() -> dict:
+    try:
+        if RISK_STATE_FILE.exists():
+            return json.loads(RISK_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"RISK_STATE load warn: {e}")
+    return {"date": datetime.now(timezone.utc).date().isoformat(), "r_today": 0.0, "loss_streak": 0, "cooldown_until": None}
+
+
+def _save_risk_state(state: dict):
+    try:
+        RISK_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"RISK_STATE save warn: {e}")
+
+
+def _reset_if_new_day(state: dict) -> dict:
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("date") != today:
+        state.update({"date": today, "r_today": 0.0, "loss_streak": 0, "cooldown_until": None})
+    return state
+
+
+def can_open_new_trade(s) -> Tuple[bool, str]:
+    state = _reset_if_new_day(_load_risk_state())
+    if state.get("cooldown_until"):
+        try:
+            until = datetime.fromisoformat(state["cooldown_until"])
+            if datetime.now(timezone.utc) < until:
+                return False, f"Cooldown حتى {until.isoformat()}"
+        except Exception:
+            pass
+    if float(state.get("r_today", 0.0)) <= -MAX_DAILY_LOSS_R:
+        return False, f"بلوغ حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
+    if count_open_trades(s) >= MAX_OPEN_TRADES:
+        return False, "بلوغ حد الصفقات المفتوحة"
+    return True, "OK"
+
+
+def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> float:
+    try:
+        R = float(t.entry) - float(t.sl)
+        r_multiple = 0.0 if R <= 0 else (float(exit_price) - float(t.entry)) / R
+    except Exception:
+        r_multiple = 0.0
+
+    state = _reset_if_new_day(_load_risk_state())
+    state["r_today"] = round(float(state.get("r_today", 0.0)) + r_multiple, 6)
+    state["loss_streak"] = int(state.get("loss_streak", 0)) + 1 if r_multiple < 0 else 0
+
+    cooldown_reason = None
+    if float(state["r_today"]) <= -MAX_DAILY_LOSS_R:
+        cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
+    if int(state["loss_streak"]) >= MAX_LOSSES_STREAK:
+        cooldown_reason = (cooldown_reason + " + " if cooldown_reason else "") + f"{MAX_LOSSES_STREAK} خسائر متتالية"
+
+    if cooldown_reason:
+        until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
+        state["cooldown_until"] = until.isoformat()
+        _save_risk_state(state)
+        asyncio.create_task(send_channel(
+            f"⏸️ <b>إيقاف مؤقت لفتح صفقات جديدة</b>\n"
+            f"السبب: {cooldown_reason}\n"
+            f"حتى: <code>{until.strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
+            "💡 <i>نحافظ على الذخيرة لفرص أعلى جودة.</i>"
+        ))
+        asyncio.create_task(send_admins(
+            f"⚠️ Cooldown مُفعل — {cooldown_reason}. حتى {until.isoformat()}"
+        ))
+    else:
+        _save_risk_state(state)
+    return r_multiple
+
+# ---------------------------
+# OKX
+# ---------------------------
+
+async def load_okx_markets_and_filter():
     global AVAILABLE_SYMBOLS
     try:
-        await RATE.wait()
-        markets = await asyncio.get_running_loop().run_in_executor(None, exchange.load_markets)
-        okx_syms = set(markets.keys())
-        # نحافظ على الرموز الموجودة التي يدعمها OKX
-        kept = [s for s in SYMBOLS if (s.replace("/", "/") in okx_syms)]
-        AVAILABLE_SYMBOLS = kept or [s for s in markets if s.endswith("/USDT")]
-        logger.info(f"OKX markets loaded. Using {len(AVAILABLE_SYMBOLS)} symbols.")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, exchange.load_markets)
+        mkts = set(exchange.markets.keys())
+        filtered = [s for s in SYMBOLS if s in mkts]
+        skipped = [s for s in SYMBOLS if s not in mkts]
+        AVAILABLE_SYMBOLS = filtered
+        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped {len(skipped)}: {skipped}")
     except Exception as e:
-        logger.error(f"load_okx_markets error: {e}")
-        AVAILABLE_SYMBOLS = SYMBOLS[:]
+        logger.exception(f"load_okx_markets error: {e}")
+        AVAILABLE_SYMBOLS = []
 
-# ===== جلب شموع =====
-async def fetch_ohlcv(symbol: str, timeframe: str = TIMEFRAME, limit: int = 400) -> Optional[List[List[float]]]:
-    try:
-        await RATE.wait()
-        o = await asyncio.get_running_loop().run_in_executor(None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit))
-        return o
-    except Exception:
+# ---------------------------
+# جلب البيانات/الأسعار
+# ---------------------------
+
+async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300):
+    for attempt in range(4):
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            )
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+            await asyncio.sleep(0.6 * (attempt + 1) + random.random() * 0.3)
+        except Exception as e:
+            logger.warning(f"FETCH_OHLCV ERROR {symbol}: {e}")
+            return []
+    return []
+
+async def fetch_ticker_price(symbol: str) -> float | None:
+    for attempt in range(3):
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+            price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
+            return float(price) if price is not None else None
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+            await asyncio.sleep(0.5 * (attempt + 1))
+        except Exception as e:
+            logger.warning(f"FETCH_TICKER ERROR {symbol}: {e}")
+            return None
+    return None
+
+# ---------------------------
+# Dedupe: منع تكرار الإشارات
+# ---------------------------
+
+_last_signal_at: Dict[str, float] = {}
+
+def _should_skip_duplicate(sig: dict) -> bool:
+    sym = sig.get("symbol")
+    if not sym:
+        return False
+    now = time.time()
+    last_ts = _last_signal_at.get(sym, 0)
+    if now - last_ts < DEDUPE_WINDOW_MIN * 60:
+        return True
+    _last_signal_at[sym] = now
+    return False
+
+# ---------------------------
+# فحص الإشارات (Batch + Concurrency)
+# ---------------------------
+
+SCAN_LOCK = asyncio.Lock()
+
+async def _send_signal_to_channel(sig: dict, audit_id: str | None) -> None:
+    await send_channel(format_signal_text_basic(sig))
+
+async def _scan_one_symbol(sym: str) -> Optional[dict]:
+    data = await fetch_ohlcv(sym)
+    if not data:
         return None
+    sig = check_signal(sym, data)
+    if not sig:
+        return None
+    return sig
 
-# ===== إرسال الإشارة =====
-async def publish_signal(sig: dict):
-    text = format_signal(sig)
-    await send_channel(text)
-    # حفظ في DB
-    with get_session() as s:
-        audit_id = hashlib.md5(f"{sig['symbol']}_{sig['entry']}_{sig['timestamp']}".encode()).hexdigest()[:8]
-        add_trade_sig(s, sig, audit_id=audit_id, qty=None)
+async def scan_and_dispatch():
+    if not AVAILABLE_SYMBOLS:
+        return
+    async with SCAN_LOCK:
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        async def _guarded_scan(sym: str) -> Optional[dict]:
+            async with sem:
+                try:
+                    return await _scan_one_symbol(sym)
+                except Exception as e:
+                    logger.warning(f"scan symbol error {sym}: {e}")
+                    return None
+        for i in range(0, len(AVAILABLE_SYMBOLS), SCAN_BATCH_SIZE):
+            batch = AVAILABLE_SYMBOLS[i:i+SCAN_BATCH_SIZE]
+            sigs = await asyncio.gather(*[_guarded_scan(s) for s in batch])
+            for sig in filter(None, sigs):
+                if _should_skip_duplicate(sig):
+                    logger.info(f"DEDUPE SKIP {sig['symbol']}")
+                    continue
+                with get_session() as s:
+                    allowed, reason = can_open_new_trade(s)
+                    if not allowed:
+                        logger.info(f"SKIP SIGNAL {sig['symbol']}: {reason}")
+                        continue
+                    try:
+                        if has_open_trade_on_symbol(s, sig["symbol"]):
+                            logger.info(f"SKIP {sig['symbol']}: already open position")
+                            continue
+                    except Exception:
+                        pass
+                    audit_id = _make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
+                    try:
+                        trade_id = add_trade_sig(s, sig, audit_id=audit_id, qty=None)
+                    except Exception as e:
+                        logger.exception(f"add_trade_sig error, fallback to add_trade: {e}")
+                        trade_id = add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
+                    AUDIT_IDS[trade_id] = audit_id
+                    # خزّن رسائل الصفقة (إن وُجدت في الإشارة)
+                    if sig.get("messages"):
+                        try:
+                            MESSAGES_CACHE[trade_id] = dict(sig["messages"])
+                        except Exception:
+                            pass
+                    try:
+                        # رسالة الإشارة الأساسية
+                        await _send_signal_to_channel(sig, audit_id)
+                        # رسالة "الدخول" التحفيزية (اختيارية)
+                        entry_msg = (sig.get("messages") or {}).get("entry")
+                        if entry_msg:
+                            await notify_subscribers(entry_msg)
+                        # ملاحظة قصيرة للمشتركين
+                        note = (
+                            "🚀 <b>إشارة جديدة وصلت!</b>\n"
+                            "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
+                        )
+                        uids = list_active_user_ids()
+                        for uid in uids:
+                            try:
+                                await bot.send_message(uid, note, parse_mode="HTML", disable_web_page_preview=True)
+                                await asyncio.sleep(0.02)
+                            except Exception:
+                                pass
+                        logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
+                    except Exception as e:
+                        logger.exception(f"SEND SIGNAL ERROR: {e}")
+            await asyncio.sleep(0.1)
 
-# ===== مراقبة الصفقات (TP/SL) =====
-async def monitor_trades_loop():
+async def loop_signals():
+    while True:
+        started = time.time()
+        try:
+            await scan_and_dispatch()
+        except Exception as e:
+            logger.exception(f"SCAN_LOOP ERROR: {e}")
+        elapsed = time.time() - started
+        sleep_for = max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed)
+        await asyncio.sleep(sleep_for)
+
+# ---------------------------
+# مراقبة الصفقات (TP1 إشعار فقط / TP2 & SL إغلاق)
+# ---------------------------
+
+async def monitor_open_trades():
+    from types import SimpleNamespace  # لرسالة TP1 التصويرية
     while True:
         try:
             with get_session() as s:
                 open_trades = s.query(Trade).filter(Trade.status == "open").all()
-            if not open_trades:
-                await asyncio.sleep(MONITOR_INTERVAL_SEC)
-                continue
+                for t in open_trades:
+                    price = await fetch_ticker_price(t.symbol)
+                    if price is None:
+                        continue
+                    hit_tp2 = price >= t.tp2
+                    hit_tp1 = price >= t.tp1
+                    hit_sl = price <= t.sl
 
-            tickers_needed = list({t.symbol for t in open_trades})
-            prices: Dict[str, float] = {}
-            for sym in tickers_needed:
-                try:
-                    await RATE.wait()
-                    ticker = await asyncio.get_running_loop().run_in_executor(None, lambda: exchange.fetch_ticker(sym))
-                    prices[sym] = float(ticker.get("last") or ticker.get("close") or 0.0)
-                except Exception:
-                    prices[sym] = 0.0
-                await asyncio.sleep(0.01)
+                    # الإغلاق عند SL أو TP2 فقط
+                    result, exit_px = None, None
+                    if hit_sl:
+                        result, exit_px = "sl", float(t.sl)
+                    elif hit_tp2:
+                        result, exit_px = "tp2", float(t.tp2)
 
-            # تحديث النتائج وإدارة R
-            state = reset_if_new_day(load_risk_state())
-            for t in open_trades:
-                p = prices.get(t.symbol) or 0.0
-                if p <= 0: continue
-                # تحقق TP/SL
-                hit = None
-                msg = None
-                if p >= float(t.tp2 or 0) and (t.tp_final and p >= float(t.tp_final)):
-                    hit = "tp2"  # سنسجّل TP2 كحد أدنى، وTP3 عندما نغلق نهائيًا
-                if t.tp_final and p >= float(t.tp_final or 0):
-                    hit = "tp3"
-                if p <= float(t.sl or 0):
-                    hit = "sl"
+                    if result:
+                        r_multiple = on_trade_closed_update_risk(t, result, exit_px)
+                        try:
+                            close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
+                        except Exception as e:
+                            logger.warning(f"close_trade warn: {e}")
+                        msg = format_close_text(t, r_multiple)
+                        # أضف الرسالة التحفيزية لو وُجدت
+                        try:
+                            extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
+                            if extra:
+                                msg += "\n\n" + extra
+                        except Exception:
+                            pass
+                        await notify_subscribers(msg)
+                        await asyncio.sleep(0.05)
+                        continue  # انتهت هذه الصفقة (أُغلقت)
 
-                if not hit:
-                    continue
-
-                # حساب R تقريبي
-                risk = max(float(t.entry) - float(t.sl), 1e-9)
-                r_multiple = 0.0
-                if hit == "tp1":
-                    r_multiple = (float(t.tp1) - float(t.entry)) / risk
-                elif hit == "tp2":
-                    r_multiple = (float(t.tp2) - float(t.entry)) / risk
-                elif hit == "tp3":
-                    r_multiple = (float(t.tp_final or t.tp2) - float(t.entry)) / risk
-                elif hit == "sl":
-                    r_multiple = -1.0
-
-                # إرسال
-                if hit == "sl":
-                    msg = format_sl_update(t.symbol, p, "🛑 تم ضرب وقف الخسارة — ننتقل للفرصة القادمة.")
-                elif hit == "tp3":
-                    msg = format_tp_update(t.symbol, "tp3", p, "🏁 TP3 — إغلاق جميل، مكسب كامل ✨")
-                elif hit == "tp2":
-                    msg = format_tp_update(t.symbol, "tp2", p, "🚀 TP2 — فعّلنا التريلينغ لحماية المكسب.")
-                else:
-                    msg = format_tp_update(t.symbol, "tp1", p, "🎯 TP1 — ثبّت جزءًا وانقل SL للتعادل.")
-
-                await send_channel(msg)
-
-                # إغلاق الصفقة وتحديث الحالة
-                with get_session() as s:
-                    close_trade(s, t.id, hit, exit_price=p, r_multiple=r_multiple)
-
-                # تحديث R اليومي
-                state["r_sum"] = float(state.get("r_sum", 0.0)) + float(r_multiple)
-                if hit == "sl":
-                    state["losses_streak"] = int(state.get("losses_streak", 0)) + 1
-                else:
-                    state["losses_streak"] = 0
-                save_risk_state(state)
-
-                # تنبيه آدمن عند خسارة يومية -R
-                if (state["r_sum"] <= -abs(MAX_DAILY_LOSS_R)) and not state.get("notified_loss", False):
-                    txt = (
-                        "⏸️ <b>إيقاف مؤقّت لفتح صفقات جديدة (تنبيه آدمن فقط)</b>\n"
-                        f"السبب: حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R\n"
-                        f"حتى: { (datetime.utcnow()+timedelta(hours=COOLDOWN_HOURS)).strftime('%Y-%m-%d %H:%M UTC') }\n"
-                        "💡 نحافظ على الذخيرة لفرص أعلى جودة."
-                    )
-                    if COOLDOWN_ALERT_ADMIN_ONLY:
-                        await send_admins(txt)
-                    else:
-                        await send_channel(txt)
-                    state["notified_loss"] = True
-                    save_risk_state(state)
-
-                # تهنئة +2R للمشتركين (بدون إيقاف إجباري)
-                if (state["r_sum"] >= 2.0) and not state.get("notified_gain", False):
-                    await send_channel(
-                        "🎉 <b>إنجاز يومي:</b> حققنا اليوم +2R تقريبًا.\n"
-                        "إذا اكتفيت، يكفيك هذا الربح — وإلا سنستمر في اقتناص الفرص لمن يرغب بالاستمرار."
-                    )
-                    state["notified_gain"] = True
-                    save_risk_state(state)
-
-            await asyncio.sleep(MONITOR_INTERVAL_SEC)
+                    # TP1 — إشعار مرة واحدة فقط، دون إغلاق فعلي
+                    if hit_tp1 and not HIT_TP1.get(t.id):
+                        HIT_TP1[t.id] = True
+                        tmp = SimpleNamespace(
+                            symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1"
+                        )
+                        msg = format_close_text(tmp, None)
+                        try:
+                            extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp1")
+                            if extra:
+                                msg += "\n\n" + extra
+                        except Exception:
+                            pass
+                        msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
+                        await notify_subscribers(msg)
+                        await asyncio.sleep(0.05)
         except Exception as e:
-            logger.exception(f"monitor_trades_loop error: {e}")
-            await asyncio.sleep(3)
+            logger.exception(f"MONITOR ERROR: {e}")
+        await asyncio.sleep(MONITOR_INTERVAL_SEC)
 
-# ===== ماسح الإشارات =====
-async def scan_symbols_once():
-    if not AVAILABLE_SYMBOLS:
-        return
-    # تقسيم دفعات
-    batches = [AVAILABLE_SYMBOLS[i:i+SCAN_BATCH_SIZE] for i in range(0, len(AVAILABLE_SYMBOLS), SCAN_BATCH_SIZE)]
-    for batch in batches:
-        await asyncio.gather(*[process_symbol(sym) for sym in batch])
+# ---------------------------
+# مهام الاشتراكات: إزالة المنتهين + تذكير قبل الانتهاء
+# ---------------------------
 
-async def process_symbol(symbol: str):
-    try:
-        # منع التكرار خلال نافذة
-        last_time = _LAST_SIGNAL_AT.get(symbol, 0.0)
-        if (time.time() - last_time) < (DEDUPE_WINDOW_MIN * 60):
-            return
-
-        ohlcv = await fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=240)
-        if not ohlcv or len(ohlcv) < 120:
-            return
-        # إطار أعلى 15m إن توفر
-        ohlcv_htf = await fetch_ohlcv(symbol, timeframe="15m", limit=240)
-
-        sig = check_signal(symbol, ohlcv, ohlcv_htf)
-        if not sig: return
-
-        # حد عدد الصفقات المفتوحة
-        with get_session() as s:
-            if count_open_trades(s) >= MAX_OPEN_TRADES:
-                return
-            if has_open_trade_on_symbol(s, symbol):
-                return
-
-        await publish_signal(sig)
-        _LAST_SIGNAL_AT[symbol] = time.time()
-    except Exception as e:
-        logger.debug(f"process_symbol({symbol}) warn: {e}")
-
-async def scan_loop():
-    await load_okx_markets()
+async def kick_expired_members_loop():
+    """إزالة من انتهت صلاحيتهم من القناة + رسالة خاصة لطيفة للترقية."""
     while True:
         try:
-            await scan_symbols_once()
+            now = datetime.now(timezone.utc)
+            with get_session() as s:
+                expired = (
+                    s.query(User)
+                    .filter(User.end_at != None, User.end_at <= now)  # noqa: E711
+                    .all()
+                )
+                for u in expired:
+                    try:
+                        member = await bot.get_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+                        status = getattr(member, "status", None)
+                        if status in ("member", "administrator", "creator"):
+                            await bot.ban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+                            await asyncio.sleep(0.3)
+                            await bot.unban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+                        # إشعار خاص
+                        try:
+                            await bot.send_message(
+                                u.tg_user_id,
+                                "⏳ انتهت صلاحية الوصول.\n"
+                                "✨ فعّل اشتراكك الآن للاستمرار باستلام الإشارات والتقرير اليومي.\n"
+                                "استخدم /start لطلب التفعيل أو مراسلة الأدمن.",
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.1)
+                    except Exception as e:
+                        logger.debug(f"kick_expired: {e}")
         except Exception as e:
-            logger.exception(f"scan_loop error: {e}")
-        await asyncio.sleep(SIGNAL_SCAN_INTERVAL_SEC)
+            logger.exception(f"KICK_EXPIRED_LOOP ERROR: {e}")
+        await asyncio.sleep(max(60, KICK_CHECK_INTERVAL_SEC))
 
-# ===== تقارير يومية + رسالة Pep يومية =====
+async def notify_trial_expiring_soon_loop():
+    """تذكير جميع المنتهين خلال REMINDER_BEFORE_HOURS القادمة (مرّة واحدة لكل مستخدم)."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            soon = now + timedelta(hours=REMINDER_BEFORE_HOURS)
+            with get_session() as s:
+                rows = (
+                    s.query(User)
+                    .filter(User.end_at != None, User.end_at > now, User.end_at <= soon)  # noqa: E711
+                    .all()
+                )
+                for u in rows:
+                    if u.tg_user_id in _SENT_SOON_REM:
+                        continue
+                    try:
+                        left_min = max(1, int((u.end_at - now).total_seconds() // 60))
+                        await bot.send_message(
+                            u.tg_user_id,
+                            f"⏰ تبقّى حوالي {left_min} دقيقة على نهاية صلاحيتك.\n"
+                            "✅ فعّل اشتراكك الآن لتستمر الإشارات بدون انقطاع. استخدم /start.",
+                        )
+                        _SENT_SOON_REM.add(u.tg_user_id)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.debug(f"notify_expiring_soon: {e}")
+        await asyncio.sleep(900)  # كل 15 دقيقة
+
+# ---------------------------
+# التقرير اليومي
+# ---------------------------
+
+def _report_card(stats_24: dict, stats_7d: dict) -> str:
+    return (
+        "📊 <b>التقرير اليومي — لقطة أداء مركّزة</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>آخر 24 ساعة</b>\n"
+        f"• إشارات: <b>{stats_24['signals']}</b> | صفقات مفتوحة الآن: <b>{stats_24['open']}</b>\n"
+        f"• محقق من الأهداف: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})\n"
+        f"• وقف خسارة: <b>{stats_24['sl']}</b>\n"
+        f"• معدل نجاح: <b>{stats_24['win_rate']}%</b>\n"
+        f"• صافي R تقريبي: <b>{stats_24['r_sum']}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>آخر 7 أيام</b>\n"
+        f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>\n"
+        f"• معدل نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "💡 <i>الخطة أهم من الضجيج: مخاطرة ثابتة + التزام بالأهداف.</i>"
+    )
+
+async def daily_report_once():
+    with get_session() as s:
+        stats_24 = get_stats_24h(s)
+        stats_7d = get_stats_7d(s)
+        await send_channel(_report_card(stats_24, stats_7d))
+        logger.info("Daily report sent.")
+
 async def daily_report_loop():
     tz = pytz.timezone(TIMEZONE)
-    logged_next = None
     while True:
+        now = datetime.now(tz)
+        target = now.replace(hour=DAILY_REPORT_HOUR_LOCAL, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target = target + timedelta(days=1)
+        delay = (target - now).total_seconds()
+        logger.info(f"Next daily report at {target.isoformat()} ({TIMEZONE})")
+        await asyncio.sleep(delay)
         try:
-            now = datetime.now(tz)
-            target = now.replace(hour=DAILY_REPORT_HOUR_LOCAL, minute=0, second=0, microsecond=0)
-            if now >= target:
-                target += timedelta(days=1)
-            if logged_next != target:
-                logger.info(f"Next daily report at {target.isoformat()} ({TIMEZONE})")
-                logged_next = target
-            await asyncio.sleep((target - now).total_seconds())
-            with get_session() as s:
-                st24 = get_stats_24h(s); st7 = get_stats_7d(s)
-            text = (
-                "🗓️ <b>التقرير اليومي</b>\n"
-                f"آخر 24 ساعة — إشارات: {st24['signals']} | TP: {st24['tp_total']} | SL: {st24['sl']} | Win%: {st24['win_rate']} | ΣR: {st24['r_sum']}\n"
-                f"7 أيام — TP: {st7['tp_total']} | SL: {st7['sl']} | Win%: {st7['win_rate']} | ΣR: {st7['r_sum']}"
-            )
-            await send_channel(text)
+            await daily_report_once()
         except Exception as e:
-            logger.exception(f"daily_report_loop error: {e}")
-            await asyncio.sleep(5)
+            logger.exception(f"DAILY_REPORT ERROR: {e} — retrying in 60s")
+            await asyncio.sleep(60)
+            try:
+                await daily_report_once()
+            except Exception as e2:
+                logger.exception(f"DAILY_REPORT RETRY FAILED: {e2}")
 
-async def pep_message_loop():
-    if not DAILY_PEP_MSG_ENABLED:
+# ---------------------------
+# أوامر المستخدم
+# ---------------------------
+
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔑 طلب اشتراك", callback_data="req_sub")
+    kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
+    kb.button(text="🧾 حالة اشتراكي", callback_data="status_btn")
+    kb.adjust(1)
+    await m.answer(await welcome_text(), parse_mode="HTML", reply_markup=kb.as_markup())
+    if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
+        await m.answer("تحتاج مساعدة؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
+
+@dp.callback_query(F.data == "status_btn")
+async def cb_status_btn(q: CallbackQuery):
+    with get_session() as s:
+        ok = is_active(s, q.from_user.id)
+    await q.message.answer(
+        "✅ <b>اشتراكك نشط.</b>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
+        if ok else
+        "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اطلب التفعيل وسيقوم الأدمن بإتمامه.",
+        parse_mode="HTML"
+    )
+    await q.answer()
+
+@dp.callback_query(F.data == "start_trial")
+async def cb_trial(q: CallbackQuery):
+    with get_session() as s:
+        ok = start_trial(s, q.from_user.id)
+    if ok:
+        await q.message.answer(
+            "✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁\n"
+            "🚀 استمتع بالإشارات والتقرير اليومي.",
+            parse_mode="HTML"
+        )
+        # إرسال دعوة للقناة (تجربة)
+        invite = await get_trial_invite_link(q.from_user.id)
+        if invite:
+            try:
+                await bot.send_message(q.from_user.id, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
+            except Exception as e:
+                logger.warning(f"SEND INVITE(TRIAL) ERROR: {e}")
+    else:
+        await q.message.answer(
+            "ℹ️ لقد استخدمت التجربة المجانية مسبقًا.\n"
+            "✨ يمكنك طلب الاشتراك الآن وسيقوم الأدمن بالتفعيل.",
+            parse_mode="HTML"
+        )
+    await q.answer()
+
+# أمر نصّي للتجربة
+@dp.message(Command("trial"))
+async def cmd_trial(m: Message):
+    with get_session() as s:
+        ok = start_trial(s, m.from_user.id)
+    if ok:
+        await m.answer("✅ تم تفعيل التجربة المجانية لمدة <b>يوم واحد</b> 🎁", parse_mode="HTML")
+        invite = await get_trial_invite_link(m.from_user.id)
+        if invite:
+            try:
+                await bot.send_message(m.from_user.id, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
+            except Exception as e:
+                logger.warning(f"SEND INVITE(TRIAL CMD) ERROR: {e}")
+    else:
+        await m.answer("ℹ️ لقد استخدمت التجربة المجانية مسبقًا.", parse_mode="HTML")
+
+# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن + إرشاد دفع للمستخدم ===
+@dp.callback_query(F.data == "req_sub")
+async def cb_req_sub(q: CallbackQuery):
+    u = q.from_user
+    uid = u.id
+    uname = (u.username and f"@{u.username}") or (u.full_name or "")
+    user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
+
+    # إشعار للأدمن مع أزرار الموافقة/الرفض + يوم مجاني
+    kb_admin = InlineKeyboardBuilder()
+    kb_admin.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
+    kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
+    kb_admin.button(text="🎁 تفعيل يوم مجاني (gift1d)", callback_data=f"approve_inline:{uid}:gift1d")
+    kb_admin.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
+    # (اختياري) زر مراسلة المستخدم مباشرة
+    kb_admin.button(text="👤 مراسلة المستخدم", url=f"tg://user?id={uid}")
+    kb_admin.adjust(1)
+
+    await send_admins(
+        "🔔 <b>طلب اشتراك جديد</b>\n" f"المستخدم: {user_line}\n" "اختر نوع التفعيل:",
+        reply_markup=kb_admin.as_markup(),
+    )
+
+    # رسالة للمستخدم: الأسعار + عنوان المحفظة + زر مراسلة الأدمن
+    price_line = ""
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
+    wallet_line = ""
+    try:
+        if USDT_TRC20_WALLET:
+            wallet_line = f"💳 محفظة USDT (TRC20):\n<code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
+    except Exception:
+        pass
+    await q.message.answer(
+        "📩 تم إرسال طلبك للأدمن.\n"
+        "يرجى التحويل ثم مراسلة الأدمن لتأكيد التفعيل.\n\n"
+        "الخطط:\n"
+        f"{price_line}"
+        f"{wallet_line}"
+        "بعد التأكيد ستستلم رابط الدخول للقناة تلقائيًا.",
+        parse_mode="HTML",
+        reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None,
+    )
+    await q.answer()
+
+# موافقات الأدمن السريعة من إشعار "طلب اشتراك"
+@dp.callback_query(F.data.startswith("approve_inline:"))
+async def cb_approve_inline(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    try:
+        _, uid_str, plan = q.data.split(":")
+        uid = int(uid_str)
+        if plan not in ("2w", "4w", "gift1d"):
+            return await q.answer("خطة غير صالحة.", show_alert=True)
+
+        # تحديد المدة
+        if plan == "2w":
+            dur = SUB_DURATION_2W
+        elif plan == "4w":
+            dur = SUB_DURATION_4W
+        else:  # gift1d
+            dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
+
+        with get_session() as s:
+            end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
+
+        await q.message.answer(
+            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
+            f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+            parse_mode="HTML",
+        )
+
+        # إرسال رابط دعوة للمستخدم
+        invite = await get_paid_invite_link(uid)
+        try:
+            if invite:
+                title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                await bot.send_message(uid, title, reply_markup=invite_kb(invite))
+            else:
+                await bot.send_message(
+                    uid,
+                    "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning(f"USER DM/INVITE ERROR: {e}")
+        await q.answer("تم.")
+    except Exception as e:
+        logger.exception(f"APPROVE_INLINE ERROR: {e}")
+        await q.answer("خطأ أثناء التفعيل.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("reject_inline:"))
+async def cb_reject_inline(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    try:
+        _, uid_str = q.data.split(":")
+        uid = int(uid_str)
+        await q.message.answer(f"❌ تم رفض طلب الاشتراك للمستخدم <code>{uid}</code>.", parse_mode="HTML")
+        try:
+            await bot.send_message(uid, "ℹ️ تم رفض طلب الاشتراك. تواصل مع الأدمن للتفاصيل.", parse_mode="HTML")
+        except Exception:
+            pass
+        await q.answer("تم.")
+    except Exception as e:
+        logger.exception(f"REJECT_INLINE ERROR: {e}")
+        await q.answer("خطأ أثناء الرفض.", show_alert=True)
+
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    text = (
+        "🤖 <b>أوامر المستخدم</b>\n"
+        "• <code>/start</code> – البداية والقائمة الرئيسية\n"
+        "• <code>/trial</code> – تجربة مجانية ليوم\n"
+        "• <code>/status</code> – حالة الاشتراك\n"
+        "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
+        "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
+    )
+    await m.answer(text, parse_mode="HTML")
+
+@dp.message(Command("status"))
+async def cmd_status(m: Message):
+    with get_session() as s:
+        ok = is_active(s, m.from_user.id)
+    await m.answer(
+        "✅ <b>اشتراكك نشط.</b>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
+        if ok else
+        "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اطلب التفعيل وسيقوم الأدمن بإتمامه.",
+        parse_mode="HTML",
+    )
+
+# ---------------------------
+# أوامر الأدمن
+# ---------------------------
+
+@dp.message(Command("admin_help"))
+async def cmd_admin_help(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
         return
-    tz = pytz.timezone(TIMEZONE)
-    last_sent_date = ""
+    txt = (
+        "🛠️ <b>أوامر الأدمن</b>\n"
+        "• <code>/admin</code> – لوحة الأزرار\n"
+        "• <code>/approve &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code> – تفعيل مباشر\n"
+        "• <code>/activate &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code> – مرادف\n"
+        "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية للمشتركين النشطين\n"
+        "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
+        "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري"
+    )
+    await m.answer(txt, parse_mode="HTML")
+
+@dp.message(Command("admin"))
+async def cmd_admin(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ تفعيل اشتراك يدوي (إدخال user_id)", callback_data="admin_manual")
+    kb.button(text="ℹ️ أوامر الأدمن", callback_data="admin_help_btn")
+    kb.adjust(1)
+    await m.answer("لوحة الأدمن:", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "admin_help_btn")
+async def cb_admin_help_btn(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_USER_IDS:
+        return await q.answer()
+    await cmd_admin_help(q.message)
+    await q.answer()
+
+@dp.callback_query(F.data == "admin_manual")
+async def cb_admin_manual(q: CallbackQuery):
+    aid = q.from_user.id
+    if aid not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    ADMIN_FLOW[aid] = {"stage": "await_user"}
+    await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
+    await q.answer()
+
+@dp.message(F.text)
+async def admin_manual_router(m: Message):
+    aid = m.from_user.id
+    flow = ADMIN_FLOW.get(aid)
+    if not flow or aid not in ADMIN_USER_IDS:
+        return
+    stage = flow.get("stage")
+
+    if stage == "await_user":
+        try:
+            uid = int(m.text.strip())
+            flow["uid"] = uid
+            flow["stage"] = "await_plan"
+            kb = InlineKeyboardBuilder()
+            kb.button(text="تفعيل 2 أسابيع (2w)", callback_data="admin_plan:2w")
+            kb.button(text="تفعيل 4 أسابيع (4w)", callback_data="admin_plan:4w")
+            kb.button(text="🎁 تفعيل يوم مجاني (gift1d)", callback_data="admin_plan:gift1d")
+            kb.button(text="إلغاء", callback_data="admin_cancel")
+            kb.adjust(1)
+            await m.answer(f"تم استلام user_id: <code>{uid}</code>\nاختر الخطة:", parse_mode="HTML", reply_markup=kb.as_markup())
+        except Exception:
+            await m.answer("الرجاء إرسال رقم user_id صحيح (أرقام فقط).")
+        return
+
+    if stage == "await_ref":
+        ref = m.text.strip()
+        if ref.lower() in ("/skip", "skip", "تخطي", "تخطى"):
+            ref = None
+        uid = flow.get("uid"); plan = flow.get("plan")
+        if plan == "2w":
+            dur = SUB_DURATION_2W
+        elif plan == "4w":
+            dur = SUB_DURATION_4W
+        else:
+            dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
+        try:
+            with get_session() as s:
+                end_at = approve_paid(s, uid, plan, dur, tx_hash=ref)
+            ADMIN_FLOW.pop(aid, None)
+            await m.answer(
+                f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
+                f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+                parse_mode="HTML",
+            )
+            invite = await get_paid_invite_link(uid)
+            try:
+                if invite:
+                    title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                    await bot.send_message(uid, title, reply_markup=invite_kb(invite))
+                else:
+                    await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"USER DM ERROR: {e}")
+        except Exception as e:
+            ADMIN_FLOW.pop(aid, None)
+            await m.answer(f"❌ فشل التفعيل: {e}")
+        return
+
+@dp.callback_query(F.data.startswith("admin_plan:"))
+async def cb_admin_plan(q: CallbackQuery):
+    aid = q.from_user.id
+    if aid not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    flow = ADMIN_FLOW.get(aid)
+    if not flow or flow.get("stage") != "await_plan":
+        return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
+    plan = q.data.split(":", 1)[1]
+    if plan not in ("2w", "4w", "gift1d"):
+        return await q.answer("خطة غير صالحة.", show_alert=True)
+    flow["plan"] = plan
+    flow["stage"] = "await_ref"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="تخطي المرجع", callback_data="admin_skip_ref")
+    kb.button(text="إلغاء", callback_data="admin_cancel")
+    kb.adjust(1)
+    await q.message.answer(
+        "أرسل رقم مرجع (اختياري) لإرفاقه بالإيصال.\nأو اضغط «تخطي المرجع».",
+        reply_markup=kb.as_markup(),
+    )
+    await q.answer()
+
+@dp.callback_query(F.data == "admin_skip_ref")
+async def cb_admin_skip_ref(q: CallbackQuery):
+    aid = q.from_user.id
+    if aid not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    flow = ADMIN_FLOW.get(aid)
+    if not flow or flow.get("stage") != "await_ref":
+        return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
+    uid = flow.get("uid"); plan = flow.get("plan")
+    if plan == "2w":
+        dur = SUB_DURATION_2W
+    elif plan == "4w":
+        dur = SUB_DURATION_4W
+    else:
+        dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
+    try:
+        with get_session() as s:
+            end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
+        ADMIN_FLOW.pop(aid, None)
+        await q.message.answer(
+            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
+            f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
+            parse_mode="HTML",
+        )
+        invite = await get_paid_invite_link(uid)
+        try:
+            if invite:
+                title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                await bot.send_message(uid, title, reply_markup=invite_kb(invite))
+            else:
+                await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"USER DM ERROR: {e}")
+    except Exception as e:
+        ADMIN_FLOW.pop(aid, None)
+        await q.message.answer(f"❌ فشل التفعيل: {e}")
+    await q.answer("تم.")
+
+@dp.callback_query(F.data == "admin_cancel")
+async def cb_admin_cancel(q: CallbackQuery):
+    aid = q.from_user.id
+    if aid in ADMIN_FLOW:
+        ADMIN_FLOW.pop(aid, None)
+    await q.message.answer("تم إلغاء جلسة التفعيل اليدوي.")
+    await q.answer("تم.")
+
+@dp.message(Command("approve"))
+async def cmd_approve(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    parts = (m.text or "").strip().split()
+    if len(parts) not in (3, 4) or parts[2] not in ("2w", "4w", "gift1d"):
+        return await m.answer("استخدم: /approve <user_id> <2w|4w|gift1d> [reference]")
+    uid = int(parts[1]); plan = parts[2]
+    txh = parts[3] if len(parts) == 4 else None
+    if plan == "2w":
+        dur = SUB_DURATION_2W
+    elif plan == "4w":
+        dur = SUB_DURATION_4W
+    else:
+        dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
+    with get_session() as s:
+        end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
+    await m.answer(f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+    invite = await get_paid_invite_link(uid)
+    if invite:
+        try:
+            title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+            await bot.send_message(uid, title, reply_markup=invite_kb(invite))
+        except Exception as e:
+            logger.warning(f"SEND INVITE ERROR (/approve): {e}")
+
+@dp.message(Command("activate"))
+async def cmd_activate(m: Message):
+    await cmd_approve(m)
+
+@dp.message(Command("gift1d"))
+async def cmd_gift1d(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    parts = (m.text or "").strip().split()
+    if len(parts) != 2:
+        return await m.answer("استخدم: /gift1d <user_id>")
+    uid = int(parts[1])
+    with get_session() as s:
+        end_at = approve_paid(s, uid, "gift1d", timedelta(hours=GIFT_ONE_DAY_HOURS))
+    await m.answer(f"🎁 تم منح يوم مجاني للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
+    invite = await get_paid_invite_link(uid)
+    if invite:
+        try:
+            await bot.send_message(uid, "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:", reply_markup=invite_kb(invite))
+        except Exception as e:
+            logger.warning(f"SEND INVITE ERROR (/gift1d): {e}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    txt = m.text.partition(" ")[2].strip()
+    if not txt:
+        return await m.answer("استخدم: /broadcast <text>")
+    uids = list_active_user_ids(); sent = 0
+    for uid in uids:
+        try:
+            await bot.send_message(uid, txt, parse_mode="HTML", disable_web_page_preview=True)
+            sent += 1; await asyncio.sleep(0.02)
+        except Exception:
+            pass
+    await m.answer(f"تم الإرسال إلى {sent} مشترك.")
+
+@dp.message(Command("force_report"))
+async def cmd_force_report(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    with get_session() as s:
+        stats_24 = get_stats_24h(s); stats_7d = get_stats_7d(s)
+    await send_channel(_report_card(stats_24, stats_7d))
+    await m.answer("تم إرسال التقرير للقناة.")
+
+# ---------------------------
+# فحوصات التشغيل
+# ---------------------------
+
+async def check_channel_and_admin_dm():
+    ok = True
+    try:
+        chat = await bot.get_chat(TELEGRAM_CHANNEL_ID)
+        logger.info(f"CHANNEL OK: {chat.id} / {chat.title or chat.username or 'channel'}")
+    except Exception as e:
+        logger.error(f"CHANNEL CHECK FAILED: {e} — تأكد من إضافة البوت كمشرف وضبط TELEGRAM_CHANNEL_ID.")
+        ok = False
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, "✅ البوت يعمل الآن. 🚀", parse_mode="HTML")
+            logger.info(f"ADMIN DM OK: {admin_id}")
+        except Exception as e:
+            logger.warning(f"ADMIN DM FAILED for {admin_id}: {e}")
+    return ok
+
+# ---------------------------
+# Polling متين ضد انقطاعات الشبكة
+# ---------------------------
+
+async def resilient_polling():
+    """يشغّل polling مع إعادة محاولة تلقائية عند مشاكل الشبكة المؤقتة."""
+    delay = 5
     while True:
         try:
-            now = datetime.now(tz)
-            target = now.replace(hour=DAILY_PEP_MSG_HOUR_LOCAL, minute=0, second=0, microsecond=0)
-            if now >= target:
-                target += timedelta(days=1)
-            await asyncio.sleep(max((target - now).total_seconds(), 1))
-            today = target.strftime("%Y-%m-%d")
-            if today != last_sent_date:
-                await send_channel(DAILY_PEP_MSG_TEXT)
-                last_sent_date = today
+            await dp.start_polling(bot)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.exception(f"pep_message_loop error: {e}")
-            await asyncio.sleep(5)
+            logger.warning(f"Polling failed: {e} — retrying in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+        else:
+            delay = 5
+            await asyncio.sleep(3)
 
-# ===== الإقلاع =====
-async def on_startup():
-    init_db()
-    await load_okx_markets()
-    logger.info("Bot is ready.")
+# ---------------------------
+# التشغيل (تحسين قفل القائد: SIGTERM + إعادة محاولات)
+# ---------------------------
 
 async def main():
-    await on_startup()
-    # مهام خلفية
-    asyncio.create_task(scan_loop())
-    asyncio.create_task(monitor_trades_loop())
-    asyncio.create_task(daily_report_loop())
-    asyncio.create_task(pep_message_loop())
-    # polling مباشر (بدون webhook)
-    logger.info(f"Run polling for bot @{(await bot.get_me()).username}")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    init_db()
+    hb_task = None
+    holder = f"{SERVICE_NAME}:{os.getpid()}"
+
+    def _on_sigterm(*_):
+        try:
+            logger.info("SIGTERM received → releasing leader lock and shutting down…")
+            if ENABLE_DB_LOCK and release_leader_lock:
+                release_leader_lock(LEADER_LOCK_NAME, holder)
+        except Exception as e:
+            logger.warning(f"release_leader_lock on SIGTERM warn: {e}")
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
+
+    if ENABLE_DB_LOCK and acquire_or_steal_leader_lock:
+        got = False
+        for attempt in range(20):
+            ok = acquire_or_steal_leader_lock(LEADER_LOCK_NAME, holder, ttl_seconds=LEADER_TTL)
+            if ok:
+                got = True
+                break
+            wait_s = 15
+            logger.error(f"Another instance holds the leader DB lock. Retrying in {wait_s}s… (try {attempt+1})")
+            await asyncio.sleep(wait_s)
+        if not got:
+            logger.error("Timeout waiting for leader lock. Exiting.")
+            return
+
+        async def _leader_heartbeat_task(name: str, holder: str):
+            while True:
+                try:
+                    ok = heartbeat_leader_lock(name, holder)
+                    if not ok:
+                        logger.error("Leader lock lost! Exiting worker loop.")
+                        os._exit(1)
+                except Exception as e:
+                    logger.warning(f"Heartbeat error: {e}")
+                await asyncio.sleep(max(10, LEADER_TTL // 2))
+        hb_task = asyncio.create_task(_leader_heartbeat_task(LEADER_LOCK_NAME, holder))
+
+    await load_okx_markets_and_filter()
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted; starting polling.")
+    except Exception as e:
+        logger.warning(f"DELETE_WEBHOOK WARN: {e}")
+
+    await check_channel_and_admin_dm()
+
+    t1 = asyncio.create_task(resilient_polling())
+    t2 = asyncio.create_task(loop_signals())
+    t3 = asyncio.create_task(daily_report_loop())
+    t4 = asyncio.create_task(monitor_open_trades())
+    t5 = asyncio.create_task(kick_expired_members_loop())
+    t6 = asyncio.create_task(notify_trial_expiring_soon_loop())
+
+    try:
+        await asyncio.gather(t1, t2, t3, t4, t5, t6)
+    except TelegramConflictError:
+        logger.error("❌ Conflict: يبدو أن نسخة أخرى من البوت تعمل وتستخدم getUpdates. أوقف النسخة الأخرى أو غيّر التوكن.")
+        return
+    except Exception as e:
+        logger.exception(f"FATAL ERROR: {e}")
+        try:
+            await send_admins(f"❌ تعطل البوت: <code>{_h(str(e))}</code>")
+        except Exception:
+            pass
+        raise
+    finally:
+        if ENABLE_DB_LOCK and release_leader_lock:
+            try:
+                release_leader_lock(LEADER_LOCK_NAME, holder)
+                logger.info("Leader lock released.")
+            except Exception:
+                pass
+        if hb_task:
+            hb_task.cancel()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    asyncio.run(main())
