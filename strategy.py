@@ -76,24 +76,60 @@ MOTIVATION = {
 
 # ========= Engagement Mode (اختياري) =========
 # يزيد وتيرة الإشعارات بشكل منضبط عبر تخفيفات طفيفة ومحسوبة — دون تغيير القيم الأصلية أعلاه
-ENGAGEMENT_MODE = True            # شغّال افتراضيًا — يضبطه bot.py تلقائيًا
+ENGAGEMENT_MODE = False            # شغّال افتراضيًا حسب طلبك — أوقفه إلى False إن رغبت
 ENG_POLICY_OVERRIDE = True        # عند التفعيل: نجعل بوابة MACD/RSI "lenient" داخليًا فقط أثناء الفحص
 ENG_RVOL_MIN_HARD = 0.85          # أخف من 0.90 لفتح فرص أكثر قليلًا
 ENG_ATR_PCT_MIN   = 0.0012        # قبول ATR% أدنى قليلًا
 ENG_BREAKOUT_BUFFER = 0.0012      # هامش اختراق أخف
 ENG_HOLDOUT_BARS    = 1           # تكرار أسرع للإشارات بين الشموع
 
-# === Mode toggle helpers (يستعملها bot.py) ===
-def set_engagement_mode(value: bool) -> None:
-    global ENGAGEMENT_MODE
-    ENGAGEMENT_MODE = bool(value)
+# ========= Reliability Boost (Strict filters) =========
+STRICT_MODE = True                 # فعّل حزم الفلاتر التالية لرفع الثقة
+STRICT_EMA_STACK = True            # الترتيب: EMA9 > EMA21 > EMA50
+RVOL_MIN_STRICT = 1.05             # حد أدنى أعلى قليلًا للـ RVOL
+STRICT_BODY_PCT_MIN = 0.55         # جسم الشمعة >= 55% من المدى الحقيقي
+MAX_UPWICK_PCT = 0.35              # أقصى نسبة للذيل العلوي من المدى
+MTF_FILTER_ENABLED = True          # تأكيد إطار أعلى (مثلاً 15m) إن توفر
+MTF_REQUIRE_EMA_TREND = True       # EMA50↑ على الإطار الأعلى
 
-def get_mode_label() -> str:
-    return "تحفيزي" if ENGAGEMENT_MODE else "قياسي"
+# ---------- فلاتر الجودة/إطار أعلى ----------
+def candle_quality(row) -> bool:
+    o = float(row["open"]); c = float(row["close"]); h = float(row["high"]); l = float(row["low"]) 
+    tr = max(h - l, 1e-9)
+    body = abs(c - o)
+    upper_wick = h - max(c, o)
+    body_pct = body / tr
+    upwick_pct = upper_wick / tr
+    return (c > o) and (body_pct >= STRICT_BODY_PCT_MIN) and (upwick_pct <= MAX_UPWICK_PCT)
+
+def ema_stack_ok(row) -> bool:
+    return (float(row["ema9"]) > float(row["ema21"]) > float(row["ema50"]))
+
+def pass_mtf_filter(ohlcv_htf: List[list]) -> bool:
+    try:
+        dfh = pd.DataFrame(ohlcv_htf, columns=["timestamp","open","high","low","close","volume"])
+        for col in ["open","high","low","close","volume"]:
+            dfh[col] = pd.to_numeric(dfh[col], errors="coerce")
+        dfh = dfh.dropna().reset_index(drop=True)
+        if len(dfh) < 60:
+            return False
+        dfh = add_indicators(dfh)
+        closed_h = dfh.iloc[-2]
+        conds = []
+        conds.append(float(closed_h["close"]) > float(closed_h["ema50"]))
+        conds.append(float(closed_h["macd_hist"]) > 0)
+        conds.append(float(closed_h["rsi"]) > 50)
+        if MTF_REQUIRE_EMA_TREND:
+            conds.append(float(dfh["ema50"].diff(5).iloc[-2]) > 0)
+        return all(conds)
+    except Exception:
+        return False
 
 # ---------- مؤشرات ----------
+
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
+
 
 def rsi(series, period=14):
     d = series.diff()
@@ -104,6 +140,7 @@ def rsi(series, period=14):
     rs = ag / al
     return 100 - (100 / (1 + rs))
 
+
 def macd_cols(df, fast=12, slow=26, signal=9):
     df["ema_fast"] = ema(df["close"], fast)
     df["ema_slow"] = ema(df["close"], slow)
@@ -112,12 +149,14 @@ def macd_cols(df, fast=12, slow=26, signal=9):
     df["macd_hist"] = df["macd"] - df["macd_signal"]
     return df
 
+
 def atr_series(df, period=14):
     c = df["close"].shift(1)
     tr = pd.concat([(df["high"]-df["low"]).abs(),
                     (df["high"]-c).abs(),
                     (df["low"]-c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
+
 
 def add_indicators(df):
     df["ema9"]   = ema(df["close"], EMA_FAST)
@@ -131,6 +170,7 @@ def add_indicators(df):
     return df
 
 # ---------- أدوات S/R & Fibo ----------
+
 def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < window + 3:
         return None, None
@@ -142,6 +182,7 @@ def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
         return None, None
     return float(support), float(resistance)
 
+
 def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < lookback + 5:
         return None, None
@@ -151,6 +192,7 @@ def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
     if pd.isna(hhv) or pd.isna(llv) or hhv <= llv:
         return None, None
     return float(hhv), float(llv)
+
 
 def near_any_fib(price: float, hhv: float, llv: float, tol: float) -> Tuple[bool, str]:
     rng = hhv - llv
@@ -163,6 +205,7 @@ def near_any_fib(price: float, hhv: float, llv: float, tol: float) -> Tuple[bool
             return True, name
     return False, ""
 
+
 def detect_regime(df) -> str:
     c = df["close"]; e200 = df.get("ema200", None)
     if e200 is None or pd.isna(e200.iloc[-1]):
@@ -171,6 +214,7 @@ def detect_regime(df) -> str:
     return "trend" if (c.iloc[-1] > e200.iloc[-1] and e200.diff(10).iloc[-1] > 0) else "mean"
 
 # ---------- اختيار البروفايل تلقائيًا ----------
+
 def _decide_profile_from_df(df) -> str:
     closed = df.iloc[-2]
     price  = float(closed["close"])
@@ -192,6 +236,7 @@ def _decide_profile_from_df(df) -> str:
     if trend_ok and near_ema21:
         return "vpc3"
     return "msb3"
+
 
 def _build_targets(entry_price: float, atr_val: Optional[float], profile: str) -> Tuple[float, float, float, float]:
     atr = float(atr_val or 0.0)
@@ -224,6 +269,7 @@ def _build_targets(entry_price: float, atr_val: Optional[float], profile: str) -
     return float(sl), float(tp1), float(tp2), float(tp3)
 
 # ---------- MACD/RSI Gate ----------
+
 def macd_rsi_gate(prev_row, closed_row) -> Tuple[bool, list]:
     reasons = []
     rsi_now = float(closed_row["rsi"])
@@ -252,6 +298,7 @@ def macd_rsi_gate(prev_row, closed_row) -> Tuple[bool, list]:
     return ok, reasons
 
 # ---------- مولّد الإشارة ----------
+
 def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]] = None) -> Optional[Dict]:
     if not ohlcv or len(ohlcv) < 80:
         return None
@@ -298,11 +345,17 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
         return None
     if not ((float(closed["ema9"]) > float(closed["ema21"])) or (price > float(closed["ema50"]))):
         return None
+    if STRICT_MODE:
+        if STRICT_EMA_STACK and not ema_stack_ok(closed):
+            return None
+        if not candle_quality(closed):
+            return None
 
-    # RVOL
+    # RVول
     vma = float(closed["vol_ma20"]) if not pd.isna(closed["vol_ma20"]) else 0.0
     rvol = (float(closed["volume"]) / (vma + 1e-9)) if vma > 0 else 0.0
-    if rvol < eff_rvol_min:
+    eff_rvol_gate = max(eff_rvol_min, RVOL_MIN_STRICT) if STRICT_MODE else eff_rvol_min
+    if rvol < eff_rvol_gate:
         return None
 
     # MACD/RSI Gate — تبديل مؤقت للـ policy إن لزم
@@ -326,6 +379,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
     # اكتشاف النظام (للمعلومة)
     regime = detect_regime(df)
 
+    # فلتر إطار أعلى (إن توفرت بياناته)
+    if MTF_FILTER_ENABLED and ohlcv_htf:
+        if not pass_mtf_filter(ohlcv_htf):
+            return None
+
     # ===== منطق الدخول: اختراق أو ارتداد فيبو =====
     entry_ok = False
     entry_tag = ""
@@ -339,6 +397,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
             entry_ok = True
             entry_tag = "Breakout SR"
             reasons.append("Breakout SR")
+        elif not breakout_ok and near_res_block:
+            pass  # نكمل لاحقًا إلى بدائل أخرى
 
     # (ب) ارتداد في منطقة 0.382–0.618
     if not entry_ok and USE_FIB:
@@ -354,6 +414,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
 
     # (ج) مسار تعزيز الإشعارات (Fallback خفيف) — لا يعمل إلا مع ENGAGEMENT_MODE
     if not entry_ok and ENGAGEMENT_MODE:
+        # اختراق أخف بشرط زخم بسيط
         try:
             hhv_soft = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
             soft_break = price > hhv_soft * (1.0 + max(0.0009, eff_bb*0.8))
@@ -366,12 +427,13 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
             entry_tag = entry_tag or "Breakout (eng)"
             reasons.append("Engaged")
         else:
+            # أو قبول ارتداد فيبو مع شرط زخم أبسط
             if USE_FIB:
                 hhv3, llv3 = recent_swing(df, SWING_LOOKBACK)
                 if hhv3 and llv3:
                     near_fib2, which2 = near_any_fib(price, hhv3, llv3, FIB_TOL)
                     near_sup_block2 = sup is not None and price <= sup * (1 + SUP_BLOCK_NEAR)
-                    rsi_up_only = float(closed["rsi"]) > float(prev["rsi"])
+                    rsi_up_only = float(closed["rsi"]) > float(prev["rsi"])  # نكتفي بتحسّن RSI
                     if near_fib2 and rsi_up_only and not near_sup_block2:
                         entry_ok = True
                         entry_tag = entry_tag or (which2 + " (eng)")
@@ -412,7 +474,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
         "tp2":   MOTIVATION["tp2"].format(symbol=symbol),
         "tp3":   MOTIVATION["tp3"].format(symbol=symbol),
         "sl":    MOTIVATION["sl"].format(symbol=symbol),
-        "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎".format(symbol=symbol),
+        "time":  MOTIVATION["time"].format(symbol=symbol),
     }
 
     return {
