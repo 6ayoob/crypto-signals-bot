@@ -1,14 +1,8 @@
 # database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
-# متوافق مع bot.py الحالي:
-# ensure_ref_code / set_referred_by / get_user_by_tg / get_user_by_ref_code /
-# grant_free_hours / mark_referral_rewarded …إلخ
-#
-# ملاحظات:
-# - نحفظ كود الإحالة الخاص بكل مستخدم في users.ref_code.
-# - نحفظ كود المُحيل (وليس الـ id) في users.referred_by (نص).
-# - مرة واحدة فقط: users.referral_rewarded يمنع تكرار المكافأة لنفس المُحال.
-# - حقل users.referrals_count عدّاد بسيط (اختياري) إذا أحببت تحديثه من البوت.
-# - لا نمنح المكافأة تلقائيًا هنا؛ البوت يفعل ذلك عند approve_paid كما كتبت.
+# متوافق مع bot.py V2 + Leader Lock (TTL)
+# تحديثات مهمة:
+# - فهرس/قيد فريد على users.tg_user_id + تنظيف التكرارات آليًا قبل الإنشاء.
+# - تحسين تهيئة الـ logging بدون فرض basicConfig إذا كان مضبوطًا مسبقًا.
 
 import os
 import logging
@@ -47,7 +41,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 Base = declarative_base()
 
 # ---------------------------
-# Helpers زمنية
+# Helpers
 # ---------------------------
 def _utcnow():
     return datetime.now(timezone.utc)
@@ -63,24 +57,16 @@ def _as_aware(dt: datetime | None) -> datetime | None:
         return dt
 
 # ---------------------------
-# نماذج الجداول
+# النماذج (Models)
 # ---------------------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)
-
+    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)  # نجعلها فريدة عبر فهرس في الهجرة
     trial_used = Column(Boolean, default=False, nullable=False)
     end_at = Column(DateTime, nullable=True)             # UTC
-    plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w" | "gift1d"
+    plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w"
     last_tx_hash = Column(String(128), nullable=True)
-
-    # إحالات
-    ref_code = Column(String(32), index=True, unique=False, nullable=True)  # كود هذا المستخدم
-    referred_by = Column(String(32), index=True, unique=False, nullable=True)  # كود مُحيله
-    referral_rewarded = Column(Boolean, default=False, nullable=False)  # مُنحت مكافأة للمُحيل على هذا المستخدم؟
-    referrals_count = Column(Integer, default=0, nullable=False)  # عدّاد اختياري
-
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
@@ -94,23 +80,30 @@ class Trade(Base):
     sl    = Column(Float, nullable=False)
     tp1   = Column(Float, nullable=False)
     tp2   = Column(Float, nullable=False)
-    # إضافية
+    # إضافية V2
     tp_final   = Column(Float, nullable=True)
     audit_id   = Column(String(64), index=True, nullable=True)
     score      = Column(Integer, nullable=True)
     regime     = Column(String(16), nullable=True)
-    reasons    = Column(Text, nullable=True)           # CSV نصي
+    reasons    = Column(Text, nullable=True)           # JSON/CSV نصي
     qty        = Column(Float, nullable=True)
     exit_price = Column(Float, nullable=True)
     r_multiple = Column(Float, nullable=True)
     # حالة
     status = Column(String(8), default="open", index=True, nullable=False)  # open | closed
-    result = Column(String(8), nullable=True)  # tp1 | tp2 | tp3 | sl
+    result = Column(String(8), nullable=True)  # tp1 | tp2 | sl
     opened_at = Column(DateTime, default=_utcnow, nullable=False)
     closed_at = Column(DateTime, nullable=True)
     # created/updated
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+# قفل القيادة
+class Lock(Base):
+    __tablename__ = "locks"
+    name = Column(String(64), primary_key=True)
+    holder = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
 # ---------------------------
 # تهيئة + هجرة خفيفة
@@ -123,10 +116,6 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "end_at": "TIMESTAMPTZ",
             "plan": "VARCHAR(8)",
             "last_tx_hash": "VARCHAR(128)",
-            "ref_code": "VARCHAR(32)",
-            "referred_by": "VARCHAR(32)",
-            "referral_rewarded": "BOOLEAN DEFAULT FALSE",
-            "referrals_count": "INTEGER DEFAULT 0",
             "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         }
@@ -136,10 +125,6 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "end_at": "TIMESTAMP",
             "plan": "VARCHAR(8)",
             "last_tx_hash": "VARCHAR(128)",
-            "ref_code": "VARCHAR(32)",
-            "referred_by": "VARCHAR(32)",
-            "referral_rewarded": "BOOLEAN",
-            "referrals_count": "INTEGER",
             "created_at": "TIMESTAMP",
             "updated_at": "TIMESTAMP",
         }
@@ -186,30 +171,34 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
     return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'  # SQLite
 
 def _ensure_indexes(connection, dialect: str):
+    # مؤشرات عامة
     if dialect == "postgresql":
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
-        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_ref_code ON "users" (ref_code);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON "users" (referred_by);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
     else:
+        # SQLite لا يدعم IF NOT EXISTS لكل شيء، لكن لهذه المؤشرات يكفي
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);'))
-        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_ref_code ON users (ref_code);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON users (referred_by);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);'))
 
 def _dedupe_users_on_tg_user_id(connection, dialect: str):
+    """
+    يحذف النسخ المكررة لنفس tg_user_id (يُبقي الأقدم id فقط).
+    يُستدعى مرة واحدة قبل إنشاء الفهرس/القيد الفريد.
+    """
+    # اعثر على tg_user_id المكررة
     dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' \
         if dialect == "postgresql" else \
         'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
     result = connection.execute(text(dup_sql)).fetchall()
     dups = [r[0] for r in result if r[0] is not None]
     for tg_id in dups:
+        # احذف كل الصفوف الأحدث وأبقِ الأقدم
         if dialect == "postgresql":
             del_sql = '''
                 DELETE FROM "users"
@@ -227,6 +216,11 @@ def _dedupe_users_on_tg_user_id(connection, dialect: str):
         connection.execute(text(del_sql), {"tg": tg_id})
 
 def _ensure_unique_index_users_tg_user_id(connection, dialect: str):
+    """
+    ينشئ فهرسًا فريدًا على users(tg_user_id).
+    في Postgres نستخدم CREATE UNIQUE INDEX IF NOT EXISTS.
+    في SQLite نستخدم CREATE UNIQUE INDEX IF NOT EXISTS أيضًا.
+    """
     _dedupe_users_on_tg_user_id(connection, dialect)
     if dialect == "postgresql":
         connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);'))
@@ -235,20 +229,17 @@ def _ensure_unique_index_users_tg_user_id(connection, dialect: str):
 
 def _lightweight_migrate():
     Base.metadata.create_all(bind=engine)
+
     insp = inspect(engine)
     dialect = engine.dialect.name
 
     with engine.begin() as conn:
-        # users — تأكد من الأعمدة
+        # users
         try:
             cols_users = {c["name"] for c in insp.get_columns("users")}
         except Exception:
             cols_users = set()
-        required_users = [
-            "tg_user_id","trial_used","end_at","plan","last_tx_hash",
-            "ref_code","referred_by","referral_rewarded","referrals_count",
-            "created_at","updated_at"
-        ]
+        required_users = ["tg_user_id", "trial_used", "end_at", "plan", "last_tx_hash", "created_at", "updated_at"]
         for c in required_users:
             if c not in cols_users:
                 try:
@@ -264,16 +255,16 @@ def _lightweight_migrate():
             except Exception as e:
                 logger.warning(f"users.updated_at default/not null adjust failed: {e}")
 
-        # trades — تأكد من الأعمدة
+        # trades
         try:
             cols_trades = {c["name"] for c in insp.get_columns("trades")}
         except Exception:
             cols_trades = set()
         required_trades = [
-            "result","opened_at","closed_at","status",
-            "tp_final","audit_id","score","regime","reasons",
-            "qty","exit_price","r_multiple",
-            "created_at","updated_at"
+            "result", "opened_at", "closed_at", "status",
+            "tp_final", "audit_id", "score", "regime", "reasons",
+            "qty", "exit_price", "r_multiple",
+            "created_at", "updated_at",
         ]
         for c in required_trades:
             if c not in cols_trades:
@@ -282,12 +273,29 @@ def _lightweight_migrate():
                 except Exception as e:
                     logger.warning(f"ALTER trades ADD {c} failed: {e}")
 
-        # المؤشرات
+        if dialect == "postgresql":
+            try:
+                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "opened_at" SET DEFAULT NOW();'))
+                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "created_at" SET DEFAULT NOW();'))
+                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET DEFAULT NOW();'))
+                conn.execute(text('UPDATE "trades" SET "created_at" = COALESCE("created_at", NOW()) WHERE "created_at" IS NULL;'))
+                conn.execute(text('UPDATE "trades" SET "updated_at" = COALESCE("updated_at", "created_at");'))
+                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "created_at" SET NOT NULL;'))
+                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET NOT NULL;'))
+            except Exception as e:
+                logger.warning(f"trades created/updated defaults adjust failed: {e}")
+
+        # مؤشرات عامة
         try:
             _ensure_indexes(conn, dialect)
-            _ensure_unique_index_users_tg_user_id(conn, dialect)
         except Exception as e:
             logger.warning(f"CREATE INDEX failed: {e}")
+
+        # الفهرس/القيد الفريد على users.tg_user_id (مع تنظيف التكرارات)
+        try:
+            _ensure_unique_index_users_tg_user_id(conn, dialect)
+        except Exception as e:
+            logger.warning(f"Ensure unique users.tg_user_id failed: {e}")
 
 def init_db():
     try:
@@ -313,95 +321,35 @@ def get_session():
         s.close()
 
 # ---------------------------
-# وظائف إحالة مطلوبة من bot.py
-# ---------------------------
-_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # بدون 0 O I لتجنب اللبس
-
-def _b32(n: int) -> str:
-    if n <= 0:
-        return "2"
-    out = []
-    base = len(_ALPHABET)
-    while n > 0:
-        n, r = divmod(n, base)
-        out.append(_ALPHABET[r])
-    return "".join(reversed(out))[-8:]
-
-def _gen_ref_code_for(tg_user_id: int) -> str:
-    return f"R{_b32(abs(int(tg_user_id or 0)))}"
-
-def get_user_by_tg(s, tg_user_id: int) -> User | None:
-    return s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
-
-def get_user_by_ref_code(s, code: str) -> User | None:
-    return s.execute(select(User).where(User.ref_code == (code or "").upper())).scalar_one_or_none()
-
-def ensure_ref_code(s, tg_user_id: int) -> str:
-    u = get_user_by_tg(s, tg_user_id)
-    if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=False)
-        s.add(u); s.flush()
-    if not u.ref_code:
-        u.ref_code = _gen_ref_code_for(tg_user_id)
-        s.flush()
-    return u.ref_code
-
-def set_referred_by(s, tg_user_id: int, ref_code: str) -> bool:
-    """
-    يربط المستخدم بمُحيل عن طريق ref_code (مرة واحدة فقط).
-    يعيد True إذا تم الربط الآن.
-    """
-    if not ref_code:
-        return False
-    u = get_user_by_tg(s, tg_user_id)
-    if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=False)
-        s.add(u); s.flush()
-    if u.referred_by:
-        return False
-    code = ref_code.strip().upper()
-    # منع الإحالة الذاتية
-    my_code = ensure_ref_code(s, tg_user_id)
-    if code == my_code:
-        return False
-    # تحقق أن الكود موجود
-    ref_u = get_user_by_ref_code(s, code)
-    if not ref_u:
-        return False
-    u.referred_by = code
-    s.flush()
-    return True
-
-def grant_free_hours(s, tg_user_id: int, hours: int) -> datetime:
-    u = get_user_by_tg(s, tg_user_id)
-    if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=False)
-        s.add(u); s.flush()
-    now = _utcnow()
-    base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
-    u.end_at = base + timedelta(hours=int(hours or 0))
-    s.flush()
-    return u.end_at
-
-def mark_referral_rewarded(s, tg_user_id: int) -> None:
-    u = get_user_by_tg(s, tg_user_id)
-    if not u:
-        return
-    u.referral_rewarded = True
-    s.flush()
-
-# ---------------------------
 # وظائف الاشتراك
 # ---------------------------
+def _get_or_create_user(s, tg_user_id: int) -> User:
+    # نتعامل مع احتمال وجود تكرارات قديمة
+    users = s.execute(
+        select(User).where(User.tg_user_id == tg_user_id).order_by(User.id.asc())
+    ).scalars().all()
+    if not users:
+        u = User(tg_user_id=tg_user_id, trial_used=False, end_at=None)
+        s.add(u); s.flush()
+        return u
+    # لو فيه أكثر من سجل، نحافظ على الأقدم ونحذف البقية
+    keep = users[0]
+    for extra in users[1:]:
+        try:
+            s.delete(extra)
+        except Exception:
+            pass
+    s.flush()
+    return keep
+
 def is_active(s, tg_user_id: int) -> bool:
-    u = get_user_by_tg(s, tg_user_id)
-    return bool(u and u.end_at and _as_aware(u.end_at) > _utcnow())
+    u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
+    if not u or not u.end_at:
+        return False
+    return _as_aware(u.end_at) > _utcnow()
 
 def start_trial(s, tg_user_id: int) -> bool:
-    u = get_user_by_tg(s, tg_user_id)
-    if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=False)
-        s.add(u); s.flush()
+    u = _get_or_create_user(s, tg_user_id)
     if u.trial_used:
         return False
     u.trial_used = True
@@ -410,14 +358,10 @@ def start_trial(s, tg_user_id: int) -> bool:
         base = _as_aware(u.end_at)
     u.end_at = base + timedelta(days=1)
     u.plan = "trial"
-    s.flush()
     return True
 
 def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str | None = None) -> datetime:
-    u = get_user_by_tg(s, tg_user_id)
-    if not u:
-        u = User(tg_user_id=tg_user_id, trial_used=False)
-        s.add(u); s.flush()
+    u = _get_or_create_user(s, tg_user_id)
     now = _utcnow()
     base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
     u.end_at = base + timedelta(days=int(duration_days))
@@ -476,6 +420,11 @@ def close_trade(s, trade_id: int, result: str, exit_price: float | None = None, 
         except Exception: pass
     s.flush()
 
+def list_active_user_ids(s) -> list[int]:
+    now = _utcnow()
+    rows = s.execute(select(User.tg_user_id).where(User.end_at != None, User.end_at > now)).all()
+    return [r[0] for r in rows if r[0]]
+
 # ---------------------------
 # إحصائيات التقارير
 # ---------------------------
@@ -510,3 +459,48 @@ def get_stats_24h(s) -> dict:
 
 def get_stats_7d(s) -> dict:
     return _period_stats(s, _utcnow() - timedelta(days=7))
+
+# ---------------------------
+# Leader Lock APIs
+# ---------------------------
+def try_acquire_leader_lock(name: str, holder: str) -> bool:
+    with SessionLocal() as s:
+        if s.get(Lock, name): return False
+        s.add(Lock(name=name, holder=holder))
+        try: s.commit(); return True
+        except IntegrityError:
+            s.rollback(); return False
+
+def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300) -> bool:
+    now = _utcnow(); expiry = now - timedelta(seconds=int(ttl_seconds))
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row is None:
+            s.add(Lock(name=name, holder=holder, created_at=now))
+            try: s.commit(); return True
+            except Exception: s.rollback(); return False
+        row_ct = _as_aware(row.created_at)
+        if row_ct is not None and row_ct < expiry:
+            row.holder = holder; row.created_at = now
+            try: s.commit(); return True
+            except Exception: s.rollback(); return False
+        return False
+
+def heartbeat_leader_lock(name: str, holder: str) -> bool:
+    now = _utcnow()
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row is None or row.holder != holder: return False
+        row.created_at = now
+        try: s.commit(); return True
+        except Exception: s.rollback(); return False
+
+def release_leader_lock(name: str, holder: str) -> None:
+    with SessionLocal() as s:
+        row = s.get(Lock, name)
+        if row and row.holder == holder:
+            s.delete(row)
+            try: s.commit()
+            except Exception: s.rollback()
+
+# انتهى
