@@ -1,6 +1,5 @@
-# symbols.py — قائمة 70 عملة (يمكن تعديلها) + توسعة تلقائية من OKX حتى N (افتراضي 100)
-# الميزة: تنظّف التكرارات، تطبّع الشكل AAA/USDT، تجلب أزواج OKX SPOT/USDT (مرة عند الإقلاع)،
-# وترتّبها تقريبيًا حسب السيولة ثم تُكمل قائمتك حتى العدد المطلوب.
+# symbols.py — قائمة 70 عملة + توسعة تلقائية من OKX حتى N (افتراضي 100)
+# يتحكم عبر متغيرات بيئة: SKIP_STABLES, SYMBOLS_BLACKLIST, SYMBOLS_WHITELIST, MIN_USD_VOL_24H
 # المتطلبات: requests
 
 import os, time, random, json
@@ -22,7 +21,7 @@ SYMBOLS = [
   # Gaming/Metaverse (8)
   "MANA/USDT", "AXS/USDT", "SAND/USDT", "CHZ/USDT", "ENJ/USDT",
   "GALA/USDT", "APE/USDT", "ILV/USDT",
-  # Layer 2 (5)
+  # Layer 2 (+ إضافات)
   "OP/USDT", "IMX/USDT", "LUNA/USDT", "ZIL/USDT", "ZRX/USDT", "SKL/USDT",
   # Meme Coins (5)
   "PEPE/USDT", "DOGE/USDT", "SHIB/USDT", "PUMP/USDT", "MEMEFI/USDT",
@@ -40,7 +39,7 @@ SYMBOLS = [
   "CAT/USDT", "ELON/USDT",
 ]
 
-# ===== خيارات التوسيع التلقائي (يمكن ضبطها بمتغيرات البيئة) =====
+# ===== خيارات التوسيع/الكاش (قائمة على الشبكة) =====
 AUTO_EXPAND_SYMBOLS = bool(int(os.getenv("AUTO_EXPAND_SYMBOLS", "1")))   # عطّلها بوضع 0
 TARGET_SYMBOLS_COUNT = int(os.getenv("TARGET_SYMBOLS_COUNT", "100"))     # الهدف: 100
 USE_SYMBOLS_CACHE    = bool(int(os.getenv("USE_SYMBOLS_CACHE", "1")))    # كاش ملف
@@ -88,8 +87,13 @@ def _okx_get_json(url: str, attempts: int = 3):
             time.sleep((2 ** a) + random.random())
     return None
 
+# سنقرأ بعض المفاتيح هنا (لا تعتمد على دوال مساعدة)
+MIN_USD_VOL_24H = float(os.getenv("MIN_USD_VOL_24H", "0"))
+SKIP_STABLES    = bool(int(os.getenv("SKIP_STABLES", "1")))
+_STABLES = {"USDC/USDT","DAI/USDT","TUSD/USDT","USDD/USDT","USDP/USDT"}
+
 def _fetch_okx_usdt_spot_ranked() -> List[str]:
-    """قائمة أزواج SPOT/USDT مرتبة تقريبياً حسب السيولة (vol/last)."""
+    """قائمة أزواج SPOT/USDT مرتبة تقريبياً حسب السيولة (vol*last أو volCcy24h)."""
     j = _okx_get_json(TICKERS_URL, attempts=3)
     if not j:
         return []
@@ -112,6 +116,8 @@ def _fetch_okx_usdt_spot_ranked() -> List[str]:
                 vol = float(it.get("vol24h", 0)) * float(it.get("last", 0))
             except:  # noqa
                 vol = 0.0
+        if MIN_USD_VOL_24H and vol < MIN_USD_VOL_24H:
+            continue
         sym = inst.replace("-", "/")
         rows.append((sym, vol))
     rows.sort(key=lambda x: x[1], reverse=True)
@@ -132,11 +138,26 @@ def _write_cache(symbols: List[str]) -> None:
     except Exception:
         pass
 
+# نقرأ القوائم السوداء/البيضاء بعد توفر _normalize_symbol
+_SYMBOLS_BLACKLIST = { _normalize_symbol(s) for s in os.getenv("SYMBOLS_BLACKLIST", "").split(",") if s.strip() }
+_SYMBOLS_WHITELIST = [ _normalize_symbol(s) for s in os.getenv("SYMBOLS_WHITELIST", "").split(",") if s.strip() ]
+
 def _expand_symbols_okx(existing_symbols: Iterable[str], target: int = 100) -> List[str]:
     """يحافظ على الموجود (إن كان مدعومًا على OKX) ثم يُكمّل تلقائيًا حتى يصل للهدف."""
     # طبّع + تصحيح أسماء بسيطة + أزل التكرارات
     base = [_alias_symbol(_normalize_symbol(s)) for s in existing_symbols]
     base = _dedupe_keep_order(base)
+
+    # قوائم بيضاء/سوداء
+    if _SYMBOLS_BLACKLIST:
+        base = [s for s in base if s not in _SYMBOLS_BLACKLIST]
+    # إدراج whitelist في المقدّمة (إن لم تكن موجودة)
+    for w in reversed(_SYMBOLS_WHITELIST):  # reverse حتى يبقى ترتيبها في النهاية كما كُتب
+        if w not in base:
+            base.insert(0, w)
+
+    if SKIP_STABLES:
+        base = [s for s in base if s not in _STABLES]
 
     okx_ranked = _fetch_okx_usdt_spot_ranked()
     if not okx_ranked:
@@ -155,8 +176,14 @@ def _expand_symbols_okx(existing_symbols: Iterable[str], target: int = 100) -> L
             print(f"[symbols] no OKX/no cache → using base ({len(out)})")
         return out
 
+    # طبّق أساليب التصفية على قائمة OKX
+    if _SYMBOLS_BLACKLIST:
+        okx_ranked = [s for s in okx_ranked if s not in _SYMBOLS_BLACKLIST]
+    if SKIP_STABLES:
+        okx_ranked = [s for s in okx_ranked if s not in _STABLES]
+
     okx_set = set(okx_ranked)
-    kept = [s for s in base if s in okx_set]      # احتفظ بما لديك إن كان مدعومًا
+    kept = [s for s in base if s in okx_set]           # احتفظ بما لديك إن كان مدعومًا
     extras = [s for s in okx_ranked if s not in kept]  # ثم أكمل من الأعلى سيولة
     out = (kept + extras)[:target]
 
