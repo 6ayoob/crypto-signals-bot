@@ -1,5 +1,4 @@
-# strategy.py — SCALP+ (AUTO Profiles + 3 TPs + Motivational messages)
-# + Engagement Mode (اختياري) لزيادة وتيرة الإشعارات دون المساس بالمنطق الجوهري
+# strategy.py — Auto S+/G3/S1 | S/R + Reversal Candles + Confluence
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
@@ -75,22 +74,21 @@ MOTIVATION = {
 }
 
 # ========= Engagement Mode (اختياري) =========
-# يزيد وتيرة الإشعارات بشكل منضبط عبر تخفيفات طفيفة ومحسوبة — دون تغيير القيم الأصلية أعلاه
-ENGAGEMENT_MODE = False            # شغّال افتراضيًا حسب طلبك — أوقفه إلى False إن رغبت
-ENG_POLICY_OVERRIDE = True        # عند التفعيل: نجعل بوابة MACD/RSI "lenient" داخليًا فقط أثناء الفحص
-ENG_RVOL_MIN_HARD = 0.85          # أخف من 0.90 لفتح فرص أكثر قليلًا
-ENG_ATR_PCT_MIN   = 0.0012        # قبول ATR% أدنى قليلًا
-ENG_BREAKOUT_BUFFER = 0.0012      # هامش اختراق أخف
-ENG_HOLDOUT_BARS    = 1           # تكرار أسرع للإشارات بين الشموع
+ENGAGEMENT_MODE = False
+ENG_POLICY_OVERRIDE = True
+ENG_RVOL_MIN_HARD = 0.85
+ENG_ATR_PCT_MIN   = 0.0012
+ENG_BREAKOUT_BUFFER = 0.0012
+ENG_HOLDOUT_BARS    = 1
 
 # ========= Reliability Boost (Strict filters) =========
-STRICT_MODE = True                 # فعّل حزم الفلاتر التالية لرفع الثقة
-STRICT_EMA_STACK = True            # الترتيب: EMA9 > EMA21 > EMA50
-RVOL_MIN_STRICT = 1.05             # حد أدنى أعلى قليلًا للـ RVOL
-STRICT_BODY_PCT_MIN = 0.55         # جسم الشمعة >= 55% من المدى الحقيقي
-MAX_UPWICK_PCT = 0.35              # أقصى نسبة للذيل العلوي من المدى
-MTF_FILTER_ENABLED = True          # تأكيد إطار أعلى (مثلاً 15m) إن توفر
-MTF_REQUIRE_EMA_TREND = True       # EMA50↑ على الإطار الأعلى
+STRICT_MODE = True
+STRICT_EMA_STACK = True
+RVOL_MIN_STRICT = 1.05
+STRICT_BODY_PCT_MIN = 0.55
+MAX_UPWICK_PCT = 0.35
+MTF_FILTER_ENABLED = True
+MTF_REQUIRE_EMA_TREND = True
 
 # ---------- فلاتر الجودة/إطار أعلى ----------
 def candle_quality(row) -> bool:
@@ -126,10 +124,8 @@ def pass_mtf_filter(ohlcv_htf: List[list]) -> bool:
         return False
 
 # ---------- مؤشرات ----------
-
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
-
 
 def rsi(series, period=14):
     d = series.diff()
@@ -140,7 +136,6 @@ def rsi(series, period=14):
     rs = ag / al
     return 100 - (100 / (1 + rs))
 
-
 def macd_cols(df, fast=12, slow=26, signal=9):
     df["ema_fast"] = ema(df["close"], fast)
     df["ema_slow"] = ema(df["close"], slow)
@@ -149,14 +144,12 @@ def macd_cols(df, fast=12, slow=26, signal=9):
     df["macd_hist"] = df["macd"] - df["macd_signal"]
     return df
 
-
 def atr_series(df, period=14):
     c = df["close"].shift(1)
     tr = pd.concat([(df["high"]-df["low"]).abs(),
                     (df["high"]-c).abs(),
                     (df["low"]-c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
-
 
 def add_indicators(df):
     df["ema9"]   = ema(df["close"], EMA_FAST)
@@ -170,7 +163,6 @@ def add_indicators(df):
     return df
 
 # ---------- أدوات S/R & Fibo ----------
-
 def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < window + 3:
         return None, None
@@ -182,7 +174,6 @@ def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
         return None, None
     return float(support), float(resistance)
 
-
 def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < lookback + 5:
         return None, None
@@ -193,7 +184,6 @@ def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
         return None, None
     return float(hhv), float(llv)
 
-
 def near_any_fib(price: float, hhv: float, llv: float, tol: float) -> Tuple[bool, str]:
     rng = hhv - llv
     if rng <= 0:
@@ -201,10 +191,9 @@ def near_any_fib(price: float, hhv: float, llv: float, tol: float) -> Tuple[bool
     fib382 = hhv - rng * 0.382
     fib618 = hhv - rng * 0.618
     for lvl, name in ((fib382, "Fib 0.382"), (fib618, "Fib 0.618")):
-        if abs(price - lvl) / lvl <= tol:
+        if abs(price - lvl) / max(lvl, 1e-9) <= tol:
             return True, name
     return False, ""
-
 
 def detect_regime(df) -> str:
     c = df["close"]; e200 = df.get("ema200", None)
@@ -213,8 +202,34 @@ def detect_regime(df) -> str:
         return "trend" if (c.iloc[-1] > e50.iloc[-1] and e50.diff(10).iloc[-1] > 0) else "mean"
     return "trend" if (c.iloc[-1] > e200.iloc[-1] and e200.diff(10).iloc[-1] > 0) else "mean"
 
-# ---------- اختيار البروفايل تلقائيًا ----------
+# ---------- شموع انعكاسية / سلوك ----------
+def is_bull_engulf(prev, cur) -> bool:
+    # جسم أخضر يبتلع جسم شمعة سابقة حمراء
+    return (float(cur["close"]) > float(cur["open"]) and
+            float(prev["close"]) < float(prev["open"]) and
+            (float(cur["close"]) - float(cur["open"])) > (abs(float(prev["close"]) - float(prev["open"])) * 0.9) and
+            float(cur["close"]) >= float(prev["open"]))
 
+def is_hammer(cur) -> bool:
+    h = float(cur["high"]); l = float(cur["low"]); o = float(cur["open"]); c = float(cur["close"])
+    tr = max(h - l, 1e-9); body = abs(c - o)
+    lower_wick = min(o, c) - l
+    # ذيل سفلي طويل، جسم صغير قرب الأعلى
+    return (c > o) and (lower_wick / tr >= 0.5) and (body / tr <= 0.35) and ((h - max(o, c)) / tr <= 0.15)
+
+def is_inside_break(pprev, prev, cur) -> bool:
+    # Inside Bar (prev داخل نطاق pprev) ثم اختراق لأعلى على cur
+    cond_inside = (float(prev["high"]) <= float(pprev["high"])) and (float(prev["low"]) >= float(pprev["low"]))
+    return cond_inside and (float(cur["high"]) > float(prev["high"])) and (float(cur["close"]) > float(prev["high"]))
+
+def swept_liquidity(prev, cur) -> bool:
+    # Sweep بسيط: لمس قاع سابق ثم إغلاق أعلى
+    return (float(cur["low"]) < float(prev["low"])) and (float(cur["close"]) > float(prev["close"]))
+
+def near_level(price: float, level: Optional[float], tol: float) -> bool:
+    return (level is not None) and (abs(price - level) / max(level, 1e-9) <= tol)
+
+# ---------- اختيار البروفايل تلقائيًا ----------
 def _decide_profile_from_df(df) -> str:
     closed = df.iloc[-2]
     price  = float(closed["close"])
@@ -237,11 +252,9 @@ def _decide_profile_from_df(df) -> str:
         return "vpc3"
     return "msb3"
 
-
 def _build_targets(entry_price: float, atr_val: Optional[float], profile: str) -> Tuple[float, float, float, float]:
     atr = float(atr_val or 0.0)
     p = (profile or "msb3").lower()
-
     if p == "dal3" and atr > 0:
         tp1 = entry_price + atr * DAL3_TP_ATR[0]
         tp2 = entry_price + atr * DAL3_TP_ATR[1]
@@ -264,12 +277,16 @@ def _build_targets(entry_price: float, atr_val: Optional[float], profile: str) -
             sl  = min(sl_atr, sl_pct)
         else:
             sl  = entry_price * (1 - FIXED_SL_PCT_MAX)
-
     tp1, tp2, tp3 = sorted([tp1, tp2, tp3])
     return float(sl), float(tp1), float(tp2), float(tp3)
 
-# ---------- MACD/RSI Gate ----------
+def _build_targets_s1(entry: float, sl: float) -> Tuple[float, float, float, float]:
+    # هدف واحد قريب ≈ 0.5R (نُرجِع tp1=tp2=tp3 لتوافق البوت: يغلق عند TP2)
+    R = max(entry - sl, 1e-9)
+    tp = entry + 0.5 * R
+    return float(sl), float(tp), float(tp), float(tp)
 
+# ---------- MACD/RSI Gate ----------
 def macd_rsi_gate(prev_row, closed_row) -> Tuple[bool, list]:
     reasons = []
     rsi_now = float(closed_row["rsi"])
@@ -298,7 +315,6 @@ def macd_rsi_gate(prev_row, closed_row) -> Tuple[bool, list]:
     return ok, reasons
 
 # ---------- مولّد الإشارة ----------
-
 def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]] = None) -> Optional[Dict]:
     if not ohlcv or len(ohlcv) < 80:
         return None
@@ -314,6 +330,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
     if len(df) < 60:
         return None
 
+    prev2  = df.iloc[-4] if len(df) >= 4 else df.iloc[-3]
     prev   = df.iloc[-3]
     closed = df.iloc[-2]
     cur_ts = int(closed["timestamp"])
@@ -340,7 +357,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
     if atr_pct < eff_atr_min or atr_pct > ATR_PCT_MAX:
         return None
 
-    # شمعة خضراء واتجاه خفيف
+    # اتجاه/جودة شمعة
     if not (price > float(closed["open"])):
         return None
     if not ((float(closed["ema9"]) > float(closed["ema21"])) or (price > float(closed["ema50"]))):
@@ -351,7 +368,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
         if not candle_quality(closed):
             return None
 
-    # RVول
+    # RVOL
     vma = float(closed["vol_ma20"]) if not pd.isna(closed["vol_ma20"]) else 0.0
     rvol = (float(closed["volume"]) / (vma + 1e-9)) if vma > 0 else 0.0
     eff_rvol_gate = max(eff_rvol_min, RVOL_MIN_STRICT) if STRICT_MODE else eff_rvol_min
@@ -384,90 +401,140 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
         if not pass_mtf_filter(ohlcv_htf):
             return None
 
-    # ===== منطق الدخول: اختراق أو ارتداد فيبو =====
-    entry_ok = False
-    entry_tag = ""
+    # ========= طبقة Price Action لاختيار الاستراتيجية =========
+    # شموع انعكاس
+    rev_hammer  = is_hammer(closed)
+    rev_engulf  = is_bull_engulf(prev, closed)
+    rev_insideb = is_inside_break(prev2, prev, closed)
+    had_sweep   = swept_liquidity(prev, closed)
 
-    # (أ) اختراق مقاومة + هامش
-    if res is not None:
-        hhv = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
-        breakout_ok = price > hhv * (1.0 + eff_bb)
-        near_res_block = (price >= res * (1 - RES_BLOCK_NEAR)) and (price <= res * (1 + RES_BLOCK_NEAR))
-        if breakout_ok and not near_res_block:
-            entry_ok = True
-            entry_tag = "Breakout SR"
-            reasons.append("Breakout SR")
-        elif not breakout_ok and near_res_block:
-            pass  # نكمل لاحقًا إلى بدائل أخرى
+    # قرب مستويات
+    near_res = near_level(price, res, RES_BLOCK_NEAR)
+    near_sup = near_level(price, sup, SUP_BLOCK_NEAR)
 
-    # (ب) ارتداد في منطقة 0.382–0.618
-    if not entry_ok and USE_FIB:
-        hhv2, llv2 = recent_swing(df, SWING_LOOKBACK)
-        if hhv2 and llv2:
-            near_fib, which = near_any_fib(price, hhv2, llv2, FIB_TOL)
-            near_sup_block = sup is not None and price <= sup * (1 + SUP_BLOCK_NEAR)
-            if near_fib and not near_sup_block:
-                if (float(closed["rsi"]) > float(prev["rsi"])) or (float(closed["macd_hist"]) > float(prev["macd_hist"])):
-                    entry_ok = True
-                    entry_tag = which
-                    reasons.append(which)
+    # اتجاه عام نظيف
+    ema50_slope_up = (float(df["ema50"].diff(5).iloc[-2]) > 0)
+    trend_ok = (price > float(closed["ema50"])) and ema50_slope_up and (float(closed["ema9"]) > float(closed["ema21"]))
 
-    # (ج) مسار تعزيز الإشعارات (Fallback خفيف) — لا يعمل إلا مع ENGAGEMENT_MODE
-    if not entry_ok and ENGAGEMENT_MODE:
-        # اختراق أخف بشرط زخم بسيط
+    # ============ S1: آمنة جدًا بهدف واحد ============
+    s1_ok = False
+    if trend_ok and (0.0015 <= atr_pct <= 0.0065) and (0.85 <= rvol <= 1.15):
+        # Break–Retest–Go هادئ قرب مقاومة تحوّلت لدعم + شمعة انعكاس + MSS بسيط (كسر قمة ميكرو)
+        mss = float(closed["high"]) > float(prev["high"])
+        s1_ok = (near_res or near_level(price, float(df.iloc[:-1]["high"].rolling(10, min_periods=5).max().iloc[-1]), 0.003)) \
+                and (rev_hammer or rev_engulf or rev_insideb) and mss
+
+    # ============ G3: آمنة بثلاثة أهداف قريبة ============
+    g3_ok = False
+    if not s1_ok and trend_ok:
+        # R→S أو HL عند مستوى واضح + شمعة انعكاسية + RVOL طبيعي
+        # تقريب R→S: كسر سابق لأعلى (hhv_prev) ثم رجوع للمستوى مع شمعة انعكاس
         try:
-            hhv_soft = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
-            soft_break = price > hhv_soft * (1.0 + max(0.0009, eff_bb*0.8))
+            hhv_prev = float(df.iloc[-8:-1]["high"].max())
         except Exception:
-            soft_break = False
-        momentum_ok = (float(closed.get("macd_hist", 0.0)) >= 0) or (rvol >= 1.2)
-        near_res_block = (res is not None) and (res * (1 - RES_BLOCK_NEAR) <= price <= res * (1 + RES_BLOCK_NEAR))
-        if soft_break and momentum_ok and not near_res_block:
-            entry_ok = True
-            entry_tag = entry_tag or "Breakout (eng)"
-            reasons.append("Engaged")
-        else:
-            # أو قبول ارتداد فيبو مع شرط زخم أبسط
-            if USE_FIB:
-                hhv3, llv3 = recent_swing(df, SWING_LOOKBACK)
-                if hhv3 and llv3:
-                    near_fib2, which2 = near_any_fib(price, hhv3, llv3, FIB_TOL)
-                    near_sup_block2 = sup is not None and price <= sup * (1 + SUP_BLOCK_NEAR)
-                    rsi_up_only = float(closed["rsi"]) > float(prev["rsi"])  # نكتفي بتحسّن RSI
-                    if near_fib2 and rsi_up_only and not near_sup_block2:
-                        entry_ok = True
-                        entry_tag = entry_tag or (which2 + " (eng)")
-                        reasons.append("Engaged")
+            hhv_prev = float(prev["high"])
+        broke_before = float(prev["close"]) > hhv_prev * (1.0 + eff_bb*0.5)
+        hl_ok = float(closed["low"]) > float(prev["low"])  # HL مبسّط
+        g3_ok = ((broke_before and near_res) or hl_ok) and (rev_hammer or rev_engulf or rev_insideb) and (0.9 <= rvol <= 1.3)
 
-    if not entry_ok:
+    # ============ S+: سكالب نشِط (المنطق الأصلي) ============
+    splus_ok = False
+    entry_tag = ""
+    if not (s1_ok or g3_ok):
+        # (أ) اختراق مقاومة + هامش
+        if res is not None:
+            hhv = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
+            breakout_ok = price > hhv * (1.0 + eff_bb)
+            near_res_block = (price >= res * (1 - RES_BLOCK_NEAR)) and (price <= res * (1 + RES_BLOCK_NEAR))
+            if breakout_ok and not near_res_block:
+                splus_ok = True
+                entry_tag = "Breakout SR"
+                reasons.append("Breakout SR")
+        # (ب) ارتداد فيبو 0.382/0.618 مع تحسّن زخم
+        if not splus_ok and USE_FIB:
+            hhv2, llv2 = recent_swing(df, SWING_LOOKBACK)
+            if hhv2 and llv2:
+                near_fib, which = near_any_fib(price, hhv2, llv2, FIB_TOL)
+                near_sup_block = sup is not None and price <= sup * (1 + SUP_BLOCK_NEAR)
+                if near_fib and not near_sup_block:
+                    if (float(closed["rsi"]) > float(prev["rsi"])) or (float(closed["macd_hist"]) > float(prev["macd_hist"])):
+                        splus_ok = True
+                        entry_tag = which
+                        reasons.append(which)
+        # (ج) مسار إنجيجمنت اختياري
+        if not splus_ok and ENGAGEMENT_MODE:
+            try:
+                hhv_soft = float(df.iloc[:-1]["high"].rolling(SR_WINDOW, min_periods=10).max().iloc[-1])
+                soft_break = price > hhv_soft * (1.0 + max(0.0009, eff_bb*0.8))
+            except Exception:
+                soft_break = False
+            momentum_ok = (float(closed.get("macd_hist", 0.0)) >= 0) or (rvol >= 1.2)
+            near_res_block = (res is not None) and (res * (1 - RES_BLOCK_NEAR) <= price <= res * (1 + RES_BLOCK_NEAR))
+            if soft_break and momentum_ok and not near_res_block:
+                splus_ok = True
+                entry_tag = entry_tag or "Breakout (eng)"
+                reasons.append("Engaged")
+
+    # لا شيء صالح
+    if not (s1_ok or g3_ok or splus_ok):
         return None
 
-    # ===== بروفايل وأهداف/وقف =====
+    # ========= بناء الأهداف/الوقف حسب الاستراتيجية =========
     profile = _decide_profile_from_df(df) if ENTRY_PROFILE == "auto" else ENTRY_PROFILE.lower()
-    sl, tp1, tp2, tp3 = _build_targets(price, atr, profile)
+    sl, tp1, tp2, tp3 = (0,0,0,0)
+    strategy_code = "S+"
+    max_bars_to_tp1 = MAX_BARS_TO_TP1
 
-    # حماية بالـ swing_low
-    try:
-        swing_low = float(df.iloc[:-1]["low"].rolling(6, min_periods=3).min().iloc[-1])
-        if swing_low < price:
-            sl = min(sl, swing_low)
-    except Exception:
-        pass
+    # SL حماية إضافية بسوينغ لو
+    def _protect_sl_with_swing(sl_in: float) -> float:
+        try:
+            swing_low = float(df.iloc[:-1]["low"].rolling(6, min_periods=3).min().iloc[-1])
+            if swing_low < price:
+                return min(sl_in, swing_low)
+        except Exception:
+            pass
+        return sl_in
 
-    if not (sl < price < tp1 < tp2 < tp3):
+    if s1_ok:
+        # S1: هدف واحد محافظ ~0.5R — نجعل tp1=tp2=tp3
+        base_sl = price - max(atr * 0.8, price * 0.002)  # حد أدنى ضيق قليلًا
+        sl = _protect_sl_with_swing(base_sl)
+        sl, tp1, tp2, tp3 = _build_targets_s1(price, sl)
+        strategy_code = "S1"
+        # وقت تعرّض أقصر لبلوغ TP1
+        max_bars_to_tp1 = min(MAX_BARS_TO_TP1, 5)
+
+    elif g3_ok:
+        # G3: ثلاث أهداف قريبة (نستخدم vpc3 افتراضيًا إن توافر ATR)
+        sl, tp1, tp2, tp3 = _build_targets(price, atr, "vpc3" if atr > 0 else "msb3")
+        strategy_code = "G3"
+
+    else:
+        # S+: كما هو
+        sl, tp1, tp2, tp3 = _build_targets(price, atr, profile)
+        strategy_code = "S+"
+
+    # تحقق ترتيب الأهداف
+    if not (sl < price < tp1 <= tp2 <= tp3):
         return None
 
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
     _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
-    # أسباب مختصرة
+    # أسباب/كونفلوينس
     if price > float(closed["ema50"]): reasons.append("Price>EMA50")
     if float(closed["ema9"]) > float(closed["ema21"]): reasons.append("EMA9>EMA21")
-    reasons.append(f"RVOL≥{round(eff_rvol_min,2)}")
-    reasons.append(entry_tag or profile.upper())
-    reasons = reasons[:6]
+    if rev_hammer: reasons.append("Hammer")
+    if rev_engulf: reasons.append("Bull Engulf")
+    if rev_insideb: reasons.append("InsideBreak")
+    if had_sweep: reasons.append("Sweep")
+    if strategy_code == "S1": reasons.append("MSS")
+    if near_res: reasons.append("R→S")
+    reasons.append(f"RVOL≥{round(max(eff_rvol_min, RVOL_MIN_STRICT if STRICT_MODE else eff_rvol_min),2)}")
+    if entry_tag: reasons.append(entry_tag)
+    confluence = reasons[:6]
 
-    # تجهيز رسائل تحفيزية ليستعملها كود التنفيذ/الإدارة
+    # رسائل تحفيزية
     messages = {
         "entry": MOTIVATION["entry"].format(symbol=symbol),
         "tp1":   MOTIVATION["tp1"].format(symbol=symbol),
@@ -479,7 +546,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
 
     return {
         "symbol": symbol,
-        "side": "BUY",
+        "side": "LONG",                      # توحيدًا مع تنسيق الرسائل في البوت
         "entry": round(price, 6),
         "sl":    round(sl, 6),
         "tp1":   round(tp1, 6),
@@ -489,11 +556,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
 
         "atr":   round(atr, 6),
         "r":     round(price - sl, 6),
-        "score": 65,
+        "score": 65,                         # يمكن معايرته لاحقًا
         "regime": regime,
-        "reasons": reasons,
+        "reasons": confluence,
+        "confluence": confluence,
 
-        # خصائص إضافية
         "features": {
             "rsi": float(closed["rsi"]),
             "rvol": rvol,
@@ -509,12 +576,13 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[List[list]]
         "partials": PARTIAL_FRACTIONS,
         "trail_after_tp2": TRAIL_AFTER_TP2,
         "trail_atr_mult": TRAIL_AFTER_TP2_ATR if TRAIL_AFTER_TP2 else None,
-        "max_bars_to_tp1": MAX_BARS_TO_TP1 if USE_MAX_BARS_TO_TP1 else None,
+        "max_bars_to_tp1": max_bars_to_tp1 if USE_MAX_BARS_TO_TP1 else None,
         "cooldown_after_sl_min": COOLDOWN_AFTER_SL_MIN,
         "cooldown_after_tp_min": COOLDOWN_AFTER_TP_MIN,
 
-        # بروفايل ورسائل
+        # بروفايل ورسائل + وسم الاستراتيجية
         "profile": profile,
+        "strategy_code": strategy_code,      # ← مهم لعرض الرمز في القناة
         "messages": messages,
 
         "timestamp": datetime.utcnow().isoformat()
