@@ -1,3 +1,4 @@
+# bot.py — تشغيل Aiogram v3 | اشتراكات + إشارات قناة فقط افتراضيًا + رسائل محفّزة منظمة
 import asyncio
 import json
 import hashlib
@@ -88,7 +89,7 @@ if ENABLE_DB_LOCK:
             ENABLE_DB_LOCK = False
 
 # -----------------------------------
-from strategy import check_signal  # NOTE: الاستراتيجية الآن أكثر ثقة (STRICT filters)
+from strategy import check_signal  # NOTE: لا نغيّر المنطق الداخلي
 from symbols import SYMBOLS
 
 # ---------------------------
@@ -100,6 +101,10 @@ logging.getLogger("aiogram").setLevel(logging.INFO)
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+# ===== مفاتيح سلوكية اختيارية =====
+# إرسال إشارات وتحديثات الصفقات بالخاص؟ (مغلق افتراضيًا تلبيةً لطلبك)
+SEND_SIGNAL_DM = (os.getenv("SEND_SIGNAL_DM", "0") == "1")
 
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
@@ -233,6 +238,8 @@ ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
 def _h(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+def _strategy_emoji(tag: str) -> str:
+    return {"S+": "🔥", "G3": "🛡️", "S1": "🔒"}.get(tag, "📈")
 
 def _make_audit_id(symbol: str, entry: float, score: int) -> str:
     base = f"{datetime.utcnow().strftime('%Y-%m-%d')}_{symbol}_{round(float(entry), 4)}_{int(score or 0)}"
@@ -255,7 +262,6 @@ async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = Non
         except Exception as e:
             logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
-
 def list_active_user_ids() -> list[int]:
     try:
         with get_session() as s:
@@ -267,15 +273,16 @@ def list_active_user_ids() -> list[int]:
         return []
 
 async def notify_subscribers(text: str):
+    """مُستخدم الآن للنشرات/التذكير العام فقط. الإشارات وتحديثات الصفقات تُرسل للقناة افتراضيًا."""
     await send_channel(text)
-    uids = list_active_user_ids()
-    for uid in uids:
-        try:
-            await bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
-            await asyncio.sleep(0.02)
-        except Exception:
-            pass
-
+    if SEND_SIGNAL_DM:
+        uids = list_active_user_ids()
+        for uid in uids:
+            try:
+                await bot.send_message(uid, text, parse_mode="HTML", disable_web_page_preview=True)
+                await asyncio.sleep(0.02)
+            except Exception:
+                pass
 
 def _contact_line() -> str:
     parts = []
@@ -286,7 +293,6 @@ def _contact_line() -> str:
     if SUPPORT_CHAT_ID and not SUPPORT_USERNAME:
         parts.append(f"⚡️ افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
     return "\n".join(parts) if parts else "—"
-
 
 async def welcome_text() -> str:
     price_line = ""
@@ -306,14 +312,13 @@ async def welcome_text() -> str:
         f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
         "خطط الاشتراك:\n"
         f"{price_line}"
-        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن لتفعيلك لمدة 2 أسابيع أو 4 أسابيع.\n\n"
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيصل طلبك للأدمن للتفعيل.\n\n"
         "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
         f"{wallet_line}"
         "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
     )
 
 # ===== زر مراسلة الأدمن (خاص) =====
-
 def support_dm_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     if SUPPORT_USERNAME:
@@ -323,29 +328,42 @@ def support_dm_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 # ===== تنسيق رسائل الإشارة/الإغلاق =====
-
 def format_signal_text_basic(sig: dict) -> str:
-    extra = ""
+    # يحاول التقاط رمز الاستراتيجية إن أرسله check_signal
+    tag = sig.get("strategy_code") or sig.get("strategy") or sig.get("tag")
+    side = (sig.get("side") or "LONG").upper()
+    symbol = _h(sig['symbol'])
+    header = ""
+    if tag:
+        header = f"{_strategy_emoji(tag)} <b>{_h(tag)}</b> | {side} | {symbol}"
+    else:
+        header = f"🚀 <b>إشارة {('شراء' if side=='LONG' else 'بيع')} جديدة!</b>\n🔹 الأصل: <b>{symbol}</b>"
+
+    extra_lines = []
     if "score" in sig or "regime" in sig:
-        extra = f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
-        if sig.get("reasons"):
-            extra += f"\n🧠 أسباب مختصرة: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+        extra_lines.append(f"📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>")
+    if sig.get("confluence") or sig.get("reasons"):
+        reasons = sig.get("confluence") or sig.get("reasons") or []
+        if isinstance(reasons, (list, tuple)):
+            reasons = ", ".join(reasons[:6])
+        extra_lines.append(f"🧠 Confluence: <i>{_h(str(reasons))}</i>")
+
     tp3_line = f"\n🏁 الهدف 3: <code>{sig.get('tp3')}</code>" if sig.get("tp3") is not None else ""
-    return (
-        "🚀 <b>إشارة شراء جديدة!</b>\n"
+    core = (
+        f"{header}\n"
         "━━━━━━━━━━━━━━\n"
-        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
         f"💵 الدخول: <code>{sig['entry']}</code>\n"
         f"📉 الوقف: <code>{sig['sl']}</code>\n"
         f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
         f"🏁 الهدف 2: <code>{sig['tp2']}</code>"
         f"{tp3_line}\n"
-        f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
-        f"{extra}\n"
+        f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>\n"
         "━━━━━━━━━━━━━━\n"
-        "⚡️ <i>التزم بالخطة: مخاطرة ثابتة، لا تلحق بالسعر، والتزم بالوقف.</i>"
+        "⚡️ <i>التزم بالخطة: مخاطرة ثابتة، لا تطارد الشمعة، واحمِ وقفك.</i>"
     )
-
+    if extra_lines:
+        core += "\n" + "\n".join(extra_lines)
+    return core
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
     emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(getattr(t, "result", "") or "", "ℹ️")
@@ -381,20 +399,17 @@ def _load_risk_state() -> dict:
         logger.warning(f"RISK_STATE load warn: {e}")
     return {"date": datetime.now(timezone.utc).date().isoformat(), "r_today": 0.0, "loss_streak": 0, "cooldown_until": None}
 
-
 def _save_risk_state(state: dict):
     try:
         RISK_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         logger.warning(f"RISK_STATE save warn: {e}")
 
-
 def _reset_if_new_day(state: dict) -> dict:
     today = datetime.now(timezone.utc).date().isoformat()
     if state.get("date") != today:
         state.update({"date": today, "r_today": 0.0, "loss_streak": 0, "cooldown_until": None})
     return state
-
 
 def can_open_new_trade(s) -> Tuple[bool, str]:
     state = _reset_if_new_day(_load_risk_state())
@@ -410,7 +425,6 @@ def can_open_new_trade(s) -> Tuple[bool, str]:
     if count_open_trades(s) >= MAX_OPEN_TRADES:
         return False, "بلوغ حد الصفقات المفتوحة"
     return True, "OK"
-
 
 def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> float:
     try:
@@ -570,31 +584,18 @@ async def scan_and_dispatch():
                         logger.exception(f"add_trade_sig error, fallback to add_trade: {e}")
                         trade_id = add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
                     AUDIT_IDS[trade_id] = audit_id
-                    # خزّن رسائل الصفقة (إن وُجدت في الإشارة)
                     if sig.get("messages"):
                         try:
                             MESSAGES_CACHE[trade_id] = dict(sig["messages"])
                         except Exception:
                             pass
                     try:
-                        # رسالة الإشارة الأساسية
+                        # 1) رسالة الإشارة الأساسية — للقناة فقط
                         await _send_signal_to_channel(sig, audit_id)
-                        # رسالة "الدخول" التحفيزية (اختيارية)
+                        # 2) رسالة دخول تحفيزية قصيرة (اختيارية) — للقناة فقط
                         entry_msg = (sig.get("messages") or {}).get("entry")
                         if entry_msg:
-                            await notify_subscribers(entry_msg)
-                        # ملاحظة قصيرة للمشتركين
-                        note = (
-                            "🚀 <b>إشارة جديدة وصلت!</b>\n"
-                            "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
-                        )
-                        uids = list_active_user_ids()
-                        for uid in uids:
-                            try:
-                                await bot.send_message(uid, note, parse_mode="HTML", disable_web_page_preview=True)
-                                await asyncio.sleep(0.02)
-                            except Exception:
-                                pass
+                            await send_channel(entry_msg)
                         logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
                     except Exception as e:
                         logger.exception(f"SEND SIGNAL ERROR: {e}")
@@ -643,14 +644,14 @@ async def monitor_open_trades():
                         except Exception as e:
                             logger.warning(f"close_trade warn: {e}")
                         msg = format_close_text(t, r_multiple)
-                        # أضف الرسالة التحفيزية لو وُجدت
                         try:
                             extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
                             if extra:
                                 msg += "\n\n" + extra
                         except Exception:
                             pass
-                        await notify_subscribers(msg)
+                        # للقناة فقط افتراضيًا
+                        await send_channel(msg)
                         await asyncio.sleep(0.05)
                         continue  # انتهت هذه الصفقة (أُغلقت)
 
@@ -668,7 +669,8 @@ async def monitor_open_trades():
                         except Exception:
                             pass
                         msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
-                        await notify_subscribers(msg)
+                        # للقناة فقط افتراضيًا
+                        await send_channel(msg)
                         await asyncio.sleep(0.05)
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
@@ -875,7 +877,6 @@ async def cb_req_sub(q: CallbackQuery):
     kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
     kb_admin.button(text="🎁 تفعيل يوم مجاني (gift1d)", callback_data=f"approve_inline:{uid}:gift1d")
     kb_admin.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
-    # (اختياري) زر مراسلة المستخدم مباشرة
     kb_admin.button(text="👤 مراسلة المستخدم", url=f"tg://user?id={uid}")
     kb_admin.adjust(1)
 
@@ -1222,14 +1223,9 @@ async def cmd_broadcast(m: Message):
     txt = m.text.partition(" ")[2].strip()
     if not txt:
         return await m.answer("استخدم: /broadcast <text>")
-    uids = list_active_user_ids(); sent = 0
-    for uid in uids:
-        try:
-            await bot.send_message(uid, txt, parse_mode="HTML", disable_web_page_preview=True)
-            sent += 1; await asyncio.sleep(0.02)
-        except Exception:
-            pass
-    await m.answer(f"تم الإرسال إلى {sent} مشترك.")
+    # هذه الوظيفة ترسل للقناة + للمشتركين فقط إذا SEND_SIGNAL_DM=1
+    await notify_subscribers(txt)
+    await m.answer("تم الإرسال.")
 
 @dp.message(Command("force_report"))
 async def cmd_force_report(m: Message):
