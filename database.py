@@ -1,8 +1,12 @@
 # database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
-# متوافق مع bot.py V2 + Leader Lock (TTL)
-# تحديثات مهمة:
-# - فهرس/قيد فريد على users.tg_user_id + تنظيف التكرارات آليًا قبل الإنشاء.
-# - تحسين تهيئة الـ logging بدون فرض basicConfig إذا كان مضبوطًا مسبقًا.
+# + نظام الإحالات (يوم مجاني للمُحيل عند تفعيل المدعو اشتراكًا مدفوعًا)
+# + تحسينات خفيفة آمنة ومتوافقة مع bot.py الحالي
+#
+# ملاحظات:
+# - عند approve_paid() إذا كان المستخدم تمت إحالته ولم يُكافأ مُحيله بعد، يُمنح المُحيل REF_BONUS_HOURS (افتراضي 24 ساعة).
+# - أضفنا ref_code (كود إحالة فريد) وreferred_by (معرّف المُحيل) في جدول users.
+# - أضفنا جدول referrals لتسجيل الحِراك الائتماني وعدم تكراره.
+# - أبقينا جميع دوال الإحصاءات والـ Leader Lock كما هي.
 
 import os
 import logging
@@ -11,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Boolean, DateTime,
-    Float, Text, text, select, func
+    Float, Text, text, select, func, UniqueConstraint, Index
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import inspect
@@ -56,19 +60,34 @@ def _as_aware(dt: datetime | None) -> datetime | None:
     except Exception:
         return dt
 
+# بيئة الإحالات
+REF_BONUS_HOURS = int(os.getenv("REF_BONUS_HOURS", "24"))          # عدد ساعات المكافأة للمُحيل
+ALLOW_SELF_REFERRAL = os.getenv("ALLOW_SELF_REFERRAL", "0").strip() in ("1","true","yes","on")
+
 # ---------------------------
 # النماذج (Models)
 # ---------------------------
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
-    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)  # نجعلها فريدة عبر فهرس في الهجرة
+    tg_user_id = Column(BigInteger, index=True, unique=False, nullable=True)
+
     trial_used = Column(Boolean, default=False, nullable=False)
     end_at = Column(DateTime, nullable=True)             # UTC
-    plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w"
+    plan = Column(String(8), nullable=True)              # "trial" | "2w" | "4w" | "gift1d"
     last_tx_hash = Column(String(128), nullable=True)
+
+    # إحالات
+    ref_code = Column(String(16), index=True, unique=False, nullable=True)  # نجعلها فريدة بفهرس
+    referred_by = Column(Integer, nullable=True)  # user.id للمُحيل (بدون FK لتبسيط الهجرة)
+
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        # فهارس إضافية
+        Index("ix_users_ref_code", "ref_code"),
+    )
 
 class Trade(Base):
     __tablename__ = "trades"
@@ -98,12 +117,29 @@ class Trade(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
-# قفل القيادة
 class Lock(Base):
     __tablename__ = "locks"
     name = Column(String(64), primary_key=True)
     holder = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
+
+class Referral(Base):
+    __tablename__ = "referrals"
+    id = Column(Integer, primary_key=True)
+    referrer_user_id = Column(Integer, nullable=False)  # user.id للمُحيل
+    referee_user_id  = Column(Integer, nullable=False)  # user.id للمدعو
+    credited_hours   = Column(Integer, nullable=False, default=0)
+    credited_at      = Column(DateTime, nullable=True)
+    note             = Column(String(128), nullable=True)
+
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("referrer_user_id", "referee_user_id", name="ux_ref_pair"),
+        Index("ix_ref_referrer", "referrer_user_id"),
+        Index("ix_ref_referee", "referee_user_id"),
+    )
 
 # ---------------------------
 # تهيئة + هجرة خفيفة
@@ -116,6 +152,8 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "end_at": "TIMESTAMPTZ",
             "plan": "VARCHAR(8)",
             "last_tx_hash": "VARCHAR(128)",
+            "ref_code": "VARCHAR(16)",
+            "referred_by": "INTEGER",
             "created_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
             "updated_at": "TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         }
@@ -125,6 +163,8 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
             "end_at": "TIMESTAMP",
             "plan": "VARCHAR(8)",
             "last_tx_hash": "VARCHAR(128)",
+            "ref_code": "VARCHAR(16)",
+            "referred_by": "INTEGER",
             "created_at": "TIMESTAMP",
             "updated_at": "TIMESTAMP",
         }
@@ -171,34 +211,36 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
     return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'  # SQLite
 
 def _ensure_indexes(connection, dialect: str):
-    # مؤشرات عامة
+    # users
     if dialect == "postgresql":
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_ref_code ON "users" (ref_code);'))
+        # referrals
+        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_ref_pair ON "referrals"(referrer_user_id, referee_user_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_ref_referrer ON "referrals"(referrer_user_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_ref_referee ON "referrals"(referee_user_id);'))
     else:
-        # SQLite لا يدعم IF NOT EXISTS لكل شيء، لكن لهذه المؤشرات يكفي
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);'))
         connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_ref_code ON users (ref_code);'))
+        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_ref_pair ON referrals(referrer_user_id, referee_user_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_ref_referrer ON referrals(referrer_user_id);'))
+        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_ref_referee ON referrals(referee_user_id);'))
 
 def _dedupe_users_on_tg_user_id(connection, dialect: str):
-    """
-    يحذف النسخ المكررة لنفس tg_user_id (يُبقي الأقدم id فقط).
-    يُستدعى مرة واحدة قبل إنشاء الفهرس/القيد الفريد.
-    """
-    # اعثر على tg_user_id المكررة
     dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' \
         if dialect == "postgresql" else \
         'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
     result = connection.execute(text(dup_sql)).fetchall()
     dups = [r[0] for r in result if r[0] is not None]
     for tg_id in dups:
-        # احذف كل الصفوف الأحدث وأبقِ الأقدم
         if dialect == "postgresql":
             del_sql = '''
                 DELETE FROM "users"
@@ -216,16 +258,18 @@ def _dedupe_users_on_tg_user_id(connection, dialect: str):
         connection.execute(text(del_sql), {"tg": tg_id})
 
 def _ensure_unique_index_users_tg_user_id(connection, dialect: str):
-    """
-    ينشئ فهرسًا فريدًا على users(tg_user_id).
-    في Postgres نستخدم CREATE UNIQUE INDEX IF NOT EXISTS.
-    في SQLite نستخدم CREATE UNIQUE INDEX IF NOT EXISTS أيضًا.
-    """
     _dedupe_users_on_tg_user_id(connection, dialect)
     if dialect == "postgresql":
         connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);'))
     else:
         connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);'))
+
+def _ensure_unique_index_users_ref_code(connection, dialect: str):
+    # ref_code قد يكون فارغًا لبعض المستخدمين القدامى — لا بأس؛ الفهرس الفريد يسمح بالقيم الفارغة في Postgres.
+    if dialect == "postgresql":
+        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_ref_code ON "users" (ref_code);'))
+    else:
+        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_ref_code ON users (ref_code);'))
 
 def _lightweight_migrate():
     Base.metadata.create_all(bind=engine)
@@ -234,12 +278,13 @@ def _lightweight_migrate():
     dialect = engine.dialect.name
 
     with engine.begin() as conn:
-        # users
+        # users — تأكد من الأعمدة
         try:
             cols_users = {c["name"] for c in insp.get_columns("users")}
         except Exception:
             cols_users = set()
-        required_users = ["tg_user_id", "trial_used", "end_at", "plan", "last_tx_hash", "created_at", "updated_at"]
+        required_users = ["tg_user_id", "trial_used", "end_at", "plan", "last_tx_hash",
+                          "ref_code", "referred_by", "created_at", "updated_at"]
         for c in required_users:
             if c not in cols_users:
                 try:
@@ -255,7 +300,7 @@ def _lightweight_migrate():
             except Exception as e:
                 logger.warning(f"users.updated_at default/not null adjust failed: {e}")
 
-        # trades
+        # trades — تأكد من الأعمدة
         try:
             cols_trades = {c["name"] for c in insp.get_columns("trades")}
         except Exception:
@@ -285,17 +330,30 @@ def _lightweight_migrate():
             except Exception as e:
                 logger.warning(f"trades created/updated defaults adjust failed: {e}")
 
+        # referrals — تأكد من وجود الجدول (Base.create_all سيُنشئه)، ثم المؤشرات
+        try:
+            _ = insp.get_columns("referrals")  # سيثير خطأ إن لم توجد
+        except Exception:
+            try:
+                Base.metadata.create_all(bind=engine)
+            except Exception as e:
+                logger.warning(f"create referrals table failed: {e}")
+
         # مؤشرات عامة
         try:
             _ensure_indexes(conn, dialect)
         except Exception as e:
             logger.warning(f"CREATE INDEX failed: {e}")
 
-        # الفهرس/القيد الفريد على users.tg_user_id (مع تنظيف التكرارات)
+        # الفهرس/القيد الفريد على users.tg_user_id + users.ref_code
         try:
             _ensure_unique_index_users_tg_user_id(conn, dialect)
         except Exception as e:
             logger.warning(f"Ensure unique users.tg_user_id failed: {e}")
+        try:
+            _ensure_unique_index_users_ref_code(conn, dialect)
+        except Exception as e:
+            logger.warning(f"Ensure unique users.ref_code failed: {e}")
 
 def init_db():
     try:
@@ -321,27 +379,111 @@ def get_session():
         s.close()
 
 # ---------------------------
-# وظائف الاشتراك
+# وظائف مساندة (إحالات)
 # ---------------------------
-def _get_or_create_user(s, tg_user_id: int) -> User:
-    # نتعامل مع احتمال وجود تكرارات قديمة
+_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"  # بدون 0OI لتجنّب اللبس
+
+def _b32(n: int) -> str:
+    if n <= 0:
+        return "2"
+    out = []
+    base = len(_ALPHABET)
+    while n > 0:
+        n, r = divmod(n, base)
+        out.append(_ALPHABET[r])
+    return "".join(reversed(out))[-8:]  # حتى 8 حروف تكفي وتجمل
+
+def _gen_ref_code_for(tg_user_id: int) -> str:
+    return f"R{_b32(abs(int(tg_user_id or 0)))}"
+
+def get_or_create_user(s, tg_user_id: int) -> User:
     users = s.execute(
         select(User).where(User.tg_user_id == tg_user_id).order_by(User.id.asc())
     ).scalars().all()
     if not users:
         u = User(tg_user_id=tg_user_id, trial_used=False, end_at=None)
+        # عيّن ref_code مبدئي
+        try:
+            u.ref_code = _gen_ref_code_for(tg_user_id)
+        except Exception:
+            u.ref_code = None
         s.add(u); s.flush()
         return u
-    # لو فيه أكثر من سجل، نحافظ على الأقدم ونحذف البقية
     keep = users[0]
     for extra in users[1:]:
         try:
             s.delete(extra)
         except Exception:
             pass
+    # ضمن ref_code
+    if not keep.ref_code:
+        try:
+            keep.ref_code = _gen_ref_code_for(keep.tg_user_id)
+        except Exception:
+            pass
     s.flush()
     return keep
 
+def find_user_by_ref_code(s, code: str) -> User | None:
+    if not code:
+        return None
+    return s.execute(select(User).where(User.ref_code == code)).scalar_one_or_none()
+
+def attach_referrer_by_code(s, tg_user_id: int, ref_code: str) -> bool:
+    """
+    يربط المستخدم (tg_user_id) بمُحيل عبر ref_code (مرة واحدة فقط).
+    تُستدعى مثلًا عند /start ref=CODE.
+    """
+    u = get_or_create_user(s, tg_user_id)
+    if u.referred_by:
+        return False
+    ref = find_user_by_ref_code(s, (ref_code or "").strip().upper())
+    if not ref:
+        return False
+    if (not ALLOW_SELF_REFERRAL) and (ref.id == u.id):
+        return False
+    u.referred_by = ref.id
+    s.flush()
+    return True
+
+def _award_referrer_if_eligible(s, referee: User) -> None:
+    """
+    يمنح المُحيل يومًا مجانيًا (REF_BONUS_HOURS) إذا كان referee ممتلكًا لحقل referred_by
+    ولم تُسجل له مكافأة مسبقًا.
+    """
+    if not referee or not referee.referred_by:
+        return
+    referrer = s.get(User, referee.referred_by)
+    if not referrer:
+        return
+    # لا تُكرّر المكافأة لنفس الزوج
+    already = s.execute(
+        select(Referral).where(Referral.referrer_user_id == referrer.id,
+                               Referral.referee_user_id == referee.id)
+    ).scalar_one_or_none()
+    if already and already.credited_at:
+        return
+
+    # امنح المكافأة
+    if not already:
+        already = Referral(referrer_user_id=referrer.id,
+                           referee_user_id=referee.id,
+                           credited_hours=REF_BONUS_HOURS,
+                           credited_at=_utcnow(),
+                           note="paid_plan_credit")
+        s.add(already)
+    else:
+        already.credited_hours = REF_BONUS_HOURS
+        already.credited_at = _utcnow()
+
+    now = _utcnow()
+    base = _as_aware(referrer.end_at) if (referrer.end_at and _as_aware(referrer.end_at) and _as_aware(referrer.end_at) > now) else now
+    referrer.end_at = base + timedelta(hours=int(REF_BONUS_HOURS))
+    s.flush()
+
+# ---------------------------
+# وظائف الاشتراك
+# ---------------------------
 def is_active(s, tg_user_id: int) -> bool:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
     if not u or not u.end_at:
@@ -349,7 +491,7 @@ def is_active(s, tg_user_id: int) -> bool:
     return _as_aware(u.end_at) > _utcnow()
 
 def start_trial(s, tg_user_id: int) -> bool:
-    u = _get_or_create_user(s, tg_user_id)
+    u = get_or_create_user(s, tg_user_id)
     if u.trial_used:
         return False
     u.trial_used = True
@@ -361,7 +503,7 @@ def start_trial(s, tg_user_id: int) -> bool:
     return True
 
 def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str | None = None) -> datetime:
-    u = _get_or_create_user(s, tg_user_id)
+    u = get_or_create_user(s, tg_user_id)
     now = _utcnow()
     base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
     u.end_at = base + timedelta(days=int(duration_days))
@@ -369,6 +511,14 @@ def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: str
     if tx_hash:
         u.last_tx_hash = tx_hash
     s.flush()
+
+    # منح المُحيل مكافأة إحالة (مرة واحدة) بعد أي تفعيل مدفوع
+    try:
+        if plan in ("2w", "4w"):  # نمنح فقط عند باقة مدفوعة (وليس gift1d مثلاً)
+            _award_referrer_if_eligible(s, u)
+    except Exception as e:
+        logger.warning(f"Referral bonus grant failed: {e}")
+
     return u.end_at
 
 # ---------------------------
@@ -502,5 +652,3 @@ def release_leader_lock(name: str, holder: str) -> None:
             s.delete(row)
             try: s.commit()
             except Exception: s.rollback()
-
-# انتهى
