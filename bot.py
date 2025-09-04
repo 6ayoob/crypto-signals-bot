@@ -22,6 +22,7 @@ import pytz
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.client.default import DefaultBotProperties
 
 # ====== قفل ملف محلي لمنع نسختين على نفس الجهاز ======
 LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
