@@ -62,7 +62,9 @@ from database import (
     has_open_trade_on_symbol, get_stats_24h, get_stats_7d,
     User, Trade,
     ensure_ref_code, set_referred_by, get_user_by_tg, grant_free_hours, mark_referral_rewarded,
+    get_user_by_ref_code,  # ← تمت إضافتها هنا
 )
+
 from strategy import check_signal
 from symbols import SYMBOLS
 
