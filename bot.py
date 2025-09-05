@@ -59,7 +59,9 @@ from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
     count_open_trades, add_trade, close_trade, add_trade_sig,
     has_open_trade_on_symbol, get_stats_24h, get_stats_7d,
-    User, Trade
+    User, Trade,
+    # NEW imports for multi-targets flow
+    trade_targets_list, trade_entries_list, update_last_hit_idx
 )
 
 # Optional referral helpers (defensive import)
@@ -175,7 +177,7 @@ _last_signal_at: Dict[str, float] = {}
 
 # Messages cache per trade
 MESSAGES_CACHE: Dict[int, Dict[str, str]] = {}
-HIT_TP1: Dict[int, bool] = {}
+HIT_TP1: Dict[int, bool] = {}  # kept for backward compatibility (no longer essential)
 
 # Support DM
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
@@ -200,6 +202,18 @@ _BOT_USERNAME: Optional[str] = os.getenv("BOT_USERNAME_OVERRIDE") or None
 
 def _h(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _fmt_price(x: Any) -> str:
+    try:
+        v = float(x)
+        # adaptive formatting
+        if v == 0: return "0"
+        abs_v = abs(v)
+        if abs_v >= 100: return f"{v:.2f}"
+        if abs_v >= 1: return f"{v:.4f}"
+        return f"{v:.6f}"
+    except Exception:
+        return str(x)
 
 async def _get_bot_username() -> str:
     global _BOT_USERNAME
@@ -344,58 +358,98 @@ async def welcome_text(user_id: Optional[int] = None) -> str:
 
 # ===== Signal / close message formatting =====
 
+def _humanize_stop_rule(sr: Optional[dict]) -> str:
+    if not sr or not isinstance(sr, dict):
+        return "ثابت عند مستوى الوقف المحدد."
+    t = (sr.get("type") or "").lower()
+    if t in ("breakeven_after", "be_after", "move_to_entry_on_tp1"):
+        idx = sr.get("at_idx", 0)
+        return f"نقل الوقف لنقطة الدخول بعد الهدف {idx+1}."
+    if t == "fixed":
+        return "وقف ثابت."
+    # fallback
+    try:
+        return json.dumps(sr, ensure_ascii=False)
+    except Exception:
+        return "قاعدة وقف مخصّصة."
+
 def format_signal_text_basic(sig: dict) -> str:
+    side = (sig.get("side") or "buy").lower()
+    title = "إشارة شراء" if side != "sell" else "إشارة بيع"
+    # entries / targets
+    entries = sig.get("entries")
+    targets = sig.get("targets")
+    stop_rule = sig.get("stop_rule")
+
+    entries_line = f"💵 الدخول: <code>{_fmt_price(sig['entry'])}</code>"
+    if entries and isinstance(entries, list) and len(entries) > 1:
+        entries_line = "💵 الدخول (متعدد): " + ", ".join(f"<code>{_fmt_price(x)}</code>" for x in entries)
+
+    targets_block = f"🎯 الأهداف: <code>{_fmt_price(sig['tp1'])}</code>, <code>{_fmt_price(sig['tp2'])}</code>"
+    if targets and isinstance(targets, list) and len(targets) >= 1:
+        targets_block = "🎯 الأهداف: " + ", ".join(f"<code>{_fmt_price(x)}</code>" for x in targets)
+
     extra = ""
     if "score" in sig or "regime" in sig:
-        extra += (
-            f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
-        )
+        extra += f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
         if sig.get("reasons"):
-            extra += f"\n🧠 كونفلوينس: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+            try:
+                extra += f"\n🧠 كونفلوينس: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+            except Exception:
+                pass
 
-    tp3_line = f"\n🏁 الهدف 3: <code>{sig.get('tp3')}</code>" if sig.get("tp3") is not None else ""
     strat_line = (
         f"\n🧭 النمط: <b>{_h(sig.get('strategy_code','-'))}</b> | ملف: <i>{_h(sig.get('profile','-'))}</i>"
         if sig.get("strategy_code") else ""
     )
 
+    stop_line = f"\n📏 قاعدة الوقف: <i>{_humanize_stop_rule(stop_rule)}</i>"
+
     return (
-        "🚀 <b>إشارة شراء</b>\n"
+        f"🚀 <b>{title}</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
-        f"💵 الدخول: <code>{sig['entry']}</code>\n"
-        f"📉 الوقف: <code>{sig['sl']}</code>\n"
-        f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
-        f"🏁 الهدف 2: <code>{sig['tp2']}</code>"
-        f"{tp3_line}{strat_line}\n"
-        f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
-        f"{extra}\n"
+        f"{entries_line}\n"
+        f"📉 الوقف: <code>{_fmt_price(sig['sl'])}</code>\n"
+        f"{targets_block}"
+        f"{strat_line}\n"
+        f"⏰ (UTC): <code>{_h(sig.get('timestamp') or datetime.utcnow().strftime('%Y-%m-%d %H:%M'))}</code>"
+        f"{extra}{stop_line}\n"
         "━━━━━━━━━━━━━━\n"
         "⚡️ <i>قاعدة المخاطرة: أقصى 1% لكل صفقة، وبدون مطاردة للسعر.</i>"
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
-    emoji = {"tp1": "🎯", "tp2": "🏆", "sl": "🛑"}.get(getattr(t, "result", "") or "", "ℹ️")
+    res = getattr(t, "result", "") or ""
+    emoji = {"tp1": "🎯", "tp2": "🏆", "tp3": "🥇", "tp4": "🥈", "tp5": "🥉", "sl": "🛑"}.get(res, "ℹ️")
     result_label = {
         "tp1": "تحقق الهدف 1 — خطوة ممتازة!",
         "tp2": "تحقق الهدف 2 — إنجاز رائع!",
+        "tp3": "تحقق الهدف 3 — تقدّم قوي!",
+        "tp4": "تحقق الهدف 4 — رائعة!",
+        "tp5": "تحقق الهدف 5 — قمة الصفقة!",
         "sl": "وقف الخسارة — حماية رأس المال",
-    }.get(getattr(t, "result", "") or "", "إغلاق")
+    }.get(res, "إغلاق")
 
     r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
     tip = (
         "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب."
-        if getattr(t, "result", "") == "sl"
+        if res == "sl"
         else "🎯 إدارة الربح أهم من كثرة الصفقات."
     )
+
+    # حاول استخراج tp_final إن وُجد لعرضه مع الأهداف
+    tpf = ""
+    if getattr(t, "tp_final", None):
+        tpf = f" | 🏁 Final: <code>{_fmt_price(t.tp_final)}</code>"
 
     return (
         f"{emoji} <b>حالة صفقة</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"🔹 الأصل: <b>{_h(str(t.symbol))}</b>\n"
-        f"💵 الدخول: <code>{t.entry}</code>\n"
-        f"📉 الوقف: <code>{t.sl}</code>\n"
-        f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>\n"
+        f"💵 الدخول: <code>{_fmt_price(t.entry)}</code>\n"
+        f"📉 الوقف: <code>{_fmt_price(t.sl)}</code>\n"
+        f"🎯 TP1: <code>{_fmt_price(t.tp1)}</code> | 🏁 TP2: <code>{_fmt_price(t.tp2)}</code>{tpf}\n"
         f"📌 الحالة: <b>{result_label}</b>{r_line}\n"
         f"⏰ (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
         "━━━━━━━━━━━━━━\n"
@@ -455,9 +509,14 @@ def can_open_new_trade(s) -> Tuple[bool, str]:
     return True, "OK"
 
 def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> float:
+    # side-aware R
     try:
-        R = float(t.entry) - float(t.sl)
-        r_multiple = 0.0 if R <= 0 else (float(exit_price) - float(t.entry)) / R
+        if (t.side or "").lower() == "sell":
+            R = float(t.sl) - float(t.entry)
+            r_multiple = 0.0 if R <= 0 else (float(t.entry) - float(exit_price)) / R
+        else:
+            R = float(t.entry) - float(t.sl)
+            r_multiple = 0.0 if R <= 0 else (float(exit_price) - float(t.entry)) / R
     except Exception:
         r_multiple = 0.0
 
@@ -609,7 +668,7 @@ async def scan_and_dispatch():
                         logger.info(f"🔁 SKIP {sig['symbol']}: already open")
                         continue
 
-                    audit_id = _make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
+                    audit_id = _make_audit_id(sig["symbol"], sig.get("entry", sig.get("entries", [0])[0]), sig.get("score", 0))
 
                     try:
                         trade_id = add_trade_sig(s, sig, audit_id=audit_id, qty=None)
@@ -643,7 +702,7 @@ async def scan_and_dispatch():
                             except Exception:
                                 pass
 
-                        logger.info(f"✅ SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
+                        logger.info(f"✅ SIGNAL SENT: {sig['symbol']} audit={audit_id}")
                     except Exception as e:
                         logger.exception(f"❌ SEND SIGNAL ERROR: {e}")
 
@@ -660,8 +719,37 @@ async def loop_signals():
         await asyncio.sleep(max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed))
 
 # ---------------------------
-# Monitor open trades
+# Monitor open trades (multi-target + dynamic stop)
 # ---------------------------
+
+def _tp_key(idx: int) -> str:
+    return f"tp{idx+1}"
+
+def _stop_triggered_by_rule(t: Trade, price: float, last_hit_idx: int) -> bool:
+    """Implements a simple, robust rule set:
+       - fixed: use DB stop (default)
+       - breakeven_after (or move_to_entry_on_tp1): move stop to entry after hitting tp[idx]
+    """
+    try:
+        sr = json.loads(t.stop_rule_json) if getattr(t, "stop_rule_json", None) else None
+    except Exception:
+        sr = None
+    side = (t.side or "buy").lower()
+
+    # base stop = raw sl
+    effective_sl = float(t.sl)
+
+    if sr and isinstance(sr, dict):
+        ttype = (sr.get("type") or "").lower()
+        if ttype in ("breakeven_after", "be_after", "move_to_entry_on_tp1"):
+            at_idx = int(sr.get("at_idx", 0))
+            if last_hit_idx >= at_idx:
+                effective_sl = float(t.entry)
+
+    # trigger condition by side
+    if side == "sell":
+        return price >= effective_sl
+    return price <= effective_sl
 
 async def monitor_open_trades():
     from types import SimpleNamespace
@@ -674,17 +762,13 @@ async def monitor_open_trades():
                     if price is None:
                         continue
 
-                    hit_tp2 = price >= t.tp2
-                    hit_tp1 = price >= t.tp1
-                    hit_sl = price <= t.sl
+                    side = (t.side or "buy").lower()
+                    tgts = trade_targets_list(t)  # ordered list
+                    last_idx = int(getattr(t, "last_hit_idx", 0) or 0)
 
-                    result, exit_px = None, None
-                    if hit_sl:
-                        result, exit_px = "sl", float(t.sl)
-                    elif hit_tp2:
-                        result, exit_px = "tp2", float(t.tp2)
-
-                    if result:
+                    # ---- Check stop (raw or rule-based)
+                    if _stop_triggered_by_rule(t, price, last_idx):
+                        result, exit_px = "sl", float(t.entry) if price == t.entry else float(t.sl)
                         r_multiple = on_trade_closed_update_risk(t, result, exit_px)
                         try:
                             close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
@@ -692,7 +776,7 @@ async def monitor_open_trades():
                             logger.warning(f"⚠️ close_trade warn: {e}")
 
                         msg = format_close_text(t, r_multiple)
-                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
+                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("sl")
                         if extra:
                             msg += "\n\n" + extra
 
@@ -700,19 +784,57 @@ async def monitor_open_trades():
                         await asyncio.sleep(0.05)
                         continue
 
-                    # Hit TP1 but not yet TP2
-                    if hit_tp1 and not HIT_TP1.get(t.id):
-                        HIT_TP1[t.id] = True
-                        tmp = SimpleNamespace(symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1")
-                        msg = format_close_text(tmp, None)
+                    # ---- Determine highest target hit
+                    new_hit_idx = -1
+                    if side == "sell":
+                        for idx, tgt in enumerate(tgts):
+                            if price <= float(tgt):
+                                new_hit_idx = max(new_hit_idx, idx)
+                    else:
+                        for idx, tgt in enumerate(tgts):
+                            if price >= float(tgt):
+                                new_hit_idx = max(new_hit_idx, idx)
 
-                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp1")
+                    # No targets reached
+                    if new_hit_idx < 0:
+                        continue
+
+                    # Close if last target reached
+                    if new_hit_idx >= len(tgts) - 1:
+                        res_key = _tp_key(len(tgts) - 1)
+                        exit_px = float(tgts[-1])
+                        r_multiple = on_trade_closed_update_risk(t, res_key, exit_px)
+                        try:
+                            close_trade(s, t.id, res_key, exit_price=exit_px, r_multiple=r_multiple)
+                        except Exception as e:
+                            logger.warning(f"⚠️ close_trade warn: {e}")
+
+                        t.result = res_key  # for message rendering
+                        msg = format_close_text(t, r_multiple)
+                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(res_key)
                         if extra:
                             msg += "\n\n" + extra
-                        msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
-
                         await notify_subscribers(msg)
                         await asyncio.sleep(0.05)
+                        continue
+
+                    # Intermediate TP reached (progress)
+                    if new_hit_idx > last_idx:
+                        update_last_hit_idx(s, t.id, new_hit_idx)
+                        tmp = SimpleNamespace(
+                            symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2,
+                            tp_final=t.tp_final, result=_tp_key(new_hit_idx)
+                        )
+                        msg = format_close_text(tmp, None)
+                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(_tp_key(new_hit_idx))
+                        if extra:
+                            msg += "\n\n" + extra
+                        # helpful hint at TP1
+                        if new_hit_idx == 0:
+                            msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
+                        await notify_subscribers(msg)
+                        await asyncio.sleep(0.05)
+
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
@@ -780,33 +902,35 @@ async def notify_trial_expiring_soon_loop():
         await asyncio.sleep(900)
 
 # ---------------------------
-# Reports
+# Reports (updated to new stats keys)
 # ---------------------------
 
 def render_daily_report(stats: dict) -> str:
-    total = stats.get("total", 0)
-    win_rate = stats.get("win_rate", 0.0)
-    best_symbol = stats.get("best_symbol", "-")
-    best_gain = stats.get("best_gain", 0.0)
-    worst_symbol = stats.get("worst_symbol", "-")
-    worst_gain = stats.get("worst_gain", 0.0)
+    # stats keys from database._period_stats: signals, open, tp1, tp2, tp_total, sl, win_rate, r_sum
+    signals = stats.get("signals", 0)
+    open_now = stats.get("open", 0)
+    wins = stats.get("tp_total", (stats.get("tp1", 0) + stats.get("tp2", 0)))
+    losses = stats.get("sl", 0)
+    win_rate = float(stats.get("win_rate", 0.0))
+    r_sum = stats.get("r_sum", 0.0)
 
     msg = (
-        "📊 <b>التقرير اليومي — لقطة أداء مركّزة</b>\n"
-        f"• إجمالي الصفقات: <b>{total}</b>\n"
+        "📊 <b>التقرير اليومي — لقطة أداء</b>\n"
+        f"• إشارات جديدة: <b>{signals}</b>\n"
+        f"• صفقات مفتوحة حاليًا: <b>{open_now}</b>\n"
+        f"• نتائج الإغلاقات: ربح <b>{wins}</b> / خسارة <b>{losses}</b>\n"
         f"• نسبة الربح: <b>{win_rate:.1f}%</b>\n"
-        "—\n"
-        f"🔹 أفضل رمز: <code>{best_symbol}</code> (+{best_gain:.2f}%)\n"
-        f"🔸 أضعف رمز: <code>{worst_symbol}</code> ({worst_gain:.2f}%)\n"
+        f"• صافي R: <b>{r_sum:+.2f}R</b>\n"
     )
     return msg
 
 def _report_card(stats_24: dict, stats_7d: dict) -> str:
     part1 = render_daily_report(stats_24)
     try:
-        wr7 = stats_7d.get("win_rate", 0.0)
-        n7 = stats_7d.get("total", 0)
-        part2 = f"\n📅 آخر 7 أيام — صفقات: <b>{n7}</b> | نسبة الربح: <b>{wr7:.1f}%</b>"
+        wr7 = float(stats_7d.get("win_rate", 0.0))
+        n7 = int(stats_7d.get("signals", 0))
+        r7 = float(stats_7d.get("r_sum", 0.0))
+        part2 = f"\n📅 آخر 7 أيام — إشارات: <b>{n7}</b> | نسبة الربح: <b>{wr7:.1f}%</b> | صافي R: <b>{r7:+.2f}R</b>"
     except Exception:
         part2 = ""
     return part1 + part2
