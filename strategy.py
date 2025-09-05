@@ -142,6 +142,15 @@ def near_any_fib(price: float, hhv: float, llv: float, tol: float) -> Tuple[bool
         if abs(price - lvl) / max(lvl, 1e-9) <= tol: return True, name
     return False, ""
 
+def _fib_ok(price: float, df: pd.DataFrame) -> bool:
+    try:
+        sw = recent_swing(df, SWING_LOOKBACK)
+        if not sw or sw[0] is None or sw[1] is None:
+            return False
+        return near_any_fib(price, sw[0], sw[1], FIB_TOL)[0]
+    except Exception:
+        return False
+
 def detect_regime(df) -> str:
     c = df["close"]; e50 = df["ema50"]
     up = (c.iloc[-1] > e50.iloc[-1]) and (e50.diff(10).iloc[-1] > 0)
@@ -301,7 +310,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     regime = detect_regime(df)
     mtf_ok = pass_mtf_filter_any(ohlcv_htf)
 
-    # برايس أكشن واختيار الست-أب
+    # برايس أكشن
     rev_hammer  = is_hammer(closed)
     rev_engulf  = is_bull_engulf(prev, closed)
     rev_insideb = is_inside_break(prev2, prev, closed)
@@ -327,12 +336,19 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     struct_ok = False
     reasons: List[str] = []
 
+    # اختيار الست-أب
+    pull_cond = (
+        (regime in ("trend","mixed"))
+        and (rev_hammer or rev_engulf or rev_insideb)
+        and (
+            abs(price - float(closed["ema21"])) / max(price,1e-9) <= 0.003
+            or (USE_FIB and _fib_ok(price, df))
+        )
+    )
+
     if (regime in ("trend","mixed")) and breakout_ok and retest_ok and (rev_insideb or rev_engulf or candle_quality(closed)):
         setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest"]
-    elif (regime in ("trend","mixed")) and (rev_hammer or rev_engulf or rev_insideb) and (
-            abs(price - float(closed["ema21"])) / max(price,1e-9) <= 0.003 or (
-            USE_FIB and (lambda: (lambda sw: near_any_fib(price, *sw, FIB_TOL) if all(sw) else (False, ""))((recent_swing(df, SWING_LOOKBACK))) )()[0]
-        ):
+    elif pull_cond:
         setup = "PULL"; struct_ok = True; reasons += ["Pullback Reclaim"]
     elif range_env and near_sup and (rev_hammer or candle_quality(closed)):
         setup = "RANGE"; struct_ok = True; reasons += ["Range Rotation"]
