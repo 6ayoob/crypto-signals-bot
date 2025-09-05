@@ -344,11 +344,11 @@ wallet_line = f"""💳 USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>
         try:
             with get_session() as s:
                 code, link = await _build_ref_link(user_id, s)
-            if link:
-                ref_hint = f"
-🎁 <b>برنامج الإحالة:</b> شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.
-رابطك: <a href='{link}'>اضغط هنا</a>
-"
+ref_hint = (
+    f"\n🎁 <b>برنامج الإحالة:</b> شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.\n"
+    f"رابطك: <a href='{link}'>اضغط هنا</a>\n"
+)
+
         except Exception:
             pass
 
