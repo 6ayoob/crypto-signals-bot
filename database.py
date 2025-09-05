@@ -306,7 +306,8 @@ def approve_paid(s, tg_user_id: int, plan: str, duration: timedelta, tx_hash: Op
     return u.end_at
 
 # ---------- Referrals ----------
-def _default_referral_code_for(uid: int) -> str: return f"ref_{uid}"
+def _default_referral_code_for(uid: int) -> str:
+    return str(uid)
 
 def ensure_referral_code(s, tg_user_id: int) -> str:
     u = _get_or_create_user(s, tg_user_id)
