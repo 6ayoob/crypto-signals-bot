@@ -1,4 +1,3 @@
-
 # database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
 # Compatible with bot.py (referral-enabled), Leader Lock and lightweight migrations.
 # Additions in this version:
@@ -13,13 +12,14 @@
 import os
 import json
 import logging
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Union
 
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Boolean, DateTime,
-    Float, Text, text, select, func, Index
+    Float, Text, text, select, func
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import inspect
@@ -63,6 +63,27 @@ def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except Exception:
         return dt
+
+def _to_timedelta(duration: Union[timedelta, int, float, str]) -> timedelta:
+    """
+    يحوّل المدّة لأنواع مختلفة:
+    - timedelta → كما هي
+    - int/float  → أيام
+    - "2w" أو "14d" → أسابيع/أيام
+    """
+    if isinstance(duration, timedelta):
+        return duration
+    if isinstance(duration, (int, float)):
+        return timedelta(days=int(duration))
+    if isinstance(duration, str):
+        s = duration.strip().lower()
+        if s.endswith("w") and s[:-1].isdigit():
+            return timedelta(days=int(s[:-1]) * 7)
+        if s.endswith("d") and s[:-1].isdigit():
+            return timedelta(days=int(s[:-1]))
+        if s.isdigit():
+            return timedelta(days=int(s))
+    raise ValueError(f"Unsupported duration type/value: {duration!r}")
 
 # ---------------------------
 # النماذج (Models)
@@ -229,7 +250,11 @@ def _ensure_indexes(connection, dialect: str):
         # SQLite can't do partial unique easily. We'll rely on app-level checks.
 
 def _dedupe_users_on_tg_user_id(connection, dialect: str):
-    dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'         if dialect == "postgresql" else         'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
+    dup_sql = (
+        'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
+        if dialect == "postgresql"
+        else 'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
+    )
     result = connection.execute(text(dup_sql)).fetchall()
     dups = [r[0] for r in result if r[0] is not None]
     for tg_id in dups:
@@ -257,6 +282,7 @@ def _ensure_unique_index_users_tg_user_id(connection, dialect: str):
         connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);'))
 
 def _lightweight_migrate():
+    # أنشئ الجداول لو لم توجد (لا يغيّر الجداول القائمة)
     Base.metadata.create_all(bind=engine)
     insp = inspect(engine)
     dialect = engine.dialect.name
@@ -278,6 +304,7 @@ def _lightweight_migrate():
             if c not in cols_users:
                 try:
                     conn.execute(text(_add_column_sql("users", c, dialect)))
+                    logger.info(f'Applied: ADD COLUMN users.{c}')
                 except Exception as e:
                     logger.warning(f"ALTER users ADD {c} failed: {e}")
         if dialect == "postgresql":
@@ -304,6 +331,7 @@ def _lightweight_migrate():
             if c not in cols_trades:
                 try:
                     conn.execute(text(_add_column_sql("trades", c, dialect)))
+                    logger.info(f'Applied: ADD COLUMN trades.{c}')
                 except Exception as e:
                     logger.warning(f"ALTER trades ADD {c} failed: {e}")
 
@@ -392,16 +420,17 @@ def start_trial(s, tg_user_id: int) -> bool:
     u.plan = "trial"
     return True
 
-def approve_paid(s, tg_user_id: int, plan: str, duration_days: int, tx_hash: Optional[str] = None) -> datetime:
-    '''
-    Core paid activation. Does NOT auto-apply referral bonus by itself to avoid double-applying
-    if the caller (bot.py) already accounts for it. To enable DB-side bonus, call
-    `apply_referral_bonus_if_eligible` explicitly after this function.
-    '''
+def approve_paid(s, tg_user_id: int, plan: str, duration: Union[timedelta, int, float, str], tx_hash: Optional[str] = None) -> datetime:
+    """
+    Core paid activation.
+    duration: يدعم timedelta أو عدد أيام أو نص مثل "2w"/"14d".
+    لا يطبق بونص الإحالة تلقائياً لتفادي الازدواج؛ نادِ apply_referral_bonus_if_eligible بعده عند الحاجة.
+    """
     u = _get_or_create_user(s, tg_user_id)
     now = _utcnow()
     base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
-    u.end_at = base + timedelta(days=int(duration_days))
+    delta = _to_timedelta(duration)
+    u.end_at = base + delta
     u.plan = plan
     if tx_hash:
         u.last_tx_hash = tx_hash
@@ -445,11 +474,11 @@ def resolve_referrer_uid_by_code(s, code: str) -> Optional[int]:
     return int(u.tg_user_id) if (u and u.tg_user_id) else None
 
 def link_referred_by(s, target_tg_user_id: int, ref_code: str) -> bool:
-    '''
+    """
     Attach referred_by for a user once (idempotent). Won't set if code resolves to self
     or if referred_by already filled.
     Returns True if linkage created.
-    '''
+    """
     u = _get_or_create_user(s, target_tg_user_id)
     if u.referred_by:
         return False
@@ -461,10 +490,10 @@ def link_referred_by(s, target_tg_user_id: int, ref_code: str) -> bool:
     return True
 
 def apply_referral_bonus_if_eligible(s, target_tg_user_id: int, bonus_days: int = 2) -> bool:
-    '''
+    """
     Give +bonus_days to referred user only ONCE, when they first become paid.
     Safe to call multiple times (idempotent). Returns True if applied now.
-    '''
+    """
     u = _get_or_create_user(s, target_tg_user_id)
     if not u.referred_by or u.ref_bonus_awarded:
         return False
@@ -477,12 +506,12 @@ def apply_referral_bonus_if_eligible(s, target_tg_user_id: int, bonus_days: int 
     return True
 
 def get_ref_stats(s, referrer_tg_user_id: int) -> Dict[str, Any]:
-    '''
+    """
     Returns simple aggregate statistics for a referrer.
     - joined: users who have referred_by == referrer
     - paid_converted: subset of joined with non-trial plan ('2w' or '4w'), counted once
     - total_bonus_days_distributed: sum(ref_bonus_days) for joined users
-    '''
+    """
     joined = s.execute(select(func.count(User.id)).where(User.referred_by == referrer_tg_user_id)).scalar() or 0
     paid = s.execute(
         select(func.count(User.id)).where(User.referred_by == referrer_tg_user_id, User.plan.in_(("2w", "4w")))
@@ -494,7 +523,7 @@ def get_ref_stats(s, referrer_tg_user_id: int) -> Dict[str, Any]:
 
 # Optional: one-shot importer from legacy referrals.json to DB (call manually if needed)
 def import_legacy_referrals_json(path: str = "referrals.json") -> int:
-    '''
+    """
     Expected legacy structure (example):
     {
         "users": {
@@ -503,7 +532,7 @@ def import_legacy_referrals_json(path: str = "referrals.json") -> int:
         }
     }
     We'll only import codes (not events). Returns number of codes imported/updated.
-    '''
+    """
     p = Path(path)
     if not p.exists():
         return 0
