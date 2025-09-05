@@ -287,10 +287,8 @@ def _contact_line() -> str:
         parts.append(f"🆔 معرّف الأدمن: <code>{SUPPORT_CHAT_ID}</code>")
     if SUPPORT_CHAT_ID and not SUPPORT_USERNAME:
         parts.append(f"⚡️ افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
-  return f"""
-🔗 مثال
-🆔 آخر
-"""
+return "\n".join(parts) if parts else "—"
+
 
 # ===== Referrals =====
 async def _build_ref_link(uid: int, session) -> tuple[str, str]:
