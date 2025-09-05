@@ -331,12 +331,20 @@ def resolve_referrer_uid_by_code(s, code: str) -> Optional[int]:
     u = s.execute(select(User).where(User.referral_code == raw)).scalar_one_or_none()
     return int(u.tg_user_id) if (u and u.tg_user_id) else None
 
-def link_referred_by(s, target_tg_user_id: int, ref_code: str) -> bool:
+def link_referred_by(s, target_tg_user_id: int, ref_code: str) -> tuple[bool, str]:
+    """
+    يربط الإحالة مرة واحدة (idempotent).
+    يرجع (ok, reason): 'already_linked' | 'invalid_or_self' | 'ok'
+    """
     u = _get_or_create_user(s, target_tg_user_id)
-    if u.referred_by: return False
+    if u.referred_by:
+        return False, "already_linked"
     ref_uid = resolve_referrer_uid_by_code(s, ref_code)
-    if not ref_uid or int(ref_uid) == int(target_tg_user_id): return False
-    u.referred_by = int(ref_uid); s.flush(); return True
+    if not ref_uid or int(ref_uid) == int(target_tg_user_id):
+        return False, "invalid_or_self"
+    u.referred_by = int(ref_uid)
+    s.flush()
+    return True, "ok"
 
 def apply_referral_bonus_if_eligible(s, target_tg_user_id: int, bonus_days: int = 2) -> bool:
     u = _get_or_create_user(s, target_tg_user_id)
@@ -348,10 +356,31 @@ def apply_referral_bonus_if_eligible(s, target_tg_user_id: int, bonus_days: int 
     s.flush(); return True
 
 def get_ref_stats(s, referrer_tg_user_id: int) -> Dict[str, Any]:
-    joined = s.execute(select(func.count(User.id)).where(User.referred_by == referrer_tg_user_id)).scalar() or 0
-    paid = s.execute(select(func.count(User.id)).where(User.referred_by == referrer_tg_user_id, User.plan.in_(("2w","4w")))).scalar() or 0
-    bonus_days = s.execute(select(func.coalesce(func.sum(User.ref_bonus_days), 0)).where(User.referred_by == referrer_tg_user_id)).scalar() or 0
-    return {"joined": int(joined), "paid_converted": int(paid), "total_bonus_days_distributed": int(bonus_days)}
+    joined = s.execute(
+        select(func.count(User.id)).where(User.referred_by == referrer_tg_user_id)
+    ).scalar() or 0
+    paid = s.execute(
+        select(func.count(User.id)).where(
+            User.referred_by == referrer_tg_user_id, User.plan.in_(("2w", "4w"))
+        )
+    ).scalar() or 0
+    bonus_days = s.execute(
+        select(func.coalesce(func.sum(User.ref_bonus_days), 0)).where(User.referred_by == referrer_tg_user_id)
+    ).scalar() or 0
+
+    # المفاتيح المتوقعة في bot.py:
+    out = {
+        "referred_count": int(joined),
+        "paid_count": int(paid),
+        "total_bonus_days": int(bonus_days),
+    }
+    # مفاتيحك السابقة (توافق خلفي اختياري):
+    out.update({
+        "joined": out["referred_count"],
+        "paid_converted": out["paid_count"],
+        "total_bonus_days_distributed": out["total_bonus_days"],
+    })
+    return out
 
 # ---------- Trades ----------
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> int:
