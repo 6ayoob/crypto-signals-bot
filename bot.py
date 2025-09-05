@@ -1,4 +1,26 @@
-# -*- coding: utf-8 -*-
+# Write the updated bot.py with referral integration and improved marketing/messages
+code = r'''# bot.py — V2.2 with Referral System, Marketing Copy v2, and safer flows
+# Compatible with aiogram v3.x
+# Split-friendly (with database.py providing referral helpers)
+#
+# Key additions:
+# - Deep-link referral: /start ref_<CODE>  (auto-link on first run)
+# - /ref command: shows personal link + basic stats
+# - Admin approval path auto-applies +2 days bonus on the first paid activation for referred users
+# - Optional manual linking: /use_ref <CODE>
+# - Improved welcome & signal copy, micro-CTAs, and gentle nudges
+# - Defensive imports for referral helpers (no-crash if database.py is old)
+#
+# ENV (optional):
+#   REF_BONUS_DAYS=2
+#   BRAND_NAME="عالم الفرص"
+#   BOT_USERNAME_OVERRIDE="YourBotUsername"  # fallback if get_me fails
+#   FEATURE_TAGLINE="3 مستويات أهداف، وقف R-based، تقرير يومي"
+#   START_BANNER_EMOJI="🚀"
+#   SHOW_REF_IN_START=1                        # add "دعوة صديق" button in /start
+#   OKX_PUBLIC_RATE_MAX / OKX_PUBLIC_RATE_WINDOW as before
+#
+# NOTE: Requires database.py >= 2.0 (with referral helpers).
 import asyncio
 import json
 import hashlib
@@ -20,14 +42,9 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# =====================================================
-#                 الإعدادات العامة
-# =====================================================
-
-# ====== قفل ملف محلي لمنع نسختين على نفس الجهاز ======
+# ====== Single-instance local lock ======
 LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
 _LOCK_FP = None
-
 def _acquire_single_instance_lock():
     global _LOCK_FP
     try:
@@ -42,17 +59,15 @@ def _acquire_single_instance_lock():
         try: _LOCK_FP and _LOCK_FP.close()
         except Exception: pass
         sys.exit(1)
-
 _acquire_single_instance_lock()
 
 # ============================================
-# تلغرام Conflict (قد لا يتوفر في بعض الإصدارات)
+# Telegram Conflict (older aiogram variants)
 try:
     from aiogram.exceptions import TelegramConflictError
 except Exception:
     class TelegramConflictError(Exception): ...
 
-# من ملفاتك الحالية
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, ADMIN_USER_IDS,
     MAX_OPEN_TRADES, TIMEZONE, DAILY_REPORT_HOUR_LOCAL,
@@ -61,7 +76,7 @@ from config import (
     USDT_TRC20_WALLET
 )
 
-# قاعدة البيانات
+# Database
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
     count_open_trades, add_trade, close_trade, add_trade_sig,
@@ -69,12 +84,29 @@ from database import (
     User, Trade
 )
 
+# Optional referral helpers (defensive import)
+try:
+    from database import (
+        ensure_referral_code, link_referred_by, apply_referral_bonus_if_eligible,
+        get_ref_stats, list_active_user_ids as db_list_active_uids
+    )
+    REFERRAL_ENABLED = True
+except Exception:
+    REFERRAL_ENABLED = False
+    def ensure_referral_code(s, uid: int) -> str: return ""
+    def link_referred_by(s, uid: int, code: str) -> tuple[bool, str]: return (False, "unsupported")
+    def apply_referral_bonus_if_eligible(s, uid: int, bonus_days: int = 2):
+        return False
+    def get_ref_stats(s, uid: int) -> dict:
+        return {"referred_count": 0, "paid_count": 0, "total_bonus_days": 0}
+    def db_list_active_uids(s): return []
+
 # ---------- Leader Lock ----------
 ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
 LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
-LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # ثواني
-HEARTBEAT_INTERVAL = max(10, LEADER_TTL // 2)
+LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # seconds
+
 acquire_or_steal_leader_lock = heartbeat_leader_lock = release_leader_lock = None
 if ENABLE_DB_LOCK:
     try:
@@ -94,146 +126,64 @@ if ENABLE_DB_LOCK:
         except Exception:
             ENABLE_DB_LOCK = False
 
-# ============= الإحالات (Referral System) =============
-REFERRALS_FILE = Path(os.getenv("REFERRALS_FILE", "referrals.json"))
-REF_BONUS_DAYS = int(os.getenv("REF_BONUS_DAYS", "2"))  # هدية للمحالّ عند أول تفعيل مدفوع
-_BOT_USERNAME_CACHE: Optional[str] = None  # يُملأ تلقائيًا من get_me()
-
-def _load_referrals() -> dict:
-    try:
-        if REFERRALS_FILE.exists():
-            return json.loads(REFERRALS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {"created_at": datetime.utcnow().isoformat(), "by_user": {}}
-
-def _save_referrals(data: dict):
-    try:
-        REFERRALS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e:
-        logging.getLogger("bot").warning(f"REF SAVE WARN: {e}")
-
-def record_referral_if_new(new_user_id: int, referrer_id: int) -> bool:
-    """تسجّل الإحالة إذا لم تكن موجودة. تُعيد True إذا تم التسجيل الآن."""
-    if new_user_id == referrer_id:
-        return False
-    data = _load_referrals()
-    by_user = data.setdefault("by_user", {})
-    key = str(new_user_id)
-    if key in by_user:
-        return False
-    by_user[key] = {
-        "referrer": int(referrer_id),
-        "created_at": datetime.utcnow().isoformat(),
-        "rewarded": False,
-        "converted_at": None,
-    }
-    _save_referrals(data)
-    return True
-
-def _referral_for_user(uid: int) -> Optional[dict]:
-    data = _load_referrals()
-    return data.get("by_user", {}).get(str(uid))
-
-def mark_referral_rewarded(uid: int):
-    data = _load_referrals()
-    row = data.get("by_user", {}).get(str(uid))
-    if not row:
-        return
-    row["rewarded"] = True
-    row["converted_at"] = datetime.utcnow().isoformat()
-    _save_referrals(data)
-
-def referral_stats() -> dict:
-    data = _load_referrals()
-    by_user = data.get("by_user", {})
-    total = len(by_user)
-    rewarded = sum(1 for v in by_user.values() if v.get("rewarded"))
-    refers = {}
-    for v in by_user.values():
-        rid = v.get("referrer")
-        if rid:
-            refers[rid] = refers.get(rid, 0) + 1
-    top_ref = None
-    if refers:
-        rid, cnt = max(refers.items(), key=lambda x: x[1])
-        top_ref = {"user_id": rid, "count": cnt}
-    return {"total": total, "rewarded": rewarded, "top_ref": top_ref}
-
-async def get_bot_username(bot: Bot) -> str:
-    global _BOT_USERNAME_CACHE
-    if _BOT_USERNAME_CACHE:
-        return _BOT_USERNAME_CACHE
-    try:
-        me = await bot.get_me()
-        if getattr(me, "username", None):
-            _BOT_USERNAME_CACHE = me.username
-        else:
-            _BOT_USERNAME_CACHE = ""
-    except Exception:
-        _BOT_USERNAME_CACHE = ""
-    return _BOT_USERNAME_CACHE
-
-def make_ref_link(username: str, user_id: int) -> str:
-    if not username:
-        # fallback: سيعمل الرابط العام ولو بدون اسم مستخدم (يحتاج open bot then paste ref code)
-        return f"https://t.me/{username}?start=ref_{user_id}" if username else f"ref_{user_id}"
-    return f"https://t.me/{username}?start=ref_{user_id}"
-
-# -----------------------------------
-from strategy import check_signal  # NOTE: الاستراتيجية الآن أكثر ثقة (STRICT filters)
+# Strategy & Symbols
+from strategy import check_signal  # NOTE: your new stronger strategy
 from symbols import SYMBOLS
 
 # ---------------------------
-# إعدادات عامة
+# Logging
 # ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
+# ---------------------------
+# Globals & Config
+# ---------------------------
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+# Branding & copy
+BRAND_NAME = os.getenv("BRAND_NAME", "عالم الفرص")
+FEATURE_TAGLINE = os.getenv("FEATURE_TAGLINE", "3 مستويات أهداف، وقف R-based، تقرير يومي")
+START_BANNER_EMOJI = os.getenv("START_BANNER_EMOJI", "🚀")
+REF_BONUS_DAYS = int(os.getenv("REF_BONUS_DAYS", "2"))
+SHOW_REF_IN_START = os.getenv("SHOW_REF_IN_START", "1") == "1"
 
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: List[str] = []
 
-# ==== Rate Limiter لواجهات OKX العامة ====
-OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))  # طلبات لكل نافذة
-OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))  # مدة النافذة بالثواني
+# Rate limiter for OKX public
+OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))
+OKX_PUBLIC_WIN = float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))
 
 class SlidingRateLimiter:
     def __init__(self, max_calls: int, window_sec: float):
-        self.max_calls = max_calls
-        self.window = window_sec
-        self.calls = deque()
-        self._lock = asyncio.Lock()
-
+        self.max_calls = max_calls; self.window = window_sec
+        self.calls = deque(); self._lock = asyncio.Lock()
     async def wait(self):
-        # تجنّب الانتظار المتكرر داخل القفل
         while True:
             async with self._lock:
                 now = asyncio.get_running_loop().time()
                 while self.calls and (now - self.calls[0]) > self.window:
                     self.calls.popleft()
                 if len(self.calls) < self.max_calls:
-                    self.calls.append(now)
-                    return
+                    self.calls.append(now); return
                 sleep_for = self.window - (now - self.calls[0]) + 0.05
             await asyncio.sleep(max(sleep_for, 0.05))
 
 RATE = SlidingRateLimiter(OKX_PUBLIC_MAX, OKX_PUBLIC_WIN)
 
-# جداول المسح
+# Scan/Monitor intervals
 SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "300"))
 MONITOR_INTERVAL_SEC = int(os.getenv("MONITOR_INTERVAL_SEC", "15"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
-# ضبط التوازي والدفعات لمسح الشموع
 SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "10"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
 
-# مخاطر V2
+# Risk V2
 RISK_STATE_FILE = Path("risk_state.json")
 MAX_DAILY_LOSS_R = float(os.getenv("MAX_DAILY_LOSS_R", "2.0"))
 MAX_LOSSES_STREAK = int(os.getenv("MAX_LOSSES_STREAK", "3"))
@@ -241,36 +191,47 @@ COOLDOWN_HOURS = int(os.getenv("COOLDOWN_HOURS", "6"))
 
 AUDIT_IDS: Dict[int, str] = {}
 
-# Dedupe نافذة لمنع تكرار الإشارات المتقاربة
+# Dedupe window for signals
 DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))
-_LAST_SIGNAL_AT: Dict[str, float] = {}
+_last_signal_at: Dict[str, float] = {}
 
-# === رسائل تحفيزية للصفقات + تتبّع وصول TP1 دون إغلاق
+# Messages cache per trade
 MESSAGES_CACHE: Dict[int, Dict[str, str]] = {}
 HIT_TP1: Dict[int, bool] = {}
 
-# ===== دعم تواصل خاص مع الأدمن =====
+# Support DM
 SUPPORT_CHAT_ID: Optional[int] = int(os.getenv("SUPPORT_CHAT_ID")) if os.getenv("SUPPORT_CHAT_ID") else None
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME")
 
-# ===== روابط دعوة القناة =====
-CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # إن وفّرت رابطًا ثابتًا (fallback)
+# Channel invite links
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # static fallback
 
-# إعدادات التجربة/التذكير/الإزالة
-TRIAL_INVITE_HOURS = int(os.getenv("TRIAL_INVITE_HOURS", "24"))  # مدة رابط التجربة
+# Trial/reminders
+TRIAL_INVITE_HOURS = int(os.getenv("TRIAL_INVITE_HOURS", "24"))
 KICK_CHECK_INTERVAL_SEC = int(os.getenv("KICK_CHECK_INTERVAL_SEC", "3600"))
 REMINDER_BEFORE_HOURS = int(os.getenv("REMINDER_BEFORE_HOURS", "4"))
 _SENT_SOON_REM: set[int] = set()
 
-# ===== إعداد خيار اليوم المجاني (هدية) للأدمن =====
+# Gift 1-day (admin only)
 GIFT_ONE_DAY_HOURS = int(os.getenv("GIFT_ONE_DAY_HOURS", "24"))
 
-# =====================================================
-#                   وظائف مساعدة عامة
-# =====================================================
+# Bot username cache
+_BOT_USERNAME: Optional[str] = os.getenv("BOT_USERNAME_OVERRIDE") or None
 
+# ===== Helpers =====
 def _h(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+async def _get_bot_username() -> str:
+    global _BOT_USERNAME
+    if _BOT_USERNAME:
+        return _BOT_USERNAME
+    try:
+        me = await bot.get_me()
+        _BOT_USERNAME = me.username
+    except Exception:
+        _BOT_USERNAME = os.getenv("BOT_USERNAME_OVERRIDE") or "YourBot"
+    return _BOT_USERNAME
 
 def _make_audit_id(symbol: str, entry: float, score: int) -> str:
     base = f"{datetime.utcnow().strftime('%Y-%m-%d')}_{symbol}_{round(float(entry), 4)}_{int(score or 0)}"
@@ -294,10 +255,14 @@ async def send_admins(text: str, reply_markup: InlineKeyboardMarkup | None = Non
             logger.warning(f"ADMIN NOTIFY ERROR: {e}")
 
 def list_active_user_ids() -> list[int]:
+    # Prefer DB helper if available (faster)
     try:
         with get_session() as s:
+            if REFERRAL_ENABLED:
+                return db_list_active_uids(s)
+            # fallback generic
             now = datetime.now(timezone.utc)
-            rows = s.query(User.tg_user_id).filter(User.end_at != None, User.end_at > now).all()  # noqa: E711
+            rows = s.query(User.tg_user_id).filter(User.end_at != None, User.end_at > now).all()  # noqa
             return [r[0] for r in rows if r[0]]
     except Exception as e:
         logger.warning(f"list_active_user_ids warn: {e}")
@@ -323,45 +288,30 @@ def _contact_line() -> str:
         parts.append(f"⚡️ افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
     return "\n".join(parts) if parts else "—"
 
-# =====================================================
-#           ترحيب وتسويق (A/B) + روابط إحالة
-# =====================================================
+# ===== Referrals =====
+async def _build_ref_link(uid: int, session) -> tuple[str, str]:
+    """Returns (code, link)"""
+    code = ensure_referral_code(session, uid) if REFERRAL_ENABLED else ""
+    uname = await _get_bot_username()
+    link = f"https://t.me/{uname}?start=ref_{code}" if code else ""
+    return code, link
 
-def _price_wallet_lines() -> tuple[str, str]:
-    price_line = ""
-    try:
-        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
-    except Exception:
-        pass
-    wallet_line = ""
-    try:
-        if USDT_TRC20_WALLET:
-            wallet_line = f"💳 محفظة USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n"
-    except Exception:
-        pass
-    return price_line, wallet_line
+def _parse_start_payload(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    payload = parts[1].strip()
+    if payload.lower().startswith("ref_"):
+        return payload[4:].strip()
+    # accept naked codes too
+    return payload if payload else None
 
-async def welcome_text_ab(user_id: int) -> str:
-    """نسختان تسويقيتان؛ نربط المستخدم بنسخة ثابتة عبر user_id للحفاظ على A/B"""
-    price_line, wallet_line = _price_wallet_lines()
-    ref_hint = "🎁 مكافأة الإحالة: احصل على <b>يومين هدية</b> عند تفعيل صديقك لاشتراكه عبر رابطك!"
-    core = (
-        f"🔔 إشارات لحظية + تقرير يومي + إدارة مخاطر R-based.\n"
-        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
-        "خطط الاشتراك:\n" + price_line +
-        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيقوم الأدمن بالتفعيل.\n\n" +
-        ref_hint + "\n\n" +
-        wallet_line +
-        "📞 تواصل مباشر مع الأدمن:\n" + _contact_line()
-    )
-    variant = "A" if (user_id % 2 == 0) else "B"
-    if variant == "A":
-        header = "👋 أهلاً بك في <b>عالم الفرص</b>\n\n"
-        sub = "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>."
-    else:
-        header = "🚀 <b>خطوتك الأولى نحو تداول منضبط</b>\n\n"
-        sub = "✨ جرّب كل المزايا مجانًا لمدة <b>24 ساعة</b> – بدون التزام."
-    return header + core + "\n\n" + sub
+def invite_kb(url: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📣 ادخل القناة الآن", url=url)
+    return kb.as_markup()
 
 def support_dm_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -371,43 +321,67 @@ def support_dm_kb() -> InlineKeyboardMarkup:
         kb.button(text="💬 مراسلة الأدمن (خاص)", url=f"tg://user?id={SUPPORT_CHAT_ID}")
     return kb.as_markup()
 
-def invite_kb(url: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📣 ادخل القناة الآن", url=url)
-    return kb.as_markup()
+async def welcome_text(user_id: Optional[int] = None) -> str:
+    price_line = ""
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
+    wallet_line = ""
+    try:
+        if USDT_TRC20_WALLET:
+            wallet_line = f"💳 USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n"
+    except Exception:
+        pass
 
-def myref_kb(url: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔗 نسخ رابط الإحالة", url=url)
-    kb.button(text="📤 شاركه مع صديق", url=url)
-    kb.adjust(1)
-    return kb.as_markup()
+    ref_hint = ""
+    if REFERRAL_ENABLED and SHOW_REF_IN_START and user_id:
+        try:
+            with get_session() as s:
+                code, link = await _build_ref_link(user_id, s)
+            if link:
+                ref_hint = f"\n🎁 <b>برنامج الإحالة:</b> شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.\nرابطك: <a href='{link}'>اضغط هنا</a>\n"
+        except Exception:
+            pass
 
-# =====================================================
-#          تنسيق رسائل الإشارة/الإغلاق (محسّن)
-# =====================================================
+    tagline = os.getenv("FEATURE_TAGLINE", FEATURE_TAGLINE)
 
+    return (
+        f"{START_BANNER_EMOJI} أهلاً بك في <b>{BRAND_NAME}</b>\n"
+        f"✨ {tagline}\n\n"
+        "🔔 إشارات لحظية بتصفية صارمة + إدارة مخاطرة R-based + تقرير أداء يومي.\n"
+        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
+        "الخطط:\n"
+        f"{price_line}"
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيقوم الأدمن بالتفعيل.\n"
+        f"✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
+        f"{wallet_line}"
+        f"{ref_hint}"
+        "📞 تواصل مباشر:\n" + _contact_line()
+    )
+
+# ===== Signal / close message formatting (with subtle improvements) =====
 def format_signal_text_basic(sig: dict) -> str:
     extra = ""
     if "score" in sig or "regime" in sig:
         extra = f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
         if sig.get("reasons"):
-            extra += f"\n🧠 أسباب مختصرة: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+            extra += f"\n🧠 كونفلوينس: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
     tp3_line = f"\n🏁 الهدف 3: <code>{sig.get('tp3')}</code>" if sig.get("tp3") is not None else ""
-    carrot = "\n🧩 إدارة: جزئية على الأهداف + تريلينغ بعد TP2 لحماية الربح."
+    strat_line = f"\n🧭 النمط: <b>{_h(sig.get('strategy_code','-'))}</b> | ملف: <i>{_h(sig.get('profile','-'))}</i>" if sig.get("strategy_code") else ""
     return (
-        "🚀 <b>إشارة شراء جديدة!</b>\n"
+        "🚀 <b>إشارة شراء</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
         f"💵 الدخول: <code>{sig['entry']}</code>\n"
         f"📉 الوقف: <code>{sig['sl']}</code>\n"
         f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
         f"🏁 الهدف 2: <code>{sig['tp2']}</code>"
-        f"{tp3_line}\n"
+        f"{tp3_line}{strat_line}\n"
         f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
-        f"{extra}{carrot}\n"
+        f"{extra}\n"
         "━━━━━━━━━━━━━━\n"
-        "⚡️ <i>التزم بالخطة: مخاطرة ثابتة، لا تلحق بالسعر.</i>"
+        "⚡️ <i>قاعدة المخاطرة: أقصى 1% لكل صفقة، وبدون مطاردة للسعر.</i>"
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
@@ -432,10 +406,9 @@ def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
         f"{tip}"
     )
 
-# =====================================================
-#                   إدارة المخاطر
-# =====================================================
-
+# ---------------------------
+# Risk State helpers
+# ---------------------------
 def _load_risk_state() -> dict:
     try:
         if RISK_STATE_FILE.exists():
@@ -477,17 +450,14 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
         r_multiple = 0.0 if R <= 0 else (float(exit_price) - float(t.entry)) / R
     except Exception:
         r_multiple = 0.0
-
     state = _reset_if_new_day(_load_risk_state())
     state["r_today"] = round(float(state.get("r_today", 0.0)) + r_multiple, 6)
     state["loss_streak"] = int(state.get("loss_streak", 0)) + 1 if r_multiple < 0 else 0
-
     cooldown_reason = None
     if float(state["r_today"]) <= -MAX_DAILY_LOSS_R:
         cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
     if int(state["loss_streak"]) >= MAX_LOSSES_STREAK:
         cooldown_reason = (cooldown_reason + " + " if cooldown_reason else "") + f"{MAX_LOSSES_STREAK} خسائر متتالية"
-
     if cooldown_reason:
         until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
         state["cooldown_until"] = until.isoformat()
@@ -505,10 +475,9 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
         _save_risk_state(state)
     return r_multiple
 
-# =====================================================
-#                        OKX
-# =====================================================
-
+# ---------------------------
+# OKX
+# ---------------------------
 async def load_okx_markets_and_filter():
     global AVAILABLE_SYMBOLS
     try:
@@ -523,10 +492,9 @@ async def load_okx_markets_and_filter():
         logger.exception(f"load_okx_markets error: {e}")
         AVAILABLE_SYMBOLS = []
 
-# =====================================================
-#                 جلب البيانات/الأسعار
-# =====================================================
-
+# ---------------------------
+# Data fetchers
+# ---------------------------
 async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300):
     for attempt in range(4):
         try:
@@ -557,12 +525,9 @@ async def fetch_ticker_price(symbol: str) -> float | None:
             return None
     return None
 
-# =====================================================
-#               Dedupe: منع تكرار الإشارات
-# =====================================================
-
-_last_signal_at: Dict[str, float] = {}
-
+# ---------------------------
+# Dedupe signals
+# ---------------------------
 def _should_skip_duplicate(sig: dict) -> bool:
     sym = sig.get("symbol")
     if not sym:
@@ -574,10 +539,9 @@ def _should_skip_duplicate(sig: dict) -> bool:
     _last_signal_at[sym] = now
     return False
 
-# =====================================================
-#       فحص الإشارات (Batch + Concurrency)
-# =====================================================
-
+# ---------------------------
+# Scan & Dispatch
+# ---------------------------
 SCAN_LOCK = asyncio.Lock()
 
 async def _send_signal_to_channel(sig: dict, audit_id: str | None) -> None:
@@ -629,20 +593,14 @@ async def scan_and_dispatch():
                         logger.exception(f"add_trade_sig error, fallback to add_trade: {e}")
                         trade_id = add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
                     AUDIT_IDS[trade_id] = audit_id
-                    # خزّن رسائل الصفقة (إن وُجدت في الإشارة)
                     if sig.get("messages"):
-                        try:
-                            MESSAGES_CACHE[trade_id] = dict(sig["messages"])
-                        except Exception:
-                            pass
+                        try: MESSAGES_CACHE[trade_id] = dict(sig["messages"])
+                        except Exception: pass
                     try:
-                        # رسالة الإشارة الأساسية
                         await _send_signal_to_channel(sig, audit_id)
-                        # رسالة "الدخول" التحفيزية (اختيارية)
                         entry_msg = (sig.get("messages") or {}).get("entry")
                         if entry_msg:
                             await notify_subscribers(entry_msg)
-                        # ملاحظة قصيرة للمشتركين
                         note = (
                             "🚀 <b>إشارة جديدة وصلت!</b>\n"
                             "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
@@ -670,12 +628,11 @@ async def loop_signals():
         sleep_for = max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed)
         await asyncio.sleep(sleep_for)
 
-# =====================================================
-#   مراقبة الصفقات (TP1 إشعار فقط / TP2 & SL إغلاق)
-# =====================================================
-
+# ---------------------------
+# Monitor open trades
+# ---------------------------
 async def monitor_open_trades():
-    from types import SimpleNamespace  # لرسالة TP1 التصويرية
+    from types import SimpleNamespace
     while True:
         try:
             with get_session() as s:
@@ -688,7 +645,6 @@ async def monitor_open_trades():
                     hit_tp1 = price >= t.tp1
                     hit_sl = price <= t.sl
 
-                    # الإغلاق عند SL أو TP2 فقط
                     result, exit_px = None, None
                     if hit_sl:
                         result, exit_px = "sl", float(t.sl)
@@ -702,28 +658,22 @@ async def monitor_open_trades():
                         except Exception as e:
                             logger.warning(f"close_trade warn: {e}")
                         msg = format_close_text(t, r_multiple)
-                        # أضف الرسالة التحفيزية لو وُجدت
                         try:
                             extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
-                            if extra:
-                                msg += "\n\n" + extra
+                            if extra: msg += "\n\n" + extra
                         except Exception:
                             pass
                         await notify_subscribers(msg)
                         await asyncio.sleep(0.05)
-                        continue  # انتهت هذه الصفقة (أُغلقت)
+                        continue
 
-                    # TP1 — إشعار مرة واحدة فقط، دون إغلاق فعلي
                     if hit_tp1 and not HIT_TP1.get(t.id):
                         HIT_TP1[t.id] = True
-                        tmp = SimpleNamespace(
-                            symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1"
-                        )
+                        tmp = SimpleNamespace(symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1")
                         msg = format_close_text(tmp, None)
                         try:
                             extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp1")
-                            if extra:
-                                msg += "\n\n" + extra
+                            if extra: msg += "\n\n" + extra
                         except Exception:
                             pass
                         msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
@@ -733,19 +683,17 @@ async def monitor_open_trades():
             logger.exception(f"MONITOR ERROR: {e}")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
 
-# =====================================================
-#    مهام الاشتراكات: إزالة المنتهين + تذكير قبل الانتهاء
-# =====================================================
-
+# ---------------------------
+# Membership housekeeping
+# ---------------------------
 async def kick_expired_members_loop():
-    """إزالة من انتهت صلاحيتهم من القناة + رسالة خاصة لطيفة للترقية."""
     while True:
         try:
             now = datetime.now(timezone.utc)
             with get_session() as s:
                 expired = (
                     s.query(User)
-                    .filter(User.end_at != None, User.end_at <= now)  # noqa: E711
+                    .filter(User.end_at != None, User.end_at <= now)  # noqa
                     .all()
                 )
                 for u in expired:
@@ -756,7 +704,6 @@ async def kick_expired_members_loop():
                             await bot.ban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
                             await asyncio.sleep(0.3)
                             await bot.unban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
-                        # إشعار خاص
                         try:
                             await bot.send_message(
                                 u.tg_user_id,
@@ -774,7 +721,6 @@ async def kick_expired_members_loop():
         await asyncio.sleep(max(60, KICK_CHECK_INTERVAL_SEC))
 
 async def notify_trial_expiring_soon_loop():
-    """تذكير جميع المنتهين خلال REMINDER_BEFORE_HOURS القادمة (مرّة واحدة لكل مستخدم)."""
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -782,7 +728,7 @@ async def notify_trial_expiring_soon_loop():
             with get_session() as s:
                 rows = (
                     s.query(User)
-                    .filter(User.end_at != None, User.end_at > now, User.end_at <= soon)  # noqa: E711
+                    .filter(User.end_at != None, User.end_at > now, User.end_at <= soon)  # noqa
                     .all()
                 )
                 for u in rows:
@@ -794,6 +740,7 @@ async def notify_trial_expiring_soon_loop():
                             u.tg_user_id,
                             f"⏰ تبقّى حوالي {left_min} دقيقة على نهاية صلاحيتك.\n"
                             "✅ فعّل اشتراكك الآن لتستمر الإشارات بدون انقطاع. استخدم /start.",
+                            parse_mode="HTML",
                         )
                         _SENT_SOON_REM.add(u.tg_user_id)
                     except Exception:
@@ -801,26 +748,25 @@ async def notify_trial_expiring_soon_loop():
                     await asyncio.sleep(0.05)
         except Exception as e:
             logger.debug(f"notify_expiring_soon: {e}")
-        await asyncio.sleep(900)  # كل 15 دقيقة
+        await asyncio.sleep(900)
 
-# =====================================================
-#                       التقرير اليومي
-# =====================================================
-
+# ---------------------------
+# Reports
+# ---------------------------
 def _report_card(stats_24: dict, stats_7d: dict) -> str:
     return (
         "📊 <b>التقرير اليومي — لقطة أداء مركّزة</b>\n"
         "━━━━━━━━━━━━━━\n"
         "<b>آخر 24 ساعة</b>\n"
-        f"• إشارات: <b>{stats_24['signals']}</b> | صفقات مفتوحة الآن: <b>{stats_24['open']}</b>\n"
-        f"• محقق من الأهداف: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})\n"
+        f"• إشارات: <b>{stats_24['signals']}</b> | صفقات مفتوحة: <b>{stats_24['open']}</b>\n"
+        f"• أهداف: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})\n"
         f"• وقف خسارة: <b>{stats_24['sl']}</b>\n"
-        f"• معدل نجاح: <b>{stats_24['win_rate']}%</b>\n"
-        f"• صافي R تقريبي: <b>{stats_24['r_sum']}</b>\n"
+        f"• نجاح: <b>{stats_24['win_rate']}%</b>\n"
+        f"• صافي R: <b>{stats_24['r_sum']}</b>\n"
         "━━━━━━━━━━━━━━\n"
         "<b>آخر 7 أيام</b>\n"
         f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>\n"
-        f"• معدل نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>\n"
+        f"• نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>\n"
         "━━━━━━━━━━━━━━\n"
         "💡 <i>الخطة أهم من الضجيج: مخاطرة ثابتة + التزام بالأهداف.</i>"
     )
@@ -852,70 +798,92 @@ async def daily_report_loop():
             except Exception as e2:
                 logger.exception(f"DAILY_REPORT RETRY FAILED: {e2}")
 
-# =====================================================
-#                     أوامر المستخدم
-# =====================================================
-
-def _parse_start_payload(text: str) -> Optional[str]:
-    """يعيد البارامتر بعد /start إن وجد (مثل ref_12345)"""
-    if not text:
-        return None
-    parts = text.strip().split(maxsplit=1)
-    if len(parts) == 2 and parts[0].startswith("/start"):
-        return parts[1].strip()
-    return None
-
+# ---------------------------
+# User Commands
+# ---------------------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    # التقاط بارامتر الإحالة إن وجد
-    payload = _parse_start_payload(m.text or "")
-    if payload and payload.startswith("ref_"):
+    # Try to link referral from deep link
+    payload_code = _parse_start_payload(m.text)
+    if REFERRAL_ENABLED and payload_code:
         try:
-            ref_id = int(payload.replace("ref_", "").strip())
-            if record_referral_if_new(m.from_user.id, ref_id):
-                try:
-                    await bot.send_message(ref_id, f"🤝 مستخدم جديد وصل عبر رابطك: <code>{m.from_user.id}</code>")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            with get_session() as s:
+                linked, reason = link_referred_by(s, m.from_user.id, payload_code)
+            if linked:
+                await m.answer("🤝 تم تسجيل كود الإحالة بنجاح. عند أول تفعيل مدفوع ستحصل على هدية الأيام تلقائيًا 🎁", parse_mode="HTML")
+            else:
+                await m.answer(f"ℹ️ لم يتم ربط الإحالة: {reason}", parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"link_referred_by error: {e}")
 
     kb = InlineKeyboardBuilder()
     kb.button(text="🔑 طلب اشتراك", callback_data="req_sub")
     kb.button(text="✨ ابدأ التجربة المجانية (يوم واحد)", callback_data="start_trial")
     kb.button(text="🧾 حالة اشتراكي", callback_data="status_btn")
-    kb.button(text="🤝 رابط إحالة خاص بي", callback_data="myref_btn")
+    if REFERRAL_ENABLED and SHOW_REF_IN_START:
+        kb.button(text="🎁 رابط دعوة صديق", callback_data="show_ref_link")
     kb.adjust(1)
-    txt = await welcome_text_ab(m.from_user.id)
-    await m.answer(txt, parse_mode="HTML", reply_markup=kb.as_markup())
-
-    # زر مراسلة الأدمن
+    await m.answer(await welcome_text(m.from_user.id), parse_mode="HTML", reply_markup=kb.as_markup())
     if SUPPORT_USERNAME or SUPPORT_CHAT_ID:
         await m.answer("تحتاج مساعدة؟ راسل الأدمن مباشرة:", reply_markup=support_dm_kb())
 
-@dp.callback_query(F.data == "myref_btn")
-async def cb_myref_btn(q: CallbackQuery):
-    uname = await get_bot_username(bot)
-    link = make_ref_link(uname, q.from_user.id)
-    await q.message.answer(
-        "🤝 <b>رابط إحالتك</b>\n"
-        "أرسل هذا الرابط لصديقك، وعند أول تفعيل مدفوع له سيحصل على يومين هدية.\n\n"
-        f"<code>{link}</code>",
-        parse_mode="HTML",
-        reply_markup=myref_kb(link)
-    )
-    await q.answer()
+@dp.callback_query(F.data == "show_ref_link")
+async def cb_show_ref(q: CallbackQuery):
+    if not REFERRAL_ENABLED:
+        await q.answer("برنامج الإحالة غير مفعل حاليًا.", show_alert=True); return
+    try:
+        with get_session() as s:
+            code, link = await _build_ref_link(q.from_user.id, s)
+        if not link:
+            return await q.answer("تعذر إنشاء الرابط حالياً.", show_alert=True)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔗 افتح رابط دعوتي", url=link)
+        kb.adjust(1)
+        await q.message.answer(
+            f"🎁 شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.\n"
+            f"<code>{link}</code>",
+            parse_mode="HTML",
+            reply_markup=kb.as_markup()
+        )
+    except Exception as e:
+        logger.warning(f"show_ref_link error: {e}")
+        await q.answer("خطأ غير متوقع.", show_alert=True)
 
-@dp.message(Command("myref"))
-async def cmd_myref(m: Message):
-    uname = await get_bot_username(bot)
-    link = make_ref_link(uname, m.from_user.id)
-    await m.answer(
-        "🤝 <b>رابط إحالتك</b>\n"
-        f"<code>{link}</code>",
-        parse_mode="HTML",
-        reply_markup=myref_kb(link)
+@dp.message(Command("ref"))
+async def cmd_ref(m: Message):
+    if not REFERRAL_ENABLED:
+        return await m.answer("ℹ️ برنامج الإحالة غير مفعل حالياً.", parse_mode="HTML")
+    with get_session() as s:
+        code, link = await _build_ref_link(m.from_user.id, s)
+        stats = {}
+        try:
+            stats = get_ref_stats(s, m.from_user.id) or {}
+        except Exception:
+            stats = {}
+    txt = (
+        "🎁 <b>برنامج الإحالة</b>\n"
+        f"• رابطك: <code>{link or '—'}</code>\n"
+        f"• مدعوون: <b>{stats.get('referred_count',0)}</b>\n"
+        f"• اشتركات مدفوعة عبرك: <b>{stats.get('paid_count',0)}</b>\n"
+        f"• أيام هدية: <b>{stats.get('total_bonus_days',0)}</b>\n"
+        "ارسل لأصدقائك هذا الرابط. عند أول اشتراك مدفوع لصديقك تحصلون على الهدية حسب سياسة البونص."
     )
+    await m.answer(txt, parse_mode="HTML")
+
+@dp.message(Command("use_ref"))
+async def cmd_use_ref(m: Message):
+    if not REFERRAL_ENABLED:
+        return await m.answer("ℹ️ برنامج الإحالة غير مفعل حالياً.", parse_mode="HTML")
+    parts = (m.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("استخدم: <code>/use_ref CODE</code>", parse_mode="HTML")
+    code = parts[1].strip()
+    with get_session() as s:
+        linked, reason = link_referred_by(s, m.from_user.id, code)
+    if linked:
+        await m.answer("🤝 تم ربط الإحالة بنجاح. عند أول تفعيل مدفوع ستحصل على الهدية 🎁", parse_mode="HTML")
+    else:
+        await m.answer(f"ℹ️ لم يتم الربط: {reason}", parse_mode="HTML")
 
 @dp.callback_query(F.data == "status_btn")
 async def cb_status_btn(q: CallbackQuery):
@@ -939,7 +907,6 @@ async def cb_trial(q: CallbackQuery):
             "🚀 استمتع بالإشارات والتقرير اليومي.",
             parse_mode="HTML"
         )
-        # إرسال دعوة للقناة (تجربة)
         invite = await get_trial_invite_link(q.from_user.id)
         if invite:
             try:
@@ -954,7 +921,6 @@ async def cb_trial(q: CallbackQuery):
         )
     await q.answer()
 
-# أمر نصّي للتجربة
 @dp.message(Command("trial"))
 async def cmd_trial(m: Message):
     with get_session() as s:
@@ -970,7 +936,49 @@ async def cmd_trial(m: Message):
     else:
         await m.answer("ℹ️ لقد استخدمت التجربة المجانية مسبقًا.", parse_mode="HTML")
 
-# === زر "طلب اشتراك" للمستخدم → إشعار للأدمن + إرشاد دفع للمستخدم ===
+# Invite link helpers
+async def get_channel_invite_link() -> Optional[str]:
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
+    try:
+        inv = await bot.create_chat_invite_link(TELEGRAM_CHANNEL_ID, creates_join_request=False)
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK create failed: {e}")
+        return None
+
+async def get_trial_invite_link(user_id: int) -> Optional[str]:
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
+    try:
+        expires_at = datetime.utcnow() + timedelta(hours=TRIAL_INVITE_HOURS)
+        inv = await bot.create_chat_invite_link(
+            TELEGRAM_CHANNEL_ID,
+            name=f"trial_{user_id}",
+            expire_date=int(expires_at.replace(tzinfo=timezone.utc).timestamp()),
+            member_limit=1,
+            creates_join_request=False,
+        )
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK(TRIAL) create failed: {e}")
+        return None
+
+async def get_paid_invite_link(user_id: int) -> Optional[str]:
+    if CHANNEL_INVITE_LINK:
+        return CHANNEL_INVITE_LINK
+    try:
+        inv = await bot.create_chat_invite_link(
+            TELEGRAM_CHANNEL_ID,
+            name=f"paid_{user_id}",
+            creates_join_request=False,
+        )
+        return inv.invite_link
+    except Exception as e:
+        logger.warning(f"INVITE_LINK(PAID) create failed: {e}")
+        return None
+
+# === User purchase request flow ===
 @dp.callback_query(F.data == "req_sub")
 async def cb_req_sub(q: CallbackQuery):
     u = q.from_user
@@ -978,7 +986,6 @@ async def cb_req_sub(q: CallbackQuery):
     uname = (u.username and f"@{u.username}") or (u.full_name or "")
     user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
 
-    # إشعار للأدمن مع أزرار الموافقة/الرفض + يوم مجاني
     kb_admin = InlineKeyboardBuilder()
     kb_admin.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
     kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
@@ -992,65 +999,32 @@ async def cb_req_sub(q: CallbackQuery):
         reply_markup=kb_admin.as_markup(),
     )
 
-    # رسالة للمستخدم: الأسعار + عنوان المحفظة + زر مراسلة الأدمن
-    price_line, wallet_line = _price_wallet_lines()
+    price_line = ""
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
+    wallet_line = ""
+    try:
+        if USDT_TRC20_WALLET:
+            wallet_line = f"💳 محفظة USDT (TRC20):\n<code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
+    except Exception:
+        pass
     await q.message.answer(
         "📩 تم إرسال طلبك للأدمن.\n"
         "يرجى التحويل ثم مراسلة الأدمن لتأكيد التفعيل.\n\n"
         "الخطط:\n"
         f"{price_line}"
-        f"{wallet_line}\n"
-        "بعد التأكيد ستستلم رابط الدخول للقناة تلقائيًا.\n\n"
-        "🤝 تذكير: عند انضمام صديق عبر رابطك وتفعيله، سيحصل على يومين هدية.",
+        f"{wallet_line}"
+        "بعد التأكيد ستستلم رابط الدخول للقناة تلقائيًا.",
         parse_mode="HTML",
         reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None,
     )
     await q.answer()
 
-# =====================================================
-#        موافقات الأدمن — مع مكافأة الإحالة تلقائيًا
-# =====================================================
-
-def _base_duration_from_plan(plan: str) -> timedelta:
-    if plan == "2w":
-        return SUB_DURATION_2W
-    elif plan == "4w":
-        return SUB_DURATION_4W
-    else:
-        return timedelta(hours=GIFT_ONE_DAY_HOURS)
-
-def _apply_referral_bonus_if_eligible(uid: int, plan: str, base_dur: timedelta) -> tuple[timedelta, Optional[int]]:
-    """إن كان هذا المستخدم محالًا ولم يُكافأ بعد، زد المدة بيومي هدية وأعلِم المرجع."""
-    ref = _referral_for_user(uid)
-    if not ref or ref.get("rewarded"):
-        return base_dur, None
-    # لا نكافئ على هدية gift1d لأنها ليست تفعيلًا مدفوعًا
-    if plan not in ("2w", "4w"):
-        return base_dur, None
-    bonus = timedelta(days=REF_BONUS_DAYS)
-    return base_dur + bonus, int(ref.get("referrer") or 0) or None
-
-async def _post_approval_notify(uid: int, plan: str, end_at: datetime, referrer_id: Optional[int]):
-    try:
-        # رسالة للمستخدم
-        await bot.send_message(
-            uid,
-            f"✅ تم تفعيل اشتراكك ({plan}). صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>",
-            parse_mode="HTML"
-        )
-        # لو كان هناك رابط دعوة
-        invite = await get_paid_invite_link(uid)
-        if invite:
-            await bot.send_message(uid, "📣 ادخل القناة الآن:", reply_markup=invite_kb(invite))
-    except Exception as e:
-        logger.warning(f"USER DM/INVITE ERROR: {e}")
-
-    # إشعارات إحالة
-    if referrer_id:
-        try:
-            await bot.send_message(referrer_id, f"🎉 تهانينا! تحويل إحالة جديد تم تفعيله (User ID: <code>{uid}</code>).", parse_mode="HTML")
-        except Exception:
-            pass
+# === Admin Approvals (inline) ===
+def _bonus_applied_text(applied) -> str:
+    return "\n🎁 <i>تم إضافة هدية الإحالة (+{} يوم) تلقائيًا.</i>".format(REF_BONUS_DAYS) if applied else ""
 
 @dp.callback_query(F.data.startswith("approve_inline:"))
 async def cb_approve_inline(q: CallbackQuery):
@@ -1062,24 +1036,48 @@ async def cb_approve_inline(q: CallbackQuery):
         if plan not in ("2w", "4w", "gift1d"):
             return await q.answer("خطة غير صالحة.", show_alert=True)
 
-        # تحديد المدة + مكافأة إحالة إن لزم
-        base_dur = _base_duration_from_plan(plan)
-        dur, referrer_id = _apply_referral_bonus_if_eligible(uid, plan, base_dur)
+        # duration
+        if plan == "2w":
+            dur = SUB_DURATION_2W
+        elif plan == "4w":
+            dur = SUB_DURATION_4W
+        else:
+            dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
 
         with get_session() as s:
             end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
-        # علّم كمكافأ
-        if referrer_id:
-            mark_referral_rewarded(uid)
+            bonus_applied = False
+            if REFERRAL_ENABLED and plan in ("2w","4w"):
+                try:
+                    res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
+                    bonus_applied = bool(res)
+                except Exception as e:
+                    logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
 
         await q.message.answer(
             f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
             f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>"
-            + (f"\n🎁 شمل التفعيل مكافأة إحالة (+{REF_BONUS_DAYS} يوم)" if referrer_id else ""),
+            f"{_bonus_applied_text(bonus_applied)}",
             parse_mode="HTML",
         )
 
-        await _post_approval_notify(uid, plan, end_at, referrer_id)
+        # Send invite
+        invite = await get_paid_invite_link(uid)
+        try:
+            if invite:
+                title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                msg = title
+                if bonus_applied:
+                    msg += f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)."
+                await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
+            else:
+                await bot.send_message(
+                    uid,
+                    "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.warning(f"USER DM/INVITE ERROR: {e}")
         await q.answer("تم.")
     except Exception as e:
         logger.exception(f"APPROVE_INLINE ERROR: {e}")
@@ -1102,22 +1100,22 @@ async def cb_reject_inline(q: CallbackQuery):
         logger.exception(f"REJECT_INLINE ERROR: {e}")
         await q.answer("خطأ أثناء الرفض.", show_alert=True)
 
-# =====================================================
-#                     أوامر المساعدة
-# =====================================================
-
+# ---------------------------
+# General user commands
+# ---------------------------
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
-    text = (
+    txt = (
         "🤖 <b>أوامر المستخدم</b>\n"
-        "• <code>/start</code> – البداية والقائمة الرئيسية (+ يدعم روابط الإحالة)\n"
+        "• <code>/start</code> – البداية والقائمة الرئيسية\n"
         "• <code>/trial</code> – تجربة مجانية ليوم\n"
-        "• <code>/myref</code> – رابط إحالة خاص بك\n"
         "• <code>/status</code> – حالة الاشتراك\n"
+        "• <code>/ref</code> – رابط الإحالة وإحصاءاتك\n"
+        "• <code>/use_ref CODE</code> – ربط كود إحالة يدويًا\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
         "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
-    await m.answer(text, parse_mode="HTML")
+    await m.answer(txt, parse_mode="HTML")
 
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
@@ -1130,10 +1128,9 @@ async def cmd_status(m: Message):
         parse_mode="HTML",
     )
 
-# =====================================================
-#                     أوامر الأدمن
-# =====================================================
-
+# ---------------------------
+# Admin commands
+# ---------------------------
 @dp.message(Command("admin_help"))
 async def cmd_admin_help(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS:
@@ -1141,12 +1138,12 @@ async def cmd_admin_help(m: Message):
     txt = (
         "🛠️ <b>أوامر الأدمن</b>\n"
         "• <code>/admin</code> – لوحة الأزرار\n"
-        "• <code>/approve &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code> – تفعيل مباشر (مع مكافأة الإحالة تلقائيًا)\n"
-        "• <code>/activate &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code> – مرادف\n"
-        "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
-        "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية للمشتركين النشطين\n"
+        "• <code>/approve &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code>\n"
+        "• <code>/activate &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code>\n"
+        "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية\n"
         "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
-        "• <code>/refstats</code> – إحصاءات الإحالات (عدد المسجلين/المكافآت)"
+        "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
+        "• <code>/refstats &lt;user_id&gt;</code> – إحصاءات الإحالة للمستخدم\n"
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1175,6 +1172,8 @@ async def cb_admin_manual(q: CallbackQuery):
     ADMIN_FLOW[aid] = {"stage": "await_user"}
     await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
     await q.answer()
+
+ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
 
 @dp.message(F.text)
 async def admin_manual_router(m: Message):
@@ -1205,23 +1204,39 @@ async def admin_manual_router(m: Message):
         if ref.lower() in ("/skip", "skip", "تخطي", "تخطى"):
             ref = None
         uid = flow.get("uid"); plan = flow.get("plan")
-
-        base_dur = _base_duration_from_plan(plan)
-        dur, referrer_id = _apply_referral_bonus_if_eligible(uid, plan, base_dur)
-
+        if plan == "2w":
+            dur = SUB_DURATION_2W
+        elif plan == "4w":
+            dur = SUB_DURATION_4W
+        else:
+            dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
         try:
             with get_session() as s:
                 end_at = approve_paid(s, uid, plan, dur, tx_hash=ref)
-            if referrer_id:
-                mark_referral_rewarded(uid)
+                bonus_applied = False
+                if REFERRAL_ENABLED and plan in ("2w","4w"):
+                    try:
+                        res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
+                        bonus_applied = bool(res)
+                    except Exception as e:
+                        logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
             ADMIN_FLOW.pop(aid, None)
+            extra = f"{_bonus_applied_text(bonus_applied)}"
             await m.answer(
                 f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
-                f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>"
-                + (f"\n🎁 شمل التفعيل مكافأة إحالة (+{REF_BONUS_DAYS} يوم)" if referrer_id else ""),
+                f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>{extra}",
                 parse_mode="HTML",
             )
-            await _post_approval_notify(uid, plan, end_at, referrer_id)
+            invite = await get_paid_invite_link(uid)
+            try:
+                if invite:
+                    title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                    msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if bonus_applied else "")
+                    await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
+                else:
+                    await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"USER DM ERROR: {e}")
         except Exception as e:
             ADMIN_FLOW.pop(aid, None)
             await m.answer(f"❌ فشل التفعيل: {e}")
@@ -1259,23 +1274,39 @@ async def cb_admin_skip_ref(q: CallbackQuery):
     if not flow or flow.get("stage") != "await_ref":
         return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
     uid = flow.get("uid"); plan = flow.get("plan")
-
-    base_dur = _base_duration_from_plan(plan)
-    dur, referrer_id = _apply_referral_bonus_if_eligible(uid, plan, base_dur)
-
+    if plan == "2w":
+        dur = SUB_DURATION_2W
+    elif plan == "4w":
+        dur = SUB_DURATION_4W
+    else:
+        dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
     try:
         with get_session() as s:
             end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
-        if referrer_id:
-            mark_referral_rewarded(uid)
+            bonus_applied = False
+            if REFERRAL_ENABLED and plan in ("2w","4w"):
+                try:
+                    res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
+                    bonus_applied = bool(res)
+                except Exception as e:
+                    logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
         ADMIN_FLOW.pop(aid, None)
+        extra = f"{_bonus_applied_text(bonus_applied)}"
         await q.message.answer(
             f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>."
-            f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>"
-            + (f"\n🎁 شمل التفعيل مكافأة إحالة (+{REF_BONUS_DAYS} يوم)" if referrer_id else ""),
+            f"\nصالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>{extra}",
             parse_mode="HTML",
         )
-        await _post_approval_notify(uid, plan, end_at, referrer_id)
+        invite = await get_paid_invite_link(uid)
+        try:
+            if invite:
+                title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if bonus_applied else "")
+                await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
+            else:
+                await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"USER DM ERROR: {e}")
     except Exception as e:
         ADMIN_FLOW.pop(aid, None)
         await q.message.answer(f"❌ فشل التفعيل: {e}")
@@ -1298,19 +1329,33 @@ async def cmd_approve(m: Message):
         return await m.answer("استخدم: /approve <user_id> <2w|4w|gift1d> [reference]")
     uid = int(parts[1]); plan = parts[2]
     txh = parts[3] if len(parts) == 4 else None
-
-    base_dur = _base_duration_from_plan(plan)
-    dur, referrer_id = _apply_referral_bonus_if_eligible(uid, plan, base_dur)
-
+    if plan == "2w":
+        dur = SUB_DURATION_2W
+    elif plan == "4w":
+        dur = SUB_DURATION_4W
+    else:
+        dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
     with get_session() as s:
         end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
-    if referrer_id:
-        mark_referral_rewarded(uid)
+        bonus_applied = False
+        if REFERRAL_ENABLED and plan in ("2w","4w"):
+            try:
+                res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
+                bonus_applied = bool(res)
+            except Exception as e:
+                logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
     await m.answer(
         f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}."
-        + (f" (+{REF_BONUS_DAYS} يوم إحالة)" if referrer_id else "")
+        f"{_bonus_applied_text(bonus_applied)}"
     )
-    await _post_approval_notify(uid, plan, end_at, referrer_id)
+    invite = await get_paid_invite_link(uid)
+    if invite:
+        try:
+            msg = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+            if bonus_applied: msg += f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)."
+            await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
+        except Exception as e:
+            logger.warning(f"SEND INVITE ERROR (/approve): {e}")
 
 @dp.message(Command("activate"))
 async def cmd_activate(m: Message):
@@ -1363,20 +1408,28 @@ async def cmd_force_report(m: Message):
 async def cmd_refstats(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS:
         return
-    st = referral_stats()
-    msg = (
-        "📈 <b>إحصاءات الإحالات</b>\n"
-        f"• مسجّلون عبر روابط: <b>{st['total']}</b>\n"
-        f"• مكافآت مُطبّقة: <b>{st['rewarded']}</b>\n"
+    parts = (m.text or "").strip().split()
+    if len(parts) != 2:
+        return await m.answer("استخدم: /refstats <user_id>")
+    uid = int(parts[1])
+    if not REFERRAL_ENABLED:
+        return await m.answer("ميزة الإحالات غير مفعلة.")
+    with get_session() as s:
+        try:
+            st = get_ref_stats(s, uid)
+        except Exception as e:
+            return await m.answer(f"فشل قراءة الإحصاءات: {e}")
+    await m.answer(
+        f"📈 Referral stats for {uid}\n"
+        f"- referred_count: {st.get('referred_count')}\n"
+        f"- paid_count: {st.get('paid_count')}\n"
+        f"- total_bonus_days: {st.get('total_bonus_days')}",
+        parse_mode="HTML"
     )
-    if st["top_ref"]:
-        msg += f"• الأكثر دعوة: <code>{st['top_ref']['user_id']}</code> بعدد <b>{st['top_ref']['count']}</b>\n"
-    await m.answer(msg, parse_mode="HTML")
 
-# =====================================================
-#                   فحوصات التشغيل
-# =====================================================
-
+# ---------------------------
+# Startup checks & polling
+# ---------------------------
 async def check_channel_and_admin_dm():
     ok = True
     try:
@@ -1393,12 +1446,7 @@ async def check_channel_and_admin_dm():
             logger.warning(f"ADMIN DM FAILED for {admin_id}: {e}")
     return ok
 
-# =====================================================
-#     Polling متين ضد انقطاعات الشبكة + Leader Lock
-# =====================================================
-
 async def resilient_polling():
-    """يشغّل polling مع إعادة محاولة تلقائية عند مشاكل الشبكة المؤقتة."""
     delay = 5
     while True:
         try:
@@ -1413,59 +1461,9 @@ async def resilient_polling():
             delay = 5
             await asyncio.sleep(3)
 
-# =====================================================
-#                        التشغيل
-# =====================================================
-
-ADMIN_USER_IDS = set(ADMIN_USER_IDS)  # يضمن إمكانية البحث السريع
-ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}  # تدفق تفعيل يدوي للأدمن
-
-CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK")  # fallback للدعوات
-
-async def get_channel_invite_link() -> Optional[str]:
-    """Fallback عام (يستخدم الرابط الثابت إن وُجد، وإلا يُولد رابطًا دائمًا)."""
-    if CHANNEL_INVITE_LINK:
-        return CHANNEL_INVITE_LINK
-    try:
-        inv = await bot.create_chat_invite_link(TELEGRAM_CHANNEL_ID, creates_join_request=False)
-        return inv.invite_link
-    except Exception as e:
-        logger.warning(f"INVITE_LINK create failed: {e}")
-        return None
-
-async def get_trial_invite_link(user_id: int) -> Optional[str]:
-    """رابط دعوة للتجربة: ينتهي خلال TRIAL_INVITE_HOURS ومحدود لعضو واحد."""
-    if CHANNEL_INVITE_LINK:
-        return CHANNEL_INVITE_LINK
-    try:
-        expires_at = datetime.utcnow() + timedelta(hours=TRIAL_INVITE_HOURS)
-        inv = await bot.create_chat_invite_link(
-            TELEGRAM_CHANNEL_ID,
-            name=f"trial_{user_id}",
-            expire_date=int(expires_at.replace(tzinfo=timezone.utc).timestamp()),
-            member_limit=1,
-            creates_join_request=False,
-        )
-        return inv.invite_link
-    except Exception as e:
-        logger.warning(f"INVITE_LINK(TRIAL) create failed: {e}")
-        return None
-
-async def get_paid_invite_link(user_id: int) -> Optional[str]:
-    """رابط دائم للمشترك المدفوع (غير منتهي ولا محدود)."""
-    if CHANNEL_INVITE_LINK:
-        return CHANNEL_INVITE_LINK
-    try:
-        inv = await bot.create_chat_invite_link(
-            TELEGRAM_CHANNEL_ID,
-            name=f"paid_{user_id}",
-            creates_join_request=False,
-        )
-        return inv.invite_link
-    except Exception as e:
-        logger.warning(f"INVITE_LINK(PAID) create failed: {e}")
-        return None
-
+# ---------------------------
+# Main
+# ---------------------------
 async def main():
     init_db()
     hb_task = None
@@ -1488,8 +1486,7 @@ async def main():
         for attempt in range(20):
             ok = acquire_or_steal_leader_lock(LEADER_LOCK_NAME, holder, ttl_seconds=LEADER_TTL)
             if ok:
-                got = True
-                break
+                got = True; break
             wait_s = 15
             logger.error(f"Another instance holds the leader DB lock. Retrying in {wait_s}s… (try {attempt+1})")
             await asyncio.sleep(wait_s)
@@ -1550,3 +1547,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+'''
+with open('/mnt/data/bot.py', 'w', encoding='utf-8') as f:
+    f.write(code)
+print("bot.py written to /mnt/data/bot.py")
