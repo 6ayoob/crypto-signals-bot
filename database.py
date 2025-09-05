@@ -1,5 +1,6 @@
 # database.py — SQLAlchemy models & helpers (PostgreSQL/SQLite)
-# تحديث: دعم entries/targets/stop_rule + last_hit_idx، وهجرة خفيفة آمنة.
+# تحديث كبير: مايجريشن آمنة متدرجة + ديدوب تلقائي لـ trades.audit_id و users.tg_user_id
+# يدعم entries/targets/stop_rule/last_hit_idx والتقارير و Leader Lock.
 
 import os
 import json
@@ -7,7 +8,6 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
-from pathlib import Path
 
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Boolean, DateTime,
@@ -21,6 +21,8 @@ logger = logging.getLogger("db")
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+
+# ---------- Engine ----------
 def _normalize_db_url(url: str) -> str:
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -37,16 +39,21 @@ engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
 
-def _utcnow() -> datetime: return datetime.now(timezone.utc)
+
+# ---------- Time helpers ----------
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None: return None
+    if dt is None:
+        return None
     try:
         if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return dt
+
 
 # ---------- Models ----------
 class User(Base):
@@ -67,6 +74,7 @@ class User(Base):
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
+
 class Trade(Base):
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
@@ -77,6 +85,7 @@ class Trade(Base):
     tp1   = Column(Float, nullable=False)
     tp2   = Column(Float, nullable=False)
     tp_final   = Column(Float, nullable=True)
+
     audit_id   = Column(String(64), index=True, nullable=True)
     score      = Column(Integer, nullable=True)
     regime     = Column(String(16), nullable=True)
@@ -84,18 +93,22 @@ class Trade(Base):
     qty        = Column(Float, nullable=True)
     exit_price = Column(Float, nullable=True)
     r_multiple = Column(Float, nullable=True)
-    # NEW
+
+    # NEW JSON/fields
     entries_json   = Column(Text, nullable=True)  # JSON list[float]
     targets_json   = Column(Text, nullable=True)  # JSON list[float]
     stop_rule_json = Column(Text, nullable=True)  # JSON dict
     last_hit_idx   = Column(Integer, default=0, nullable=False)  # آخر هدف تم بلوغه (index يبدأ من 0)
+
     # حالة
     status = Column(String(8), default="open", index=True, nullable=False)  # open | closed
     result = Column(String(8), nullable=True)  # tp1 | tp2 | tp3 | tp4 | tp5 | sl
+
     opened_at = Column(DateTime, default=_utcnow, nullable=False)
     closed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
 
 class Lock(Base):
     __tablename__ = "locks"
@@ -103,7 +116,8 @@ class Lock(Base):
     holder = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
-# ---------- Migration helpers ----------
+
+# ---------- SQL helpers ----------
 def _add_column_sql(table: str, col: str, dialect: str) -> str:
     if table == "users":
         mapping_pg = {
@@ -139,130 +153,216 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
         typ = mapping_pg[col] if dialect == "postgresql" else mapping_sq[col]
     else:
         typ = "TEXT"
+
     if dialect == "postgresql":
         return f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {typ};'
+    # SQLite لا يدعم IF NOT EXISTS للأعمدة، لذا نعتمد فحص introspection قبل النداء.
     return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'
 
-# ---------- Migration (per-statement safe) ----------
+
+def _exec_begin(sql: str, params: Optional[dict] = None, warn: str = "") -> None:
+    """تنفيذ آمن داخل معاملة منفصلة (حتى لو فشل، ما يلوّث بقية الخطوات)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(sql), params or {})
+    except Exception as e:
+        if warn:
+            logger.warning(f"{warn}: {e}")
+        else:
+            logger.warning(f"SQL warn: {e}")
+
+
+def _fetchall_begin(sql: str, params: Optional[dict] = None) -> List[tuple]:
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(text(sql), params or {})
+            return list(res.fetchall())
+    except Exception as e:
+        logger.warning(f"SQL fetch warn: {e}")
+        return []
+
+
+# ---------- Index helpers ----------
+def _ensure_indexes_generic(dialect: str):
+    if dialect == "postgresql":
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON "users" (referred_by);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON "users" (referral_code);')
+
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);')
+    else:
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON users (referred_by);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON users (referral_code);')
+
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);')
+
+
+def _dedupe_users_on_tg_user_id(dialect: str):
+    dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' \
+              if dialect == "postgresql" else \
+              'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
+    dups = [r[0] for r in _fetchall_begin(dup_sql) if r[0] is not None]
+    for tg in dups:
+        if dialect == "postgresql":
+            del_sql = """
+                DELETE FROM "users"
+                WHERE tg_user_id = :tg AND id NOT IN (
+                    SELECT id FROM "users" WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
+                );
+            """
+        else:
+            del_sql = """
+                DELETE FROM users
+                WHERE tg_user_id = :tg AND id NOT IN (
+                    SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
+                );
+            """
+        _exec_begin(del_sql, {"tg": tg})
+
+
+def _ensure_unique_users_tg_user_id(dialect: str):
+    # ديدوب أولاً، ثم أنشئ UNIQUE INDEX
+    _dedupe_users_on_tg_user_id(dialect)
+    if dialect == "postgresql":
+        _exec_begin('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);',
+                    warn="ux_users_tg_user_id failed")
+    else:
+        _exec_begin('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);',
+                    warn="ux_users_tg_user_id failed")
+
+
+def _dedupe_trades_audit_id(dialect: str):
+    """يجعل قيَم audit_id المكررة فريدة بإضافة _<id> للصفوف الزائدة."""
+    if dialect in ("postgresql", "sqlite"):
+        sql = """
+            WITH d AS (
+              SELECT id, audit_id,
+                     ROW_NUMBER() OVER (PARTITION BY audit_id ORDER BY id) AS rn
+              FROM {tbl}
+              WHERE audit_id IS NOT NULL
+            )
+            UPDATE {tbl2} t
+            SET audit_id = t.audit_id || '_' || t.id
+            FROM d
+            WHERE t.id = d.id AND d.rn > 1;
+        """
+        if dialect == "postgresql":
+            sql = sql.format(tbl='"trades"', tbl2='"trades"')
+        else:
+            sql = sql.format(tbl="trades", tbl2="trades")
+        _exec_begin(sql, warn="dedupe trades.audit_id failed")
+    else:
+        # fallback بسيط: لا شيء
+        pass
+
+
+def _ensure_unique_trades_audit_id_not_null(dialect: str):
+    """ينشئ UNIQUE INDEX على audit_id (باستثناء NULL). لو فشل بسبب التكرار، يعمل ديدوب ثم يعيد المحاولة."""
+    if dialect == "postgresql":
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null '
+                    'ON "trades" (audit_id) WHERE audit_id IS NOT NULL;'
+                ))
+        except Exception as e:
+            logger.warning(f"ux_trades_audit_id_not_null failed: {e} — trying to dedupe…")
+            _dedupe_trades_audit_id(dialect)
+            # retry
+            _exec_begin(
+                'CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null '
+                'ON "trades" (audit_id) WHERE audit_id IS NOT NULL;',
+                warn="unique index retry failed"
+            )
+    else:
+        # SQLite يدعم partial indexes منذ 3.8+
+        _exec_begin(
+            'CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null '
+            'ON trades (audit_id) WHERE audit_id IS NOT NULL;',
+            warn="ux_trades_audit_id_not_null failed"
+        )
+
+
+# ---------- Migration ----------
+def _ensure_columns_for_table(table: str, required_cols: List[str], dialect: str):
+    """إضافة الأعمدة الناقصة فقط. كل ALTER يتم داخل try منفصل."""
+    try:
+        with engine.begin() as conn:
+            insp = inspect(conn)
+            existing = {c["name"] for c in insp.get_columns(table)}
+    except Exception as e:
+        logger.warning(f"inspect {table} failed: {e}")
+        existing = set()
+
+    for c in required_cols:
+        if c in existing:
+            continue
+        sql = _add_column_sql(table, c, dialect)
+        _exec_begin(sql, warn=f'ALTER {table} ADD {c} failed')
+
+
+def _adjust_defaults_pg():
+    """تهيئة افتراضيات created_at/updated_at في PG (كل أمر منفصل)."""
+    _exec_begin('ALTER TABLE "users"  ALTER COLUMN "created_at" SET DEFAULT NOW();')
+    _exec_begin('ALTER TABLE "users"  ALTER COLUMN "updated_at" SET DEFAULT NOW();')
+    _exec_begin('UPDATE "users"  SET "updated_at" = COALESCE("updated_at", "created_at");')
+    _exec_begin('ALTER TABLE "users"  ALTER COLUMN "updated_at" SET NOT NULL;')
+
+    _exec_begin('ALTER TABLE "trades" ALTER COLUMN "opened_at" SET DEFAULT NOW();')
+    _exec_begin('ALTER TABLE "trades" ALTER COLUMN "created_at" SET DEFAULT NOW();')
+    _exec_begin('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET DEFAULT NOW();')
+    _exec_begin('UPDATE "trades" SET "created_at" = COALESCE("created_at", NOW()) WHERE "created_at" IS NULL;')
+    _exec_begin('UPDATE "trades" SET "updated_at" = COALESCE("updated_at", "created_at");')
+    _exec_begin('ALTER TABLE "trades" ALTER COLUMN "created_at" SET NOT NULL;')
+    _exec_begin('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET NOT NULL;')
+
+
 def _lightweight_migrate():
-    """
-    Migration آمنة: كل ALTER/CREATE يُنفّذ ويُعمَّد (commit) وحده.
-    هذا يمنع سقوط بقية الأوامر إذا فشل أمر واحد.
-    """
-    # أنشئ الجداول الأساسية أولاً
+    # 1) إنشاء الجداول الأساسية
     Base.metadata.create_all(bind=engine)
 
     dialect = engine.dialect.name
-    with engine.connect() as conn:
-        # منفّذ بعملية مستقلة لكل أمر
-        def run(sql: str, params: dict | None = None, label: str = ""):
-            try:
-                conn.execute(text(sql), params or {})
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                logger.warning(f"{label or 'SQL'} failed: {e}")
 
-        # فاحص ديناميكي على نفس الـ connection
-        insp = inspect(conn)
+    # 2) تأكيد الأعمدة (users)
+    required_users = [
+        "tg_user_id","trial_used","end_at","plan","last_tx_hash","first_paid_at",
+        "referral_code","referred_by","ref_bonus_awarded","ref_bonus_days",
+        "marketing_variant","last_seen_at","created_at","updated_at"
+    ]
+    _ensure_columns_for_table("users", required_users, dialect)
 
-        def has_col(table: str, col: str) -> bool:
-            try:
-                return col in {c["name"] for c in insp.get_columns(table)}
-            except Exception:
-                return False
+    # 3) تأكيد الأعمدة (trades)
+    required_trades = [
+        "result","opened_at","closed_at","status","tp_final","audit_id",
+        "score","regime","reasons","qty","exit_price","r_multiple",
+        "created_at","updated_at",
+        # NEW:
+        "entries_json","targets_json","stop_rule_json","last_hit_idx"
+    ]
+    _ensure_columns_for_table("trades", required_trades, dialect)
 
-        # ---------- users ----------
-        required_users = [
-            "tg_user_id","trial_used","end_at","plan","last_tx_hash","first_paid_at",
-            "referral_code","referred_by","ref_bonus_awarded","ref_bonus_days",
-            "marketing_variant","last_seen_at","created_at","updated_at"
-        ]
-        for c in required_users:
-            if dialect == "postgresql":
-                run(_add_column_sql("users", c, dialect), label=f'ALTER users ADD {c}')
-            else:
-                if not has_col("users", c):
-                    run(_add_column_sql("users", c, dialect), label=f'ALTER users ADD {c}')
+    # 4) ضبط الافتراضيات في PG فقط
+    if dialect == "postgresql":
+        _adjust_defaults_pg()
 
-        if dialect == "postgresql":
-            run('ALTER TABLE "users" ALTER COLUMN "created_at" SET DEFAULT NOW();', label="users.created_at default")
-            run('ALTER TABLE "users" ALTER COLUMN "updated_at" SET DEFAULT NOW();', label="users.updated_at default")
-            run('UPDATE "users" SET "updated_at" = COALESCE("updated_at","created_at");', label="users.updated_at backfill")
-            run('ALTER TABLE "users" ALTER COLUMN "updated_at" SET NOT NULL;', label="users.updated_at not null")
+    # 5) فهارس عامة
+    _ensure_indexes_generic(dialect)
 
-        # ---------- trades ----------
-        required_trades = [
-            "result","opened_at","closed_at","status","tp_final","audit_id","score","regime",
-            "reasons","qty","exit_price","r_multiple","created_at","updated_at",
-            # الجدد:
-            "entries_json","targets_json","stop_rule_json","last_hit_idx"
-        ]
-        for c in required_trades:
-            if dialect == "postgresql":
-                run(_add_column_sql("trades", c, dialect), label=f'ALTER trades ADD {c}')
-            else:
-                if not has_col("trades", c):
-                    run(_add_column_sql("trades", c, dialect), label=f'ALTER trades ADD {c}')
+    # 6) unique users.tg_user_id (مع ديدوب)
+    _ensure_unique_users_tg_user_id(dialect)
 
-        if dialect == "postgresql":
-            run('ALTER TABLE "trades" ALTER COLUMN "opened_at"  SET DEFAULT NOW();', label="trades.opened_at default")
-            run('ALTER TABLE "trades" ALTER COLUMN "created_at" SET DEFAULT NOW();', label="trades.created_at default")
-            run('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET DEFAULT NOW();', label="trades.updated_at default")
-            run('UPDATE "trades" SET "created_at" = COALESCE("created_at", NOW()) WHERE "created_at" IS NULL;', label="trades.created_at backfill")
-            run('UPDATE "trades" SET "updated_at" = COALESCE("updated_at","created_at");', label="trades.updated_at backfill")
-            run('ALTER TABLE "trades" ALTER COLUMN "created_at" SET NOT NULL;', label="trades.created_at not null")
-            run('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET NOT NULL;', label="trades.updated_at not null")
+    # 7) unique trades.audit_id WHERE audit_id IS NOT NULL (مع ديدوب تلقائي إن لزم)
+    _ensure_unique_trades_audit_id_not_null(dialect)
 
-        # ---------- Indexes ----------
-        if dialect == "postgresql":
-            run('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);', label="ix_users_tg_user_id")
-            run('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON "users" (referred_by);', label="ix_users_referred_by")
-            run('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON "users" (referral_code);', label="ix_users_referral_code")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);', label="ix_trades_status")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);', label="ix_trades_opened_at")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);', label="ix_trades_audit_id")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);', label="ix_trades_symbol_status")
-            run('CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null ON "trades" (audit_id) WHERE audit_id IS NOT NULL;', label="ux_trades_audit_id_not_null")
-        else:
-            run('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);', label="ix_users_tg_user_id")
-            run('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON users (referred_by);', label="ix_users_referred_by")
-            run('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON users (referral_code);', label="ix_users_referral_code")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);', label="ix_trades_status")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);', label="ix_trades_opened_at")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);', label="ix_trades_audit_id")
-            run('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);', label="ix_trades_symbol_status")
+    logger.info("db: migration finished (per-statement safe).")
 
-        # ---------- Unique على users.tg_user_id (مع إزالة التكرارات) ----------
-        try:
-            dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' if dialect == "postgresql" else \
-                      'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
-            rows = conn.execute(text(dup_sql)).fetchall()
-            conn.commit()
-            dups = [r[0] for r in rows if r[0] is not None]
-            for tg in dups:
-                del_sql = ("""
-                    DELETE FROM "users"
-                    WHERE tg_user_id = :tg AND id NOT IN (
-                        SELECT id FROM "users" WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
-                    );
-                """ if dialect == "postgresql" else """
-                    DELETE FROM users
-                    WHERE tg_user_id = :tg AND id NOT IN (
-                        SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
-                    );
-                """)
-                run(del_sql, {"tg": tg}, label=f"dedupe tg_user_id={tg}")
-        except Exception as e:
-            conn.rollback()
-            logger.warning(f"dedupe select failed: {e}")
-
-        if dialect == "postgresql":
-            run('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);', label="ux_users_tg_user_id")
-        else:
-            run('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);', label="ux_users_tg_user_id")
-
-        logger.info("db: migration finished (per-statement safe).")
 
 def init_db():
     try:
@@ -272,6 +372,8 @@ def init_db():
         logger.exception(f"DB INIT ERROR: {e}")
         raise
 
+
+# ---------- Session ----------
 @contextmanager
 def get_session():
     s = SessionLocal()
@@ -284,6 +386,7 @@ def get_session():
     finally:
         s.close()
 
+
 # ---------- Subscription ----------
 def _get_or_create_user(s, tg_user_id: int) -> User:
     users = s.execute(select(User).where(User.tg_user_id == tg_user_id).order_by(User.id.asc())).scalars().all()
@@ -293,19 +396,23 @@ def _get_or_create_user(s, tg_user_id: int) -> User:
         return u
     keep = users[0]
     for extra in users[1:]:
-        try: s.delete(extra)
-        except Exception: pass
+        try:
+            s.delete(extra)
+        except Exception:
+            pass
     s.flush()
     return keep
 
 def is_active(s, tg_user_id: int) -> bool:
     u = s.execute(select(User).where(User.tg_user_id == tg_user_id)).scalar_one_or_none()
-    if not u or not u.end_at: return False
+    if not u or not u.end_at:
+        return False
     return (_as_aware(u.end_at) or _utcnow()) > _utcnow()
 
 def start_trial(s, tg_user_id: int) -> bool:
     u = _get_or_create_user(s, tg_user_id)
-    if u.trial_used: return False
+    if u.trial_used:
+        return False
     u.trial_used = True
     base = _utcnow()
     if u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > base:
@@ -320,11 +427,13 @@ def approve_paid(s, tg_user_id: int, plan: str, duration: timedelta, tx_hash: Op
     base = _as_aware(u.end_at) if (u.end_at and _as_aware(u.end_at) and _as_aware(u.end_at) > now) else now
     u.end_at = base + duration
     u.plan = plan
-    if tx_hash: u.last_tx_hash = tx_hash
+    if tx_hash:
+        u.last_tx_hash = tx_hash
     if plan in ("2w","4w") and u.first_paid_at is None:
         u.first_paid_at = now
     s.flush()
     return u.end_at
+
 
 # ---------- Referrals ----------
 def _default_referral_code_for(uid: int) -> str:
@@ -335,12 +444,15 @@ def ensure_referral_code(s, tg_user_id: int) -> str:
     if not u.referral_code:
         code = _default_referral_code_for(tg_user_id)
         exist = s.execute(select(User.id).where(User.referral_code == code)).first()
-        if exist: code = f"{code}_{u.id}"
-        u.referral_code = code; s.flush()
+        if exist:
+            code = f"{code}_{u.id}"
+        u.referral_code = code
+        s.flush()
     return u.referral_code
 
 def resolve_referrer_uid_by_code(s, code: str) -> Optional[int]:
-    if not code: return None
+    if not code:
+        return None
     raw = code.strip()
     uid = None
     if raw.startswith("ref_") and raw[4:].isdigit():
@@ -349,7 +461,8 @@ def resolve_referrer_uid_by_code(s, code: str) -> Optional[int]:
         uid = int(raw)
     if uid is not None:
         exists = s.execute(select(User.id).where(User.tg_user_id == uid)).first()
-        if exists: return uid
+        if exists:
+            return uid
     u = s.execute(select(User).where(User.referral_code == raw)).scalar_one_or_none()
     return int(u.tg_user_id) if (u and u.tg_user_id) else None
 
@@ -370,12 +483,15 @@ def link_referred_by(s, target_tg_user_id: int, ref_code: str) -> tuple[bool, st
 
 def apply_referral_bonus_if_eligible(s, target_tg_user_id: int, bonus_days: int = 2) -> bool:
     u = _get_or_create_user(s, target_tg_user_id)
-    if not u.referred_by or u.ref_bonus_awarded: return False
-    if u.plan not in ("2w","4w"): return False
+    if not u.referred_by or u.ref_bonus_awarded:
+        return False
+    if u.plan not in ("2w","4w"):
+        return False
     u.end_at = (_as_aware(u.end_at) or _utcnow()) + timedelta(days=int(bonus_days))
     u.ref_bonus_days = int((u.ref_bonus_days or 0) + int(bonus_days))
     u.ref_bonus_awarded = True
-    s.flush(); return True
+    s.flush()
+    return True
 
 def get_ref_stats(s, referrer_tg_user_id: int) -> Dict[str, Any]:
     joined = s.execute(
@@ -390,13 +506,12 @@ def get_ref_stats(s, referrer_tg_user_id: int) -> Dict[str, Any]:
         select(func.coalesce(func.sum(User.ref_bonus_days), 0)).where(User.referred_by == referrer_tg_user_id)
     ).scalar() or 0
 
-    # المفاتيح المتوقعة في bot.py:
     out = {
         "referred_count": int(joined),
         "paid_count": int(paid),
         "total_bonus_days": int(bonus_days),
     }
-    # مفاتيحك السابقة (توافق خلفي اختياري):
+    # توافق خلفي لمفاتيح قديمة:
     out.update({
         "joined": out["referred_count"],
         "paid_converted": out["paid_count"],
@@ -404,15 +519,18 @@ def get_ref_stats(s, referrer_tg_user_id: int) -> Dict[str, Any]:
     })
     return out
 
+
 # ---------- Trades ----------
 def add_trade(s, symbol: str, side: str, entry: float, sl: float, tp1: float, tp2: float) -> int:
     t = Trade(symbol=symbol, side=side, entry=entry, sl=sl, tp1=tp1, tp2=tp2, status="open")
-    s.add(t); s.flush(); return t.id
+    s.add(t); s.flush()
+    return t.id
 
 def add_trade_sig(s, sig: dict, audit_id: Optional[str] = None, qty: Optional[float] = None) -> int:
     if audit_id:
         exists = s.execute(select(Trade.id).where(Trade.audit_id == audit_id)).first()
-        if exists: return int(exists[0])
+        if exists:
+            return int(exists[0])
 
     entries_json = json.dumps(sig.get("entries")) if sig.get("entries") else None
     targets_json = json.dumps(sig.get("targets")) if sig.get("targets") else None
@@ -422,7 +540,8 @@ def add_trade_sig(s, sig: dict, audit_id: Optional[str] = None, qty: Optional[fl
     if sig.get("entries"):
         try:
             es = [float(x) for x in sig["entries"] if x is not None]
-            if es: entry_value = sum(es)/len(es)
+            if es:
+                entry_value = sum(es)/len(es)
         except Exception:
             pass
 
@@ -438,11 +557,13 @@ def add_trade_sig(s, sig: dict, audit_id: Optional[str] = None, qty: Optional[fl
         status="open", opened_at=_utcnow(),
         entries_json=entries_json, targets_json=targets_json, stop_rule_json=stop_rule_json, last_hit_idx=0
     )
-    s.add(t); s.flush(); return t.id
+    s.add(t); s.flush()
+    return t.id
 
 def update_last_hit_idx(s, trade_id: int, idx: int):
     t = s.get(Trade, trade_id)
-    if not t: return
+    if not t:
+        return
     t.last_hit_idx = int(max(0, idx))
     t.updated_at = _utcnow()
     s.flush()
@@ -455,23 +576,33 @@ def count_open_trades(s) -> int:
 
 def close_trade(s, trade_id: int, result: str, exit_price: Optional[float] = None, r_multiple: Optional[float] = None):
     t = s.get(Trade, trade_id)
-    if not t: return
-    t.status = "closed"; t.result = result; t.closed_at = _utcnow()
+    if not t:
+        return
+    t.status = "closed"
+    t.result = result
+    t.closed_at = _utcnow()
     if exit_price is not None:
-        try: t.exit_price = float(exit_price)
-        except Exception: pass
+        try:
+            t.exit_price = float(exit_price)
+        except Exception:
+            pass
     if r_multiple is not None:
-        try: t.r_multiple = float(r_multiple)
-        except Exception: pass
+        try:
+            t.r_multiple = float(r_multiple)
+        except Exception:
+            pass
     s.flush()
 
+
+# ---------- Lists / reports ----------
 def list_active_user_ids(s) -> List[int]:
     now = _utcnow()
     rows = s.execute(select(User.tg_user_id).where(User.end_at != None, User.end_at > now)).all()  # noqa: E711
     return [r[0] for r in rows if r[0]]
 
 def list_users_expiring_within(s, hours: int = 4) -> List[int]:
-    now = _utcnow(); soon = now + timedelta(hours=int(hours))
+    now = _utcnow()
+    soon = now + timedelta(hours=int(hours))
     rows = s.execute(select(User.tg_user_id).where(User.end_at != None, User.end_at > now, User.end_at <= soon)).all()
     return [r[0] for r in rows if r[0]]
 
@@ -480,17 +611,18 @@ def list_recent_paid(s, days: int = 7) -> List[int]:
     rows = s.execute(select(User.tg_user_id).where(User.first_paid_at != None, User.first_paid_at >= since)).all()
     return [r[0] for r in rows if r[0]]
 
-# ---------- Helpers for targets/entries ----------
 def trade_targets_list(t: Trade) -> List[float]:
     try:
         if t.targets_json:
             arr = json.loads(t.targets_json)
             arr = [float(x) for x in arr if x is not None]
-            if arr: return arr
+            if arr:
+                return arr
     except Exception:
         pass
     out = [t.tp1, t.tp2]
-    if t.tp_final and t.tp_final > max(out): out.append(t.tp_final)
+    if t.tp_final and t.tp_final > max(out):
+        out.append(t.tp_final)
     return [float(x) for x in out]
 
 def trade_entries_list(t: Trade) -> Optional[List[float]]:
@@ -503,7 +635,8 @@ def trade_entries_list(t: Trade) -> Optional[List[float]]:
         pass
     return None
 
-# ---------- Reports ----------
+
+# ---------- Period stats ----------
 def _period_stats(s, since: datetime) -> dict:
     signals = s.execute(select(func.count(Trade.id)).where(Trade.opened_at >= since)).scalar() or 0
     open_now = s.execute(select(func.count(Trade.id)).where(Trade.status == "open")).scalar() or 0
@@ -517,7 +650,8 @@ def _period_stats(s, since: datetime) -> dict:
     r_sum = 0.0
     for t in s.execute(select(Trade).where(Trade.status == "closed", Trade.closed_at >= since)).scalars().all():
         if t.r_multiple is not None:
-            r_sum += float(t.r_multiple); continue
+            r_sum += float(t.r_multiple)
+            continue
         try:
             risk = max(float(t.entry) - float(t.sl), 1e-9)
             if t.result in ("tp1","tp2","tp3","tp4","tp5"):
@@ -537,47 +671,71 @@ def _period_stats(s, since: datetime) -> dict:
 
     return {"signals": signals, "open": open_now, "tp1": tp1, "tp2": tp2, "tp_total": wins, "sl": sl, "win_rate": win_rate, "r_sum": round(r_sum, 2)}
 
-def get_stats_24h(s) -> dict: return _period_stats(s, _utcnow() - timedelta(hours=24))
-def get_stats_7d(s) -> dict:  return _period_stats(s, _utcnow() - timedelta(days=7))
+def get_stats_24h(s) -> dict:
+    return _period_stats(s, _utcnow() - timedelta(hours=24))
+
+def get_stats_7d(s) -> dict:
+    return _period_stats(s, _utcnow() - timedelta(days=7))
+
 
 # ---------- Leader Lock ----------
-class Dummy: pass
-
 def try_acquire_leader_lock(name: str, holder: str) -> bool:
     with SessionLocal() as s:
-        if s.get(Lock, name): return False
+        if s.get(Lock, name):
+            return False
         s.add(Lock(name=name, holder=holder))
-        try: s.commit(); return True
-        except IntegrityError: s.rollback(); return False
+        try:
+            s.commit()
+            return True
+        except IntegrityError:
+            s.rollback()
+            return False
 
 def acquire_or_steal_leader_lock(name: str, holder: str, ttl_seconds: int = 300) -> bool:
-    now = _utcnow(); expiry = now - timedelta(seconds=int(ttl_seconds))
+    now = _utcnow()
+    expiry = now - timedelta(seconds=int(ttl_seconds))
     with SessionLocal() as s:
         row = s.get(Lock, name)
         if row is None:
             s.add(Lock(name=name, holder=holder, created_at=now))
-            try: s.commit(); return True
-            except Exception: s.rollback(); return False
+            try:
+                s.commit()
+                return True
+            except Exception:
+                s.rollback()
+                return False
         row_ct = _as_aware(row.created_at)
         if row_ct is not None and row_ct < expiry:
-            row.holder = holder; row.created_at = now
-            try: s.commit(); return True
-            except Exception: s.rollback(); return False
+            row.holder = holder
+            row.created_at = now
+            try:
+                s.commit()
+                return True
+            except Exception:
+                s.rollback()
+                return False
         return False
 
 def heartbeat_leader_lock(name: str, holder: str) -> bool:
     now = _utcnow()
     with SessionLocal() as s:
         row = s.get(Lock, name)
-        if row is None or row.holder != holder: return False
+        if row is None or row.holder != holder:
+            return False
         row.created_at = now
-        try: s.commit(); return True
-        except Exception: s.rollback(); return False
+        try:
+            s.commit()
+            return True
+        except Exception:
+            s.rollback()
+            return False
 
 def release_leader_lock(name: str, holder: str) -> None:
     with SessionLocal() as s:
         row = s.get(Lock, name)
         if row and row.holder == holder:
             s.delete(row)
-            try: s.commit()
-            except Exception: s.rollback()
+            try:
+                s.commit()
+            except Exception:
+                s.rollback()
