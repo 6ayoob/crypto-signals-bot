@@ -901,12 +901,15 @@ async def cb_show_ref(q: CallbackQuery):
         kb.button(text="🔗 افتح رابط دعوتي", url=link)
         kb.adjust(1)
         await q.message.answer(
-            f"🎁 شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.
-"
-            f"<code>{link}</code>",
-            parse_mode="HTML",
-            reply_markup=kb.as_markup()
-        )
+referral_msg = (
+    "🤝 <b>برنامج الإحالة</b>\n"
+    f"🎁 شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.\n"
+    "—\n"
+    "1) انسخ رابط الدعوة الخاص بك من /ref\n"
+    "2) أرسله لصديقك وسجِّل عبره\n"
+    "3) بعد الدفع، تصلك الهدية تلقائيًا\n"
+)
+
     except Exception as e:
         logger.warning(f"show_ref_link error: {e}")
         await q.answer("خطأ غير متوقع.", show_alert=True)
