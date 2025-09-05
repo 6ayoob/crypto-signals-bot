@@ -325,11 +325,11 @@ def support_dm_kb() -> InlineKeyboardMarkup:
 
 async def welcome_text(user_id: Optional[int] = None) -> str:
     price_line = ""
-    try:
-price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
-"
-    except Exception:
-        pass
+try:
+    price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+except Exception:
+    pass
+
     wallet_line = ""
     try:
         if USDT_TRC20_WALLET:
