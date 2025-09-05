@@ -333,8 +333,9 @@ except Exception:
     wallet_line = ""
     try:
         if USDT_TRC20_WALLET:
-            wallet_line = f"💳 USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>
-"
+wallet_line = f"""💳 USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>
+"""
+
     except Exception:
         pass
 
