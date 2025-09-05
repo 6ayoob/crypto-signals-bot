@@ -103,7 +103,7 @@ class Lock(Base):
     holder = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_utcnow, nullable=False)
 
-# ---------- Migration ----------
+# ---------- Migration helpers ----------
 def _add_column_sql(table: str, col: str, dialect: str) -> str:
     if table == "users":
         mapping_pg = {
@@ -143,105 +143,126 @@ def _add_column_sql(table: str, col: str, dialect: str) -> str:
         return f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {typ};'
     return f'ALTER TABLE "{table}" ADD COLUMN "{col}" {typ};'
 
-def _ensure_indexes(connection, dialect: str):
-    if dialect == "postgresql":
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON "users" (referred_by);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON "users" (referral_code);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);'))
-        try:
-            connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null ON "trades" (audit_id) WHERE audit_id IS NOT NULL;'))
-        except Exception: pass
-    else:
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON users (referred_by);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON users (referral_code);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);'))
-        connection.execute(text('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);'))
-
-def _dedupe_users_on_tg_user_id(connection, dialect: str):
-    dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' if dialect == "postgresql" else \
-              'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
-    result = connection.execute(text(dup_sql)).fetchall()
-    dups = [r[0] for r in result if r[0] is not None]
-    for tg_id in dups:
-        if dialect == "postgresql":
-            del_sql = """
-                DELETE FROM "users"
-                WHERE tg_user_id = :tg AND id NOT IN (
-                    SELECT id FROM "users" WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
-                );
-            """
-        else:
-            del_sql = """
-                DELETE FROM users
-                WHERE tg_user_id = :tg AND id NOT IN (
-                    SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
-                );
-            """
-        connection.execute(text(del_sql), {"tg": tg_id})
-
-def _ensure_unique_index_users_tg_user_id(connection, dialect: str):
-    _dedupe_users_on_tg_user_id(connection, dialect)
-    if dialect == "postgresql":
-        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);'))
-    else:
-        connection.execute(text('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);'))
-
+# ---------- Migration (per-statement safe) ----------
 def _lightweight_migrate():
+    """
+    Migration آمنة: كل ALTER/CREATE يُنفّذ ويُعمَّد (commit) وحده.
+    هذا يمنع سقوط بقية الأوامر إذا فشل أمر واحد.
+    """
+    # أنشئ الجداول الأساسية أولاً
     Base.metadata.create_all(bind=engine)
-    insp = inspect(engine)
+
     dialect = engine.dialect.name
-    with engine.begin() as conn:
-        # users
-        try: cols_users = {c["name"] for c in insp.get_columns("users")}
-        except Exception: cols_users = set()
-        required_users = ["tg_user_id","trial_used","end_at","plan","last_tx_hash","first_paid_at","referral_code","referred_by","ref_bonus_awarded","ref_bonus_days","marketing_variant","last_seen_at","created_at","updated_at"]
+    with engine.connect() as conn:
+        # منفّذ بعملية مستقلة لكل أمر
+        def run(sql: str, params: dict | None = None, label: str = ""):
+            try:
+                conn.execute(text(sql), params or {})
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"{label or 'SQL'} failed: {e}")
+
+        # فاحص ديناميكي على نفس الـ connection
+        insp = inspect(conn)
+
+        def has_col(table: str, col: str) -> bool:
+            try:
+                return col in {c["name"] for c in insp.get_columns(table)}
+            except Exception:
+                return False
+
+        # ---------- users ----------
+        required_users = [
+            "tg_user_id","trial_used","end_at","plan","last_tx_hash","first_paid_at",
+            "referral_code","referred_by","ref_bonus_awarded","ref_bonus_days",
+            "marketing_variant","last_seen_at","created_at","updated_at"
+        ]
         for c in required_users:
-            if c not in cols_users:
-                try: conn.execute(text(_add_column_sql("users", c, dialect)))
-                except Exception as e: logger.warning(f"ALTER users ADD {c} failed: {e}")
-        if dialect == "postgresql":
-            try:
-                conn.execute(text('ALTER TABLE "users" ALTER COLUMN "created_at" SET DEFAULT NOW();'))
-                conn.execute(text('ALTER TABLE "users" ALTER COLUMN "updated_at" SET DEFAULT NOW();'))
-                conn.execute(text('UPDATE "users" SET "updated_at" = COALESCE("updated_at", "created_at");'))
-                conn.execute(text('ALTER TABLE "users" ALTER COLUMN "updated_at" SET NOT NULL;'))
-            except Exception as e:
-                logger.warning(f"users.updated_at default/not null adjust failed: {e}")
+            if dialect == "postgresql":
+                run(_add_column_sql("users", c, dialect), label=f'ALTER users ADD {c}')
+            else:
+                if not has_col("users", c):
+                    run(_add_column_sql("users", c, dialect), label=f'ALTER users ADD {c}')
 
-        # trades
-        try: cols_trades = {c["name"] for c in insp.get_columns("trades")}
-        except Exception: cols_trades = set()
-        required_trades = ["result","opened_at","closed_at","status","tp_final","audit_id","score","regime","reasons","qty","exit_price","r_multiple","created_at","updated_at","entries_json","targets_json","stop_rule_json","last_hit_idx"]
+        if dialect == "postgresql":
+            run('ALTER TABLE "users" ALTER COLUMN "created_at" SET DEFAULT NOW();', label="users.created_at default")
+            run('ALTER TABLE "users" ALTER COLUMN "updated_at" SET DEFAULT NOW();', label="users.updated_at default")
+            run('UPDATE "users" SET "updated_at" = COALESCE("updated_at","created_at");', label="users.updated_at backfill")
+            run('ALTER TABLE "users" ALTER COLUMN "updated_at" SET NOT NULL;', label="users.updated_at not null")
+
+        # ---------- trades ----------
+        required_trades = [
+            "result","opened_at","closed_at","status","tp_final","audit_id","score","regime",
+            "reasons","qty","exit_price","r_multiple","created_at","updated_at",
+            # الجدد:
+            "entries_json","targets_json","stop_rule_json","last_hit_idx"
+        ]
         for c in required_trades:
-            if c not in cols_trades:
-                try: conn.execute(text(_add_column_sql("trades", c, dialect)))
-                except Exception as e: logger.warning(f"ALTER trades ADD {c} failed: {e}")
+            if dialect == "postgresql":
+                run(_add_column_sql("trades", c, dialect), label=f'ALTER trades ADD {c}')
+            else:
+                if not has_col("trades", c):
+                    run(_add_column_sql("trades", c, dialect), label=f'ALTER trades ADD {c}')
+
         if dialect == "postgresql":
-            try:
-                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "opened_at" SET DEFAULT NOW();'))
-                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "created_at" SET DEFAULT NOW();'))
-                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET DEFAULT NOW();'))
-                conn.execute(text('UPDATE "trades" SET "created_at" = COALESCE("created_at", NOW()) WHERE "created_at" IS NULL;'))
-                conn.execute(text('UPDATE "trades" SET "updated_at" = COALESCE("updated_at", "created_at");'))
-                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "created_at" SET NOT NULL;'))
-                conn.execute(text('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET NOT NULL;'))
-            except Exception as e:
-                logger.warning(f"trades created/updated defaults adjust failed: {e}")
+            run('ALTER TABLE "trades" ALTER COLUMN "opened_at"  SET DEFAULT NOW();', label="trades.opened_at default")
+            run('ALTER TABLE "trades" ALTER COLUMN "created_at" SET DEFAULT NOW();', label="trades.created_at default")
+            run('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET DEFAULT NOW();', label="trades.updated_at default")
+            run('UPDATE "trades" SET "created_at" = COALESCE("created_at", NOW()) WHERE "created_at" IS NULL;', label="trades.created_at backfill")
+            run('UPDATE "trades" SET "updated_at" = COALESCE("updated_at","created_at");', label="trades.updated_at backfill")
+            run('ALTER TABLE "trades" ALTER COLUMN "created_at" SET NOT NULL;', label="trades.created_at not null")
+            run('ALTER TABLE "trades" ALTER COLUMN "updated_at" SET NOT NULL;', label="trades.updated_at not null")
 
-        # indexes
-        try: _ensure_indexes(conn, dialect)
-        except Exception as e: logger.warning(f"CREATE INDEX failed: {e}")
+        # ---------- Indexes ----------
+        if dialect == "postgresql":
+            run('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON "users" (tg_user_id);', label="ix_users_tg_user_id")
+            run('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON "users" (referred_by);', label="ix_users_referred_by")
+            run('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON "users" (referral_code);', label="ix_users_referral_code")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);', label="ix_trades_status")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);', label="ix_trades_opened_at")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);', label="ix_trades_audit_id")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);', label="ix_trades_symbol_status")
+            run('CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null ON "trades" (audit_id) WHERE audit_id IS NOT NULL;', label="ux_trades_audit_id_not_null")
+        else:
+            run('CREATE INDEX IF NOT EXISTS ix_users_tg_user_id ON users (tg_user_id);', label="ix_users_tg_user_id")
+            run('CREATE INDEX IF NOT EXISTS ix_users_referred_by ON users (referred_by);', label="ix_users_referred_by")
+            run('CREATE INDEX IF NOT EXISTS ix_users_referral_code ON users (referral_code);', label="ix_users_referral_code")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);', label="ix_trades_status")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);', label="ix_trades_opened_at")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);', label="ix_trades_audit_id")
+            run('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);', label="ix_trades_symbol_status")
 
-        # unique users.tg_user_id
-        try: _ensure_unique_index_users_tg_user_id(conn, dialect)
-        except Exception as e: logger.warning(f"Ensure unique users.tg_user_id failed: {e}")
+        # ---------- Unique على users.tg_user_id (مع إزالة التكرارات) ----------
+        try:
+            dup_sql = 'SELECT tg_user_id FROM "users" WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;' if dialect == "postgresql" else \
+                      'SELECT tg_user_id FROM users WHERE tg_user_id IS NOT NULL GROUP BY tg_user_id HAVING COUNT(*) > 1;'
+            rows = conn.execute(text(dup_sql)).fetchall()
+            conn.commit()
+            dups = [r[0] for r in rows if r[0] is not None]
+            for tg in dups:
+                del_sql = ("""
+                    DELETE FROM "users"
+                    WHERE tg_user_id = :tg AND id NOT IN (
+                        SELECT id FROM "users" WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
+                    );
+                """ if dialect == "postgresql" else """
+                    DELETE FROM users
+                    WHERE tg_user_id = :tg AND id NOT IN (
+                        SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id ASC LIMIT 1
+                    );
+                """)
+                run(del_sql, {"tg": tg}, label=f"dedupe tg_user_id={tg}")
+        except Exception as e:
+            conn.rollback()
+            logger.warning(f"dedupe select failed: {e}")
+
+        if dialect == "postgresql":
+            run('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON "users" (tg_user_id);', label="ux_users_tg_user_id")
+        else:
+            run('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_tg_user_id ON users (tg_user_id);', label="ux_users_tg_user_id")
+
+        logger.info("db: migration finished (per-statement safe).")
 
 def init_db():
     try:
