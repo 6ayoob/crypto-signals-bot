@@ -287,10 +287,11 @@ def _contact_line() -> str:
         parts.append(f"🆔 معرّف الأدمن: <code>{SUPPORT_CHAT_ID}</code>")
     if SUPPORT_CHAT_ID and not SUPPORT_USERNAME:
         parts.append(f"⚡️ افتح الخاص: <a href='tg://user?id={SUPPORT_CHAT_ID}'>اضغط هنا</a>")
-return "\n".join(parts) if parts else "—"
-
+    
+    return "\n".join(parts) if parts else "—"
 
 # ===== Referrals =====
+
 async def _build_ref_link(uid: int, session) -> tuple[str, str]:
     """Returns (code, link)"""
     code = ensure_referral_code(session, uid) if REFERRAL_ENABLED else ""
@@ -307,7 +308,6 @@ def _parse_start_payload(text: Optional[str]) -> Optional[str]:
     payload = parts[1].strip()
     if payload.lower().startswith("ref_"):
         return payload[4:].strip()
-    # accept naked codes too
     return payload if payload else None
 
 def invite_kb(url: str) -> InlineKeyboardMarkup:
@@ -325,17 +325,15 @@ def support_dm_kb() -> InlineKeyboardMarkup:
 
 async def welcome_text(user_id: Optional[int] = None) -> str:
     price_line = ""
-try:
-    price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
-except Exception:
-    pass
+    try:
+        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+    except Exception:
+        pass
 
     wallet_line = ""
     try:
-if USDT_TRC20_WALLET:
-    wallet_line = f"💳 USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n"
-
-
+        if USDT_TRC20_WALLET:
+            wallet_line = f"💳 USDT (TRC20): <code>{_h(USDT_TRC20_WALLET)}</code>\n"
     except Exception:
         pass
 
@@ -344,39 +342,27 @@ if USDT_TRC20_WALLET:
         try:
             with get_session() as s:
                 code, link = await _build_ref_link(user_id, s)
-ref_hint = (
-    f"\n🎁 <b>برنامج الإحالة:</b> شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.\n"
-    f"رابطك: <a href='{link}'>اضغط هنا</a>\n"
-)
-
+                ref_hint = (
+                    f"\n🎁 <b>برنامج الإحالة:</b> شارك رابطك واحصل على <b>{REF_BONUS_DAYS} يوم</b> هدية عند أول اشتراك مدفوع لصديقك.\n"
+                    f"رابطك: <a href='{link}'>اضغط هنا</a>\n"
+                )
         except Exception:
             pass
 
     tagline = os.getenv("FEATURE_TAGLINE", FEATURE_TAGLINE)
 
     return (
-        f"{START_BANNER_EMOJI} أهلاً بك في <b>{BRAND_NAME}</b>
-"
-        f"✨ {tagline}
-
-"
-        "🔔 إشارات لحظية بتصفية صارمة + إدارة مخاطرة R-based + تقرير أداء يومي.
-"
-        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)
-
-"
-        "الخطط:
-"
+        f"{START_BANNER_EMOJI} أهلاً بك في <b>{BRAND_NAME}</b>\n"
+        f"✨ {tagline}\n\n"
+        "🔔 إشارات لحظية بتصفية صارمة + إدارة مخاطرة R-based + تقرير أداء يومي.\n"
+        f"🕘 التقرير اليومي: <b>{DAILY_REPORT_HOUR_LOCAL}</b> صباحًا (بتوقيت السعودية)\n\n"
+        "الخطط:\n"
         f"{price_line}"
-        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيقوم الأدمن بالتفعيل.
-"
-        f"✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.
-
-"
+        "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيقوم الأدمن بالتفعيل.\n"
+        f"✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
         f"{wallet_line}"
         f"{ref_hint}"
-        "📞 تواصل مباشر:
-" + _contact_line()
+        "📞 تواصل مباشر:\n" + _contact_line()
     )
 
 # ===== Signal / close message formatting (with subtle improvements) =====
@@ -384,36 +370,30 @@ ref_hint = (
 def format_signal_text_basic(sig: dict) -> str:
     extra = ""
     if "score" in sig or "regime" in sig:
-        extra = f"
-📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
+        extra += (
+            f"\n📊 Score: <b>{sig.get('score','-')}</b> | Regime: <b>{_h(sig.get('regime','-'))}</b>"
+        )
         if sig.get("reasons"):
-            extra += f"
-🧠 كونفلوينس: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
-    tp3_line = f"
-🏁 الهدف 3: <code>{sig.get('tp3')}</code>" if sig.get("tp3") is not None else ""
-    strat_line = f"
-🧭 النمط: <b>{_h(sig.get('strategy_code','-'))}</b> | ملف: <i>{_h(sig.get('profile','-'))}</i>" if sig.get("strategy_code") else ""
+            extra += f"\n🧠 كونفلوينس: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
+
+    tp3_line = f"\n🏁 الهدف 3: <code>{sig.get('tp3')}</code>" if sig.get("tp3") is not None else ""
+    strat_line = (
+        f"\n🧭 النمط: <b>{_h(sig.get('strategy_code','-'))}</b> | ملف: <i>{_h(sig.get('profile','-'))}</i>"
+        if sig.get("strategy_code") else ""
+    )
+
     return (
-        "🚀 <b>إشارة شراء</b>
-"
-        "━━━━━━━━━━━━━━
-"
-        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>
-"
-        f"💵 الدخول: <code>{sig['entry']}</code>
-"
-        f"📉 الوقف: <code>{sig['sl']}</code>
-"
-        f"🎯 الهدف 1: <code>{sig['tp1']}</code>
-"
+        "🚀 <b>إشارة شراء</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔹 الأصل: <b>{_h(sig['symbol'])}</b>\n"
+        f"💵 الدخول: <code>{sig['entry']}</code>\n"
+        f"📉 الوقف: <code>{sig['sl']}</code>\n"
+        f"🎯 الهدف 1: <code>{sig['tp1']}</code>\n"
         f"🏁 الهدف 2: <code>{sig['tp2']}</code>"
-        f"{tp3_line}{strat_line}
-"
+        f"{tp3_line}{strat_line}\n"
         f"⏰ (UTC): <code>{_h(sig['timestamp'])}</code>"
-        f"{extra}
-"
-        "━━━━━━━━━━━━━━
-"
+        f"{extra}\n"
+        "━━━━━━━━━━━━━━\n"
         "⚡️ <i>قاعدة المخاطرة: أقصى 1% لكل صفقة، وبدون مطاردة للسعر.</i>"
     )
 
@@ -425,28 +405,24 @@ def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
         "tp2": "تحقق الهدف 2 — إنجاز رائع!",
         "sl": "وقف الخسارة — حماية رأس المال",
     }.get(getattr(t, "result", "") or "", "إغلاق")
-    r_line = f"
-📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
-    tip = "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب." if (getattr(t, "result", "") == "sl") else "🎯 إدارة الربح أهم من كثرة الصفقات."
+
+    r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
+    tip = (
+        "🔁 نبحث عن فرصة أقوى تالية… الصبر مكسب."
+        if getattr(t, "result", "") == "sl"
+        else "🎯 إدارة الربح أهم من كثرة الصفقات."
+    )
+
     return (
-        f"{emoji} <b>حالة صفقة</b>
-"
-        "━━━━━━━━━━━━━━
-"
-        f"🔹 الأصل: <b>{_h(str(t.symbol))}</b>
-"
-        f"💵 الدخول: <code>{t.entry}</code>
-"
-        f"📉 الوقف: <code>{t.sl}</code>
-"
-        f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>
-"
-        f"📌 الحالة: <b>{result_label}</b>{r_line}
-"
-        f"⏰ (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>
-"
-        "━━━━━━━━━━━━━━
-"
+        f"{emoji} <b>حالة صفقة</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔹 الأصل: <b>{_h(str(t.symbol))}</b>\n"
+        f"💵 الدخول: <code>{t.entry}</code>\n"
+        f"📉 الوقف: <code>{t.sl}</code>\n"
+        f"🎯 TP1: <code>{t.tp1}</code> | 🏁 TP2: <code>{t.tp2}</code>\n"
+        f"📌 الحالة: <b>{result_label}</b>{r_line}\n"
+        f"⏰ (UTC): <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}</code>\n"
+        "━━━━━━━━━━━━━━\n"
         f"{tip}"
     )
 
@@ -460,12 +436,20 @@ def _load_risk_state() -> dict:
             return json.loads(RISK_STATE_FILE.read_text(encoding="utf-8"))
     except Exception as e:
         logger.warning(f"RISK_STATE load warn: {e}")
-    return {"date": datetime.now(timezone.utc).date().isoformat(), "r_today": 0.0, "loss_streak": 0, "cooldown_until": None}
+    return {
+        "date": datetime.now(timezone.utc).date().isoformat(),
+        "r_today": 0.0,
+        "loss_streak": 0,
+        "cooldown_until": None
+    }
 
 
 def _save_risk_state(state: dict):
     try:
-        RISK_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        RISK_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
     except Exception as e:
         logger.warning(f"RISK_STATE save warn: {e}")
 
@@ -473,7 +457,12 @@ def _save_risk_state(state: dict):
 def _reset_if_new_day(state: dict) -> dict:
     today = datetime.now(timezone.utc).date().isoformat()
     if state.get("date") != today:
-        state.update({"date": today, "r_today": 0.0, "loss_streak": 0, "cooldown_until": None})
+        state.update({
+            "date": today,
+            "r_today": 0.0,
+            "loss_streak": 0,
+            "cooldown_until": None
+        })
     return state
 
 
@@ -499,25 +488,28 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
         r_multiple = 0.0 if R <= 0 else (float(exit_price) - float(t.entry)) / R
     except Exception:
         r_multiple = 0.0
+
     state = _reset_if_new_day(_load_risk_state())
     state["r_today"] = round(float(state.get("r_today", 0.0)) + r_multiple, 6)
     state["loss_streak"] = int(state.get("loss_streak", 0)) + 1 if r_multiple < 0 else 0
+
     cooldown_reason = None
     if float(state["r_today"]) <= -MAX_DAILY_LOSS_R:
         cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
     if int(state["loss_streak"]) >= MAX_LOSSES_STREAK:
-        cooldown_reason = (cooldown_reason + " + " if cooldown_reason else "") + f"{MAX_LOSSES_STREAK} خسائر متتالية"
+        if cooldown_reason:
+            cooldown_reason += f" + {MAX_LOSSES_STREAK} خسائر متتالية"
+        else:
+            cooldown_reason = f"{MAX_LOSSES_STREAK} خسائر متتالية"
+
     if cooldown_reason:
         until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
         state["cooldown_until"] = until.isoformat()
         _save_risk_state(state)
         asyncio.create_task(send_channel(
-            f"⏸️ <b>إيقاف مؤقت لفتح صفقات جديدة</b>
-"
-            f"السبب: {cooldown_reason}
-"
-            f"حتى: <code>{until.strftime('%Y-%m-%d %H:%M UTC')}</code>
-"
+            f"⏸️ <b>إيقاف مؤقت لفتح صفقات جديدة</b>\n"
+            f"السبب: {cooldown_reason}\n"
+            f"حتى: <code>{until.strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
             "💡 <i>نحافظ على الذخيرة لفرص أعلى جودة.</i>"
         ))
         asyncio.create_task(send_admins(
@@ -525,6 +517,7 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
         ))
     else:
         _save_risk_state(state)
+
     return r_multiple
 
 # ---------------------------
@@ -536,20 +529,20 @@ async def load_okx_markets_and_filter():
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, exchange.load_markets)
-        mkts = set(exchange.markets.keys())
-        filtered = [s for s in SYMBOLS if s in mkts]
-        skipped = [s for s in SYMBOLS if s not in mkts]
+        all_markets = set(exchange.markets.keys())
+        filtered = [s for s in SYMBOLS if s in all_markets]
+        skipped = [s for s in SYMBOLS if s not in all_markets]
         AVAILABLE_SYMBOLS = filtered
-        logger.info(f"OKX markets loaded. Using {len(filtered)} symbols, skipped {len(skipped)}: {skipped}")
+        logger.info(f"✅ OKX: Loaded {len(filtered)} symbols. Skipped {len(skipped)}: {skipped}")
     except Exception as e:
-        logger.exception(f"load_okx_markets error: {e}")
+        logger.exception(f"❌ load_okx_markets error: {e}")
         AVAILABLE_SYMBOLS = []
 
 # ---------------------------
 # Data fetchers
 # ---------------------------
 
-async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300):
+async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300) -> list:
     for attempt in range(4):
         try:
             await RATE.wait()
@@ -558,14 +551,13 @@ async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300):
                 None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             )
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
-            await asyncio.sleep(0.6 * (attempt + 1) + random.random() * 0.3)
+            await asyncio.sleep(0.6 * (attempt + 1) + random.uniform(0.1, 0.4))
         except Exception as e:
-            logger.warning(f"FETCH_OHLCV ERROR {symbol}: {e}")
+            logger.warning(f"❌ FETCH_OHLCV ERROR [{symbol}]: {e}")
             return []
     return []
 
-
-async def fetch_ticker_price(symbol: str) -> float | None:
+async def fetch_ticker_price(symbol: str) -> Optional[float]:
     for attempt in range(3):
         try:
             await RATE.wait()
@@ -574,12 +566,11 @@ async def fetch_ticker_price(symbol: str) -> float | None:
             price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
             return float(price) if price is not None else None
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
-            await asyncio.sleep(0.5 * (attempt + 1))
+            await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0.05, 0.2))
         except Exception as e:
-            logger.warning(f"FETCH_TICKER ERROR {symbol}: {e}")
+            logger.warning(f"❌ FETCH_TICKER ERROR [{symbol}]: {e}")
             return None
     return None
-
 # ---------------------------
 # Dedupe signals
 # ---------------------------
@@ -601,82 +592,89 @@ def _should_skip_duplicate(sig: dict) -> bool:
 
 SCAN_LOCK = asyncio.Lock()
 
-async def _send_signal_to_channel(sig: dict, audit_id: str | None) -> None:
+async def _send_signal_to_channel(sig: dict, audit_id: Optional[str]) -> None:
     await send_channel(format_signal_text_basic(sig))
-
 
 async def _scan_one_symbol(sym: str) -> Optional[dict]:
     data = await fetch_ohlcv(sym)
     if not data:
         return None
     sig = check_signal(sym, data)
-    if not sig:
-        return None
-    return sig
-
+    return sig if sig else None
 
 async def scan_and_dispatch():
     if not AVAILABLE_SYMBOLS:
         return
+
     async with SCAN_LOCK:
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
         async def _guarded_scan(sym: str) -> Optional[dict]:
             async with sem:
                 try:
                     return await _scan_one_symbol(sym)
                 except Exception as e:
-                    logger.warning(f"scan symbol error {sym}: {e}")
+                    logger.warning(f"⚠️ Scan error [{sym}]: {e}")
                     return None
+
         for i in range(0, len(AVAILABLE_SYMBOLS), SCAN_BATCH_SIZE):
-            batch = AVAILABLE_SYMBOLS[i:i+SCAN_BATCH_SIZE]
+            batch = AVAILABLE_SYMBOLS[i:i + SCAN_BATCH_SIZE]
             sigs = await asyncio.gather(*[_guarded_scan(s) for s in batch])
+
             for sig in filter(None, sigs):
                 if _should_skip_duplicate(sig):
-                    logger.info(f"DEDUPE SKIP {sig['symbol']}")
+                    logger.info(f"⏱️ DEDUPE SKIP {sig['symbol']}")
                     continue
+
                 with get_session() as s:
                     allowed, reason = can_open_new_trade(s)
                     if not allowed:
-                        logger.info(f"SKIP SIGNAL {sig['symbol']}: {reason}")
+                        logger.info(f"❌ SKIP SIGNAL {sig['symbol']}: {reason}")
                         continue
-                    try:
-                        if has_open_trade_on_symbol(s, sig["symbol"]):
-                            logger.info(f"SKIP {sig['symbol']}: already open position")
-                            continue
-                    except Exception:
-                        pass
+
+                    if has_open_trade_on_symbol(s, sig["symbol"]):
+                        logger.info(f"🔁 SKIP {sig['symbol']}: already open")
+                        continue
+
                     audit_id = _make_audit_id(sig["symbol"], sig["entry"], sig.get("score", 0))
+
                     try:
                         trade_id = add_trade_sig(s, sig, audit_id=audit_id, qty=None)
                     except Exception as e:
-                        logger.exception(f"add_trade_sig error, fallback to add_trade: {e}")
+                        logger.exception(f"⚠️ add_trade_sig failed, fallback: {e}")
                         trade_id = add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
+
                     AUDIT_IDS[trade_id] = audit_id
+
                     if sig.get("messages"):
-                        try: MESSAGES_CACHE[trade_id] = dict(sig["messages"])
-                        except Exception: pass
+                        try:
+                            MESSAGES_CACHE[trade_id] = dict(sig["messages"])
+                        except Exception:
+                            pass
+
                     try:
                         await _send_signal_to_channel(sig, audit_id)
+
                         entry_msg = (sig.get("messages") or {}).get("entry")
                         if entry_msg:
                             await notify_subscribers(entry_msg)
+
                         note = (
-                            "🚀 <b>إشارة جديدة وصلت!</b>
-"
+                            "🚀 <b>إشارة جديدة وصلت!</b>\n"
                             "🔔 الهدوء أفضل من مطاردة الشمعة — التزم بالخطة."
                         )
-                        uids = list_active_user_ids()
-                        for uid in uids:
+                        for uid in list_active_user_ids():
                             try:
                                 await bot.send_message(uid, note, parse_mode="HTML", disable_web_page_preview=True)
                                 await asyncio.sleep(0.02)
                             except Exception:
                                 pass
-                        logger.info(f"SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
-                    except Exception as e:
-                        logger.exception(f"SEND SIGNAL ERROR: {e}")
-            await asyncio.sleep(0.1)
 
+                        logger.info(f"✅ SIGNAL SENT: {sig['symbol']} entry={sig['entry']} tp1={sig['tp1']} tp2={sig['tp2']} audit={audit_id}")
+                    except Exception as e:
+                        logger.exception(f"❌ SEND SIGNAL ERROR: {e}")
+
+            await asyncio.sleep(0.1)
 
 async def loop_signals():
     while True:
@@ -684,11 +682,9 @@ async def loop_signals():
         try:
             await scan_and_dispatch()
         except Exception as e:
-            logger.exception(f"SCAN_LOOP ERROR: {e}")
+            logger.exception(f"🔥 SCAN_LOOP ERROR: {e}")
         elapsed = time.time() - started
-        sleep_for = max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed)
-        await asyncio.sleep(sleep_for)
-
+        await asyncio.sleep(max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed))
 # ---------------------------
 # Monitor open trades
 # ---------------------------
@@ -703,6 +699,7 @@ async def monitor_open_trades():
                     price = await fetch_ticker_price(t.symbol)
                     if price is None:
                         continue
+
                     hit_tp2 = price >= t.tp2
                     hit_tp1 = price >= t.tp1
                     hit_sl = price <= t.sl
@@ -718,33 +715,28 @@ async def monitor_open_trades():
                         try:
                             close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
                         except Exception as e:
-                            logger.warning(f"close_trade warn: {e}")
-                        msg = format_close_text(t, r_multiple)
-                        try:
-                            extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
-                            if extra: msg += "
+                            logger.warning(f"⚠️ close_trade warn: {e}")
 
-" + extra
-                        except Exception:
-                            pass
+                        msg = format_close_text(t, r_multiple)
+                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(result)
+                        if extra:
+                            msg += "\n\n" + extra
+
                         await notify_subscribers(msg)
                         await asyncio.sleep(0.05)
                         continue
 
+                    # Hit TP1 but not yet TP2
                     if hit_tp1 and not HIT_TP1.get(t.id):
                         HIT_TP1[t.id] = True
                         tmp = SimpleNamespace(symbol=t.symbol, entry=t.entry, sl=t.sl, tp1=t.tp1, tp2=t.tp2, result="tp1")
                         msg = format_close_text(tmp, None)
-                        try:
-                            extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp1")
-                            if extra: msg += "
 
-" + extra
-                        except Exception:
-                            pass
-                        msg += "
+                        extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp1")
+                        if extra:
+                            msg += "\n\n" + extra
+                        msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
 
-🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
                         await notify_subscribers(msg)
                         await asyncio.sleep(0.05)
         except Exception as e:
@@ -760,11 +752,7 @@ async def kick_expired_members_loop():
         try:
             now = datetime.now(timezone.utc)
             with get_session() as s:
-                expired = (
-                    s.query(User)
-                    .filter(User.end_at != None, User.end_at <= now)  # noqa
-                    .all()
-                )
+                expired = s.query(User).filter(User.end_at != None, User.end_at <= now).all()
                 for u in expired:
                     try:
                         member = await bot.get_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
@@ -773,17 +761,17 @@ async def kick_expired_members_loop():
                             await bot.ban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
                             await asyncio.sleep(0.3)
                             await bot.unban_chat_member(TELEGRAM_CHANNEL_ID, u.tg_user_id)
+
                         try:
                             await bot.send_message(
                                 u.tg_user_id,
-                                "⏳ انتهت صلاحية الوصول.
-"
-                                "✨ فعّل اشتراكك الآن للاستمرار باستلام الإشارات والتقرير اليومي.
-"
+                                "⏳ انتهت صلاحية الوصول.\n"
+                                "✨ فعّل اشتراكك الآن للاستمرار باستلام الإشارات والتقرير اليومي.\n"
                                 "استخدم /start لطلب التفعيل أو مراسلة الأدمن.",
                             )
                         except Exception:
                             pass
+
                         await asyncio.sleep(0.1)
                     except Exception as e:
                         logger.debug(f"kick_expired: {e}")
@@ -791,18 +779,13 @@ async def kick_expired_members_loop():
             logger.exception(f"KICK_EXPIRED_LOOP ERROR: {e}")
         await asyncio.sleep(max(60, KICK_CHECK_INTERVAL_SEC))
 
-
 async def notify_trial_expiring_soon_loop():
     while True:
         try:
             now = datetime.now(timezone.utc)
             soon = now + timedelta(hours=REMINDER_BEFORE_HOURS)
             with get_session() as s:
-                rows = (
-                    s.query(User)
-                    .filter(User.end_at != None, User.end_at > now, User.end_at <= soon)  # noqa
-                    .all()
-                )
+                rows = s.query(User).filter(User.end_at != None, User.end_at > now, User.end_at <= soon).all()
                 for u in rows:
                     if u.tg_user_id in _SENT_SOON_REM:
                         continue
@@ -810,8 +793,7 @@ async def notify_trial_expiring_soon_loop():
                         left_min = max(1, int((u.end_at - now).total_seconds() // 60))
                         await bot.send_message(
                             u.tg_user_id,
-                            f"⏰ تبقّى حوالي {left_min} دقيقة على نهاية صلاحيتك.
-"
+                            f"⏰ تبقّى حوالي {left_min} دقيقة على نهاية صلاحيتك.\n"
                             "✅ فعّل اشتراكك الآن لتستمر الإشارات بدون انقطاع. استخدم /start.",
                             parse_mode="HTML",
                         )
