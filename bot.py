@@ -809,36 +809,24 @@ async def notify_trial_expiring_soon_loop():
 # Reports
 # ---------------------------
 
-def _report_card(stats_24: dict, stats_7d: dict) -> str:
-    return (
-        "📊 <b>التقرير اليومي — لقطة أداء مركّزة</b>
-"
-        "━━━━━━━━━━━━━━
-"
-        "<b>آخر 24 ساعة</b>
-"
-        f"• إشارات: <b>{stats_24['signals']}</b> | صفقات مفتوحة: <b>{stats_24['open']}</b>
-"
-        f"• أهداف: <b>{stats_24['tp_total']}</b> (TP1: {stats_24['tp1']} | TP2: {stats_24['tp2']})
-"
-        f"• وقف خسارة: <b>{stats_24['sl']}</b>
-"
-        f"• نجاح: <b>{stats_24['win_rate']}%</b>
-"
-        f"• صافي R: <b>{stats_24['r_sum']}</b>
-"
-        "━━━━━━━━━━━━━━
-"
-        "<b>آخر 7 أيام</b>
-"
-        f"• إشارات: <b>{stats_7d['signals']}</b> | أهداف: <b>{stats_7d['tp_total']}</b> | SL: <b>{stats_7d['sl']}</b>
-"
-        f"• نجاح أسبوعي: <b>{stats_7d['win_rate']}%</b> | صافي R: <b>{stats_7d['r_sum']}</b>
-"
-        "━━━━━━━━━━━━━━
-"
-        "💡 <i>الخطة أهم من الضجيج: مخاطرة ثابتة + التزام بالأهداف.</i>"
+def render_daily_report(stats: dict) -> str:
+    total = stats.get("total", 0)
+    win_rate = stats.get("win_rate", 0.0)
+    best_symbol = stats.get("best_symbol", "-")
+    best_gain = stats.get("best_gain", 0.0)
+    worst_symbol = stats.get("worst_symbol", "-")
+    worst_gain = stats.get("worst_gain", 0.0)
+
+    msg = (
+        "📊 <b>التقرير اليومي — لقطة أداء مركّزة</b>\n"
+        f"• إجمالي الصفقات: <b>{total}</b>\n"
+        f"• نسبة الربح: <b>{win_rate:.1f}%</b>\n"
+        "—\n"
+        f"🔹 أفضل رمز: <code>{best_symbol}</code> (+{best_gain:.2f}%)\n"
+        f"🔸 أضعف رمز: <code>{worst_symbol}</code> ({worst_gain:.2f}%)\n"
     )
+    return msg
+
 
 
 async def daily_report_once():
