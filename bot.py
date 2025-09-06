@@ -109,6 +109,7 @@ if ENABLE_DB_LOCK:
 # Strategy & Symbols
 from strategy import check_signal  # NOTE: your new stronger strategy
 from symbols import SYMBOLS
+import symbols as symbols_mod  # لإعادة توليد القائمة دوريًا
 
 # ---------------------------
 # Logging
@@ -133,6 +134,7 @@ SHOW_REF_IN_START = os.getenv("SHOW_REF_IN_START", "1") == "1"
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
 AVAILABLE_SYMBOLS: List[str] = []
+AVAILABLE_SYMBOLS_LOCK = asyncio.Lock()
 
 # Rate limiter for OKX public
 OKX_PUBLIC_MAX = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))
@@ -155,8 +157,11 @@ class SlidingRateLimiter:
 
 RATE = SlidingRateLimiter(OKX_PUBLIC_MAX, OKX_PUBLIC_WIN)
 
-# Scan/Monitor intervals
-SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "300"))
+# === فواصل الفحص والتحديث ===
+SYMBOLS_REFRESH_HOURS = int(os.getenv("SYMBOLS_REFRESH_HOURS", "4"))  # تحديث الرموز كل 4 ساعات
+SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "60"))  # 60=دقيقة | 300=5 دقائق
+
+# مراقبة الصفقات
 MONITOR_INTERVAL_SEC = int(os.getenv("MONITOR_INTERVAL_SEC", "15"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
@@ -563,11 +568,46 @@ async def load_okx_markets_and_filter():
         all_markets = set(exchange.markets.keys())
         filtered = [s for s in SYMBOLS if s in all_markets]
         skipped = [s for s in SYMBOLS if s not in all_markets]
-        AVAILABLE_SYMBOLS = filtered
+        async with AVAILABLE_SYMBOLS_LOCK:
+            AVAILABLE_SYMBOLS = filtered
         logger.info(f"✅ OKX: Loaded {len(filtered)} symbols. Skipped {len(skipped)}: {skipped}")
     except Exception as e:
         logger.exception(f"❌ load_okx_markets error: {e}")
-        AVAILABLE_SYMBOLS = []
+        async with AVAILABLE_SYMBOLS_LOCK:
+            AVAILABLE_SYMBOLS = []
+
+# --- NEW: إعادة بناء القائمة وتحديثها دورياً ---
+
+async def rebuild_available_symbols(new_symbols: List[str]):
+    """
+    يفلتر الرموز بحسب أسواق OKX المتاحة، ويحدّث AVAILABLE_SYMBOLS بشكل آمن.
+    """
+    global AVAILABLE_SYMBOLS
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, exchange.load_markets)
+        all_markets = set(exchange.markets.keys())
+        filtered = [s for s in new_symbols if s in all_markets]
+        skipped = [s for s in new_symbols if s not in all_markets]
+        async with AVAILABLE_SYMBOLS_LOCK:
+            AVAILABLE_SYMBOLS = filtered
+        logger.info(f"✅ symbols reloaded: {len(filtered)} symbols. Skipped {len(skipped)}.")
+    except Exception as e:
+        logger.exception(f"❌ rebuild_available_symbols error: {e}")
+
+async def refresh_symbols_periodically():
+    """
+    يعيد توليد SYMBOLS من symbols.py كل SYMBOLS_REFRESH_HOURS ثم يعيد بناء AVAILABLE_SYMBOLS.
+    """
+    while True:
+        try:
+            fresh = symbols_mod._prepare_symbols()  # نفس منطق symbols.py
+            await rebuild_available_symbols(fresh)
+            sample = ", ".join(fresh[:10])
+            logger.info(f"[symbols] refreshed → {len(fresh)} | first 10: {sample}")
+        except Exception as e:
+            logger.exception(f"[symbols] refresh failed: {e}")
+        await asyncio.sleep(SYMBOLS_REFRESH_HOURS * 3600)
 
 # ---------------------------
 # Data fetchers
@@ -635,7 +675,9 @@ async def _scan_one_symbol(sym: str) -> Optional[dict]:
     return sig if sig else None
 
 async def scan_and_dispatch():
-    if not AVAILABLE_SYMBOLS:
+    async with AVAILABLE_SYMBOLS_LOCK:
+        symbols_snapshot = list(AVAILABLE_SYMBOLS)
+    if not symbols_snapshot:
         return
 
     async with SCAN_LOCK:
@@ -649,8 +691,8 @@ async def scan_and_dispatch():
                     logger.warning(f"⚠️ Scan error [{sym}]: {e}")
                     return None
 
-        for i in range(0, len(AVAILABLE_SYMBOLS), SCAN_BATCH_SIZE):
-            batch = AVAILABLE_SYMBOLS[i:i + SCAN_BATCH_SIZE]
+        for i in range(0, len(symbols_snapshot), SCAN_BATCH_SIZE):
+            batch = symbols_snapshot[i:i + SCAN_BATCH_SIZE]
             sigs = await asyncio.gather(*[_guarded_scan(s) for s in batch])
 
             for sig in filter(None, sigs):
@@ -1486,14 +1528,6 @@ async def cb_admin_skip_ref(q: CallbackQuery):
         await q.message.answer(f"❌ فشل التفعيل: {e}")
     await q.answer("تم.")
 
-@dp.callback_query(F.data == "admin_cancel")
-async def cb_admin_cancel(q: CallbackQuery):
-    aid = q.from_user.id
-    if aid in ADMIN_FLOW:
-        ADMIN_FLOW.pop(aid, None)
-    await q.message.answer("تم إلغاء جلسة التفعيل اليدوي.")
-    await q.answer("تم.")
-
 @dp.message(Command("approve"))
 async def cmd_approve(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS:
@@ -1685,6 +1719,12 @@ async def main():
 
     await load_okx_markets_and_filter()
 
+    # بناء أولي بالقائمة الحالية من symbols.py (مرة واحدة عند الإقلاع)
+    try:
+        await rebuild_available_symbols(SYMBOLS)
+    except Exception:
+        pass
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
@@ -1699,9 +1739,10 @@ async def main():
     t4 = asyncio.create_task(monitor_open_trades())
     t5 = asyncio.create_task(kick_expired_members_loop())
     t6 = asyncio.create_task(notify_trial_expiring_soon_loop())
+    t_symbols = asyncio.create_task(refresh_symbols_periodically())  # NEW: تحديث الرموز كل 4 ساعات
 
     try:
-        await asyncio.gather(t1, t2, t3, t4, t5, t6)
+        await asyncio.gather(t1, t2, t3, t4, t5, t6, t_symbols)
     except TelegramConflictError:
         logger.error("❌ Conflict: يبدو أن نسخة أخرى من البوت تعمل وتستخدم getUpdates. أوقف النسخة الأخرى أو غيّر التوكن.")
         return
