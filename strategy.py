@@ -1,9 +1,15 @@
 from __future__ import annotations
 """
 strategy.py — R-based Router (BRK/PULL/RANGE/SWEEP) + S/R Clamp + MTF + Score
-+ (New) dual-entry zone, 5 targets (optional), HTF close-below stop rule.
-
-متوافق مع check_signal(symbol, ohlcv[, ohlcv_htf]).
++ (Auto) dual-entry zone, 5 targets (اختياري داخليًا)، HTF close-below stop rule.
+- تحسينات تلقائية:
+  * تقليم البيانات قبل الحسابات (أداء).
+  * MTF أكثر انضباطًا في الوضع الصارم (إن لم تتوفر HTF).
+  * جودة شمعة ديناميكية بحسب RVOL.
+  * نطاق ATR ديناميكي متكيف مع تذبذب السوق الأخير.
+  * تحسين منطق retest للـ Breakout (حتى شمعتين).
+  * أهداف RANGE/SWEEP تتكيف مع ATR (تحويل داخلي إلى نسب).
+- متوافق مع check_signal(symbol, ohlcv[, ohlcv_htf]).
 """
 
 from datetime import datetime
@@ -11,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import os
 import json
 import pandas as pd
+import math
 
 # ========= حساسية/سيولة/تذبذب =========
 MIN_QUOTE_VOL = 20_000
@@ -27,20 +34,20 @@ RISK_PROFILES = {
 }
 _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["conservative"])
 
-# ========= مفاتيح الميزات الجديدة =========
-ENABLE_MULTI_ENTRIES = os.getenv("ENABLE_MULTI_ENTRIES", "1") == "1"
-ENABLE_MULTI_TARGETS = os.getenv("ENABLE_MULTI_TARGETS", "1") == "1"
-ENABLE_STOP_RULE     = os.getenv("ENABLE_STOP_RULE", "1") == "1"
+# ========= مفاتيح الميزات (أوتو) =========
+ENABLE_MULTI_ENTRIES = True
+ENABLE_MULTI_TARGETS = True
+ENABLE_STOP_RULE     = True
 
-# منطقة الدخول (كعرض بالنسبة لـ R)
-ENTRY_ZONE_WIDTH_R = float(os.getenv("ENTRY_ZONE_WIDTH_R", "0.25"))  # عرض المنطقة = 0.25R (من أسفل إلى الإغلاق الحالي)
-ENTRY_MIN_PCT      = float(os.getenv("ENTRY_MIN_PCT", "0.005"))      # حد أدنى 0.5% للعرض
-ENTRY_MAX_R        = float(os.getenv("ENTRY_MAX_R", "0.60"))         # حد أقصى 0.6R
+# منطقة الدخول (كعرض بالنسبة لـ R) — تلقائي
+ENTRY_ZONE_WIDTH_R = 0.25
+ENTRY_MIN_PCT      = 0.005
+ENTRY_MAX_R        = 0.60
 
-# خمسة أهداف (عند التفعيل). داخليًا R-based، للعرض يمكن % حسب الست-أب.
+# خمسة أهداف (عند التفعيل). داخليًا R-based أو نسب (للعرض فقط).
 TARGETS_MODE_BY_SETUP = {"BRK": "r", "PULL": "r", "RANGE": "pct", "SWEEP": "pct"}
-TARGETS_R5   = tuple(float(x) for x in os.getenv("TARGETS_R5", "1.0,1.8,3.0,4.5,6.0").split(","))
-TARGETS_PCTS = tuple(float(x) for x in os.getenv("TARGETS_PCTS", "0.03,0.06,0.09,0.12,0.15").split(","))
+TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)                    # للـ BRK/PULL
+TARGETS_PCTS = (0.03, 0.06, 0.09, 0.12, 0.15)               # افتراضي RANGE/SWEEP (يتم تعديلها على أساس ATR تلقائيًا)
 ALWAYS_LOG_R = True
 MIN_T1_ABOVE_ENTRY = 0.015
 
@@ -81,12 +88,16 @@ MOTIVATION = {
     "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎",
 }
 
-# منع تكرار داخلي
+# منع تكرار داخلي (داخل العملية فقط)
 _LAST_ENTRY_BAR_TS: dict[str, int] = {}
 _LAST_SIGNAL_BAR_IDX: dict[str, int] = {}
 HOLDOUT_BARS = _cfg["HOLDOUT_BARS"]
 
-# ========= مؤشرات =========
+# ========= أدوات مساعدة للأداء/التكيّف =========
+def _trim(df: pd.DataFrame, n: int = 240) -> pd.DataFrame:
+    """قصّ البيانات لتسريع الحسابات بدون التأثير على المنطق."""
+    return df.tail(n).copy()
+
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
@@ -122,11 +133,11 @@ def add_indicators(df):
 # ========= S/R & Fib =========
 def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < window + 3: return None, None
-    df_prev = df.iloc[:-1]; w = min(window, len(df_prev))
-    resistance = df_prev["high"].rolling(w, min_periods=max(5, w//3)).max().iloc[-1]
-    support    = df_prev["low"].rolling(w,  min_periods=max(5, w//3)).min().iloc[-1]
-    if pd.isna(resistance) or pd.isna(support): return None, None
-    return float(support), float(resistance)
+    # استخدام أقسام مباشرة بدل rolling لسرعة طفيفة
+    hi = float(df.iloc[-(window+1):-1]["high"].max())
+    lo = float(df.iloc[-(window+1):-1]["low"].min())
+    if not math.isfinite(hi) or not math.isfinite(lo): return None, None
+    return float(lo), float(hi)
 
 def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < lookback + 5: return None, None
@@ -151,6 +162,7 @@ def _fib_ok(price: float, df: pd.DataFrame) -> bool:
     except Exception:
         return False
 
+# ========= نظام السوق =========
 def detect_regime(df) -> str:
     c = df["close"]; e50 = df["ema50"]
     up = (c.iloc[-1] > e50.iloc[-1]) and (e50.diff(10).iloc[-1] > 0)
@@ -161,11 +173,13 @@ def detect_regime(df) -> str:
     return "range" if width <= 6 * atrp else "mixed"
 
 # ========= برايس أكشن =========
-def candle_quality(row) -> bool:
+def candle_quality(row, rvol_hint: float | None = None) -> bool:
     o = float(row["open"]); c = float(row["close"]); h = float(row["high"]); l = float(row["low"])
     tr = max(h - l, 1e-9); body = abs(c - o); upper_wick = h - max(c, o)
     body_pct = body / tr; upwick_pct = upper_wick / tr
-    return (c > o) and (body_pct >= 0.55) and (upwick_pct <= 0.35)
+    # حد أدنى ديناميكي حسب السيولة النسبية
+    min_body = 0.55 if (rvol_hint is None or rvol_hint < 1.3) else 0.45
+    return (c > o) and (body_pct >= min_body) and (upwick_pct <= 0.35)
 
 def is_bull_engulf(prev, cur) -> bool:
     return (float(cur["close"]) > float(cur["open"]) and
@@ -195,12 +209,12 @@ def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
         for col in ["open","high","low","close","volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna().reset_index(drop=True)
+        df = _trim(df, 240)
         return add_indicators(df)
     except Exception:
         return None
 
 def pass_mtf_filter_any(ohlcv_htf) -> bool:
-    if ohlcv_htf is None: return True
     frames: List[pd.DataFrame] = []
     if isinstance(ohlcv_htf, list):
         d = _df_from_ohlcv(ohlcv_htf)
@@ -211,6 +225,9 @@ def pass_mtf_filter_any(ohlcv_htf) -> bool:
             if data:
                 d = _df_from_ohlcv(data)
                 if d is not None: frames.append(d)
+    if not frames:
+        # في الملف الشخصي الصارم/المتوازن، غياب HTF يسقط الإشارة
+        return not _cfg["MTF_STRICT"]
     ok_count = 0
     for dfh in frames:
         if len(dfh) < 60: continue
@@ -223,13 +240,37 @@ def pass_mtf_filter_any(ohlcv_htf) -> bool:
         if _cfg["MTF_STRICT"]:
             conds.append(float(dfh["ema50"].diff(5).iloc[-2]) > 0)
         ok_count += int(all(conds))
-    if not frames: return True
     return ok_count >= 1
+
+# ========= ATR Band تكيفي =========
+def adapt_atr_band(atr_pct_series: pd.Series, base_band: Tuple[float, float]) -> Tuple[float, float]:
+    """تعديل تلقائي بسيط لنطاق ATR% حول مركز القاعدة حسب حالة السوق الأخيرة."""
+    if atr_pct_series is None or len(atr_pct_series) < 50:
+        return base_band
+    recent = atr_pct_series.tail(200).clip(lower=0)
+    med = float(recent.median())
+    std = float(recent.std(ddof=0)) if recent.std(ddof=0) > 0 else 0.0
+    lo, hi = base_band
+    center = (lo + hi) / 2.0
+    # حرك النطاق قليلًا نحو الميديان، ووسّعه/ضيقه قليلًا حسب std
+    shift = 0.5 * (med - center)
+    widen = 0.5 * std
+    new_lo = max(1e-5, lo + shift - widen)
+    new_hi = hi + shift + widen
+    if new_lo >= new_hi:
+        # fallback
+        return base_band
+    return (new_lo, new_hi)
 
 # ========= بناء الأهداف/الوقف =========
 def _build_targets_r(entry: float, sl: float, tp_r: Tuple[float, ...]) -> List[float]:
     R = max(entry - sl, 1e-9)
     return [entry + r*R for r in tp_r]
+
+def _build_targets_pct_from_atr(price: float, atr: float, multipliers: Tuple[float, ...]) -> List[float]:
+    """حوّل مضاعفات ATR إلى نسب، ثم ابني الأهداف كنِسَب للعرض/المنطق في بيئات RANGE/SWEEP."""
+    pcts = [max(atr / max(price, 1e-9) * m, 0.002) for m in multipliers]  # حد أدنى 0.2%
+    return [price * (1 + p) for p in pcts], tuple(pcts)
 
 def _clamp_t1_below_res(entry: float, t1: float, res: Optional[float], buf_pct: float = 0.0015) -> Tuple[float, bool]:
     if res is None: return t1, False
@@ -252,11 +293,12 @@ def score_signal(struct_ok: bool, rvol: float, atr_pct: float, ema_align: bool, 
     bd["struct"] = w["struct"] if struct_ok else 0; sc += bd["struct"]
     rvol_min = _cfg["RVOL_MIN"]
     rvol_score = min(max((rvol - rvol_min) / max(0.5, rvol_min), 0), 1) * w["rvol"]; bd["rvol"] = rvol_score; sc += rvol_score
+    # ATR band سيتم تكييفها تلقائيًا قبل الاستدعاء
     lo, hi = _cfg["ATR_BAND"]
-    if atr_pct < lo or atr_pct > hi:
+    center = (lo + hi)/2
+    if not (lo <= atr_pct <= hi):
         bd["atr"] = 0
     else:
-        center = (lo + hi)/2
         atr_score = (1 - abs(atr_pct - center)/max(center - lo, 1e-9)) * w["atr"]
         bd["atr"] = max(0, min(w["atr"], atr_score)); sc += bd["atr"]
     bd["ema"] = w["ema"] if ema_align else 0; sc += bd["ema"]
@@ -273,6 +315,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     df = df.dropna().reset_index(drop=True)
     if len(df) < 60: return None
 
+    # قصّ البيانات لتحسين الأداء
+    df = _trim(df, 240)
+
     df = add_indicators(df)
     if len(df) < 60: return None
 
@@ -287,28 +332,35 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     cur_idx = len(df) - 2
     if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < HOLDOUT_BARS: return None
 
-    # سيولة + تذبذب
+    # سيولة
     if price * float(closed["volume"]) < MIN_QUOTE_VOL: return None
+
     atr = float(df["atr"].iloc[-2]); atr_pct = atr / max(price, 1e-9)
-    lo, hi = _cfg["ATR_BAND"]
-    if not (lo <= atr_pct <= hi): return None
+
+    # نطاق ATR ديناميكي (يُعدّل القيم العالمية مؤقتًا لهذه المكالمة)
+    _base_lo, _base_hi = _cfg["ATR_BAND"]
+    lo_dyn, hi_dyn = adapt_atr_band((df["atr"] / df["close"]).dropna(), (_base_lo, _base_hi))
+
+    # تذبذب ضمن النطاق
+    if not (lo_dyn <= atr_pct <= hi_dyn): return None
+
+    # RVOL (قبل جودة الشمعة لتمريره تلميحًا)
+    vma = float(closed.get("vol_ma20") or 0.0)
+    rvol = (float(closed["volume"]) / (vma + 1e-9)) if vma > 0 else 0.0
+    if rvol < _cfg["RVOL_MIN"]: return None
 
     # اتجاه/جودة
     if not (price > float(closed["open"])): return None
     ema_align = (float(closed["ema9"]) > float(closed["ema21"]) > float(closed["ema50"])) or (price > float(closed["ema50"]))
     if not ema_align: return None
-    if not candle_quality(closed): return None
-
-    # RVOL
-    vma = float(closed.get("vol_ma20") or 0.0)
-    rvol = (float(closed["volume"]) / (vma + 1e-9)) if vma > 0 else 0.0
-    if rvol < _cfg["RVOL_MIN"]: return None
+    if not candle_quality(closed, rvol_hint=rvol): return None
 
     # S/R + نظام السوق + MTF
     sup = res = None
     if USE_SR: sup, res = get_sr_on_closed(df, SR_WINDOW)
     regime = detect_regime(df)
     mtf_ok = pass_mtf_filter_any(ohlcv_htf)
+    if not mtf_ok: return None
 
     # برايس أكشن
     rev_hammer  = is_hammer(closed)
@@ -324,7 +376,14 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     except Exception:
         hhv_prev = float(prev["high"])
     breakout_ok = price > hhv_prev * (1.0 + BREAKOUT_BUFFER)
-    retest_ok = float(prev["low"]) <= hhv_prev * (1.0 + 0.0005) and float(prev["low"]) >= hhv_prev * (1.0 - 0.002)
+
+    # retest: اسمح حتى شمعتين سابقتين
+    prev_l = float(prev["low"])
+    prev2_l = float(prev2["low"])
+    retest_band_hi = hhv_prev * (1.0 + 0.0008)
+    retest_band_lo = hhv_prev * (1.0 - 0.0025)
+    retest_ok = ((retest_band_lo <= prev_l <= retest_band_hi) or (retest_band_lo <= prev2_l <= retest_band_hi))
+
     hl_ok = float(closed["low"]) > float(prev["low"])
 
     seg = df.iloc[-120:]
@@ -346,13 +405,13 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         )
     )
 
-    if (regime in ("trend","mixed")) and breakout_ok and retest_ok and (rev_insideb or rev_engulf or candle_quality(closed)):
+    if (regime in ("trend","mixed")) and breakout_ok and retest_ok and (rev_insideb or rev_engulf or candle_quality(closed, rvol)):
         setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest"]
     elif pull_cond:
         setup = "PULL"; struct_ok = True; reasons += ["Pullback Reclaim"]
-    elif range_env and near_sup and (rev_hammer or candle_quality(closed)):
+    elif range_env and near_sup and (rev_hammer or candle_quality(closed, rvol)):
         setup = "RANGE"; struct_ok = True; reasons += ["Range Rotation"]
-    elif had_sweep and (rev_engulf or candle_quality(closed) or price > float(closed["ema21"])):
+    elif had_sweep and (rev_engulf or candle_quality(closed, rvol) or price > float(closed["ema21"])):
         setup = "SWEEP"; struct_ok = True; reasons += ["Liquidity Sweep"]
 
     if setup is None: return None
@@ -360,15 +419,23 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     # SL وأهداف
     sl = _protect_sl_with_swing(df, price, atr)
 
-    # أهداف (3 أو 5)
+    # أهداف (3 أو 5) — RANGE/SWEEP تتكيف مع ATR تلقائيًا
     if ENABLE_MULTI_TARGETS:
         disp_mode = TARGETS_MODE_BY_SETUP.get(setup, "r")
         if disp_mode == "pct":
-            t_list = [price * (1 + p) for p in TARGETS_PCTS]
+            # استخدم مضاعفات ATR ديناميكيًا (تحويل إلى نسب للعرض)
+            # مضاعفات افتراضية ملائمة للنطاق/السويب
+            atr_mults = (1.5, 2.5, 3.5, 4.5, 6.0)
+            t_list, pct_vals = _build_targets_pct_from_atr(price, atr, atr_mults)
+            targets_display_vals = pct_vals
         else:
             t_list = _build_targets_r(price, sl, TARGETS_R5)
+            targets_display_vals = TARGETS_R5
     else:
         t_list = _build_targets_r(price, sl, _cfg["TP_R"])
+        disp_mode = "r"
+        targets_display_vals = _cfg["TP_R"]
+
     t_list = sorted(t_list)
 
     # قصّ T1 لو قرب المقاومة
@@ -385,11 +452,15 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     R_val = max(price - sl, 1e-9)
     srdist_R = ((res - price)/R_val) if (res is not None and res > price) else 10.0
 
-    # سكور
+    # سكور — استخدم النطاق الديناميكي داخليًا
+    # (نحدّث مؤقتًا حدود ATR للاستخدام داخل الدالة)
+    old_band = _cfg["ATR_BAND"]
+    _cfg["ATR_BAND"] = (lo_dyn, hi_dyn)
     score, bd = score_signal(struct_ok, rvol, atr_pct, ema_align, mtf_ok, srdist_R)
+    _cfg["ATR_BAND"] = old_band
     if score < _cfg["SCORE_MIN"]: return None
 
-    # منطقة دخول ثنائية (اختياري)
+    # منطقة دخول ثنائية (أوتو)
     entries = None
     if ENABLE_MULTI_ENTRIES:
         width_r = max(ENTRY_ZONE_WIDTH_R * R_val, price * ENTRY_MIN_PCT)
@@ -399,20 +470,23 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         if entry_low < entry_high:
             entries = [round(entry_low, 6), round(entry_high, 6)]
 
-    # حفظ آخر بار
+    # حفظ آخر بار (داخليًا)
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
     _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
     # أسباب مختصرة
-    if price > float(closed["ema50"]): reasons.append("Price>EMA50")
-    if float(closed["ema9"]) > float(closed["ema21"]): reasons.append("EMA9>EMA21")
-    if is_hammer(closed): reasons.append("Hammer")
-    if is_bull_engulf(prev, closed): reasons.append("Bull Engulf")
-    if is_inside_break(prev2, prev, closed): reasons.append("InsideBreak")
-    if near_res: reasons.append("NearRes")
-    if near_sup: reasons.append("NearSup")
-    reasons.append(f"RVOL≥{round(_cfg['RVOL_MIN'],2)}")
-    confluence = reasons[:6]
+    reasons_full: List[str] = []
+    if price > float(closed["ema50"]): reasons_full.append("Price>EMA50")
+    if float(closed["ema9"]) > float(closed["ema21"]): reasons_full.append("EMA9>EMA21")
+    if is_hammer(closed): reasons_full.append("Hammer")
+    if is_bull_engulf(prev, closed): reasons_full.append("Bull Engulf")
+    if is_inside_break(prev2, prev, closed): reasons_full.append("InsideBreak")
+    if near_res: reasons_full.append("NearRes")
+    if near_sup: reasons_full.append("NearSup")
+    reasons_full.append(f"RVOL≥{round(_cfg['RVOL_MIN'],2)}")
+
+    # confluence = أول 6 نقاط الأكثر أهمية (مع الحفاظ على القائمة الكاملة للـdebug)
+    confluence = (reasons + reasons_full)[:6]
 
     # رسائل
     messages = {
@@ -427,8 +501,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     }
 
     # عرض للمشترك
-    disp_mode = TARGETS_MODE_BY_SETUP.get(setup, "r")
-    targets_display = {"mode": disp_mode, "values": list(TARGETS_PCTS if (ENABLE_MULTI_TARGETS and disp_mode=="pct") else (TARGETS_R5 if ENABLE_MULTI_TARGETS else _cfg["TP_R"]))}
+    targets_display = {"mode": disp_mode, "values": list(targets_display_vals)}
 
     # زمن الوصول لـ T1
     max_bars_to_tp1 = MAX_BARS_TO_TP1
@@ -450,7 +523,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "symbol": symbol,
         "side": "LONG",
         "entry": entry_out,
-        "entries": entries,                 # NEW
+        "entries": entries,                 # NEW (أوتو)
         "sl":    round(sl, 6),
         "targets": [round(x,6) for x in t_list],  # NEW
         "tp1":   round(tp1, 6),
@@ -462,8 +535,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "r":     round(entry_out - sl, 6),
         "score": int(score),
         "regime": regime,
-        "reasons": confluence,
-        "confluence": confluence,
+        "reasons": reasons_full,           # القائمة الكاملة
+        "confluence": confluence,          # خلاصة مختصرة
 
         "features": {
             "rsi": float(closed["rsi"]),
@@ -477,6 +550,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             "setup": setup,
             "targets_display": targets_display,
             "score_breakdown": bd,
+            "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},  # لمراقبة التكيّف
         },
 
         "partials": PARTIAL_FRACTIONS[:len(t_list)],
