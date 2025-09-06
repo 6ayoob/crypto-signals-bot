@@ -1,14 +1,12 @@
 from __future__ import annotations
 """
 strategy.py — R-based Router (BRK/PULL/RANGE/SWEEP) + S/R Clamp + MTF + Score
-+ (Auto) dual-entry zone, 5 targets (اختياري داخليًا)، HTF close-below stop rule.
-- تحسينات تلقائية:
-  * تقليم البيانات قبل الحسابات (أداء).
-  * MTF أكثر انضباطًا في الوضع الصارم (إن لم تتوفر HTF).
-  * جودة شمعة ديناميكية بحسب RVOL.
-  * نطاق ATR ديناميكي متكيف مع تذبذب السوق الأخير.
-  * تحسين منطق retest للـ Breakout (حتى شمعتين).
-  * أهداف RANGE/SWEEP تتكيف مع ATR (تحويل داخلي إلى نسب).
+Balanced+:
+  • MIN_T1_ABOVE_ENTRY = 1.0%
+  • ATR% adaptive + gentle widen
+  • Missing MTF ⇒ no hard reject (–15 score instead)
+  • MAX_BARS_TO_TP1 = 8 (6 for BRK/SWEEP)
+  • Pullback band near EMA21 = 0.5%
 - متوافق مع check_signal(symbol, ohlcv[, ohlcv_htf]).
 """
 
@@ -25,14 +23,14 @@ VOL_MA = 20
 ATR_PERIOD = 14
 EMA_FAST, EMA_SLOW, EMA_TREND, EMA_LONG = 9, 21, 50, 200
 
-# ========= أوضاع المخاطرة =========
-RISK_MODE = os.getenv("RISK_MODE", "conservative").lower()
+# ========= أوضاع المخاطرة (قيم الأساس) =========
+RISK_MODE = os.getenv("RISK_MODE", "balanced").lower()
 RISK_PROFILES = {
     "conservative": {"SCORE_MIN": 78, "ATR_BAND": (0.0018, 0.015), "RVOL_MIN": 1.05, "TP_R": (1.0, 1.8, 3.0), "HOLDOUT_BARS": 3, "MTF_STRICT": True},
     "balanced":     {"SCORE_MIN": 72, "ATR_BAND": (0.0015, 0.020), "RVOL_MIN": 1.00, "TP_R": (1.0, 2.0, 3.5), "HOLDOUT_BARS": 2, "MTF_STRICT": True},
     "aggressive":   {"SCORE_MIN": 68, "ATR_BAND": (0.0012, 0.030), "RVOL_MIN": 0.95, "TP_R": (1.2, 2.4, 4.0), "HOLDOUT_BARS": 1, "MTF_STRICT": False},
 }
-_cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["conservative"])
+_cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 
 # ========= مفاتيح الميزات (أوتو) =========
 ENABLE_MULTI_ENTRIES = True
@@ -47,9 +45,9 @@ ENTRY_MAX_R        = 0.60
 # خمسة أهداف (عند التفعيل). داخليًا R-based أو نسب (للعرض فقط).
 TARGETS_MODE_BY_SETUP = {"BRK": "r", "PULL": "r", "RANGE": "pct", "SWEEP": "pct"}
 TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)                    # للـ BRK/PULL
-TARGETS_PCTS = (0.03, 0.06, 0.09, 0.12, 0.15)               # افتراضي RANGE/SWEEP (يتم تعديلها على أساس ATR تلقائيًا)
+TARGETS_PCTS = (0.03, 0.06, 0.09, 0.12, 0.15)               # افتراضي RANGE/SWEEP (قد يُستبدل بـ ATR)
 ALWAYS_LOG_R = True
-MIN_T1_ABOVE_ENTRY = 0.015
+MIN_T1_ABOVE_ENTRY = 0.010  # 1.0% (Balanced+)
 
 # تقسيم الكمية (يبقى اختياري للعرض/إدارة لاحقة)
 PARTIAL_FRACTIONS = [0.35, 0.25, 0.20, 0.12, 0.08]
@@ -60,7 +58,7 @@ TRAIL_AFTER_TP2_ATR = 1.0
 
 # خروج زمني
 USE_MAX_BARS_TO_TP1 = True
-MAX_BARS_TO_TP1 = 6
+MAX_BARS_TO_TP1 = 8  # Balanced+
 
 # S/R & Fib
 USE_SR = True
@@ -133,7 +131,6 @@ def add_indicators(df):
 # ========= S/R & Fib =========
 def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < window + 3: return None, None
-    # استخدام أقسام مباشرة بدل rolling لسرعة طفيفة
     hi = float(df.iloc[-(window+1):-1]["high"].max())
     lo = float(df.iloc[-(window+1):-1]["low"].min())
     if not math.isfinite(hi) or not math.isfinite(lo): return None, None
@@ -214,7 +211,12 @@ def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-def pass_mtf_filter_any(ohlcv_htf) -> bool:
+def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool]:
+    """
+    يعيد (has_frames, pass_all_conds)
+    - إذا لا توجد HTF frames: (False, False) ⇒ سنعاملها كـ "غياب" ونطبّق خصم سكوري لاحقًا.
+    - إذا وجدت: نتحقق من الشروط (EMA50, MACD+, RSI>50 [+ ميل EMA50]).
+    """
     frames: List[pd.DataFrame] = []
     if isinstance(ohlcv_htf, list):
         d = _df_from_ohlcv(ohlcv_htf)
@@ -225,9 +227,10 @@ def pass_mtf_filter_any(ohlcv_htf) -> bool:
             if data:
                 d = _df_from_ohlcv(data)
                 if d is not None: frames.append(d)
+
     if not frames:
-        # في الملف الشخصي الصارم/المتوازن، غياب HTF يسقط الإشارة
-        return not _cfg["MTF_STRICT"]
+        return False, False
+
     ok_count = 0
     for dfh in frames:
         if len(dfh) < 60: continue
@@ -237,14 +240,13 @@ def pass_mtf_filter_any(ohlcv_htf) -> bool:
             float(closed["macd_hist"]) > 0,
             float(closed["rsi"]) > 50,
         ]
-        if _cfg["MTF_STRICT"]:
-            conds.append(float(dfh["ema50"].diff(5).iloc[-2]) > 0)
+        conds.append(float(dfh["ema50"].diff(5).iloc[-2]) > 0)  # ميل EMA50
         ok_count += int(all(conds))
-    return ok_count >= 1
+    return True, (ok_count >= 1)
 
 # ========= ATR Band تكيفي =========
 def adapt_atr_band(atr_pct_series: pd.Series, base_band: Tuple[float, float]) -> Tuple[float, float]:
-    """تعديل تلقائي بسيط لنطاق ATR% حول مركز القاعدة حسب حالة السوق الأخيرة."""
+    """تعديل تلقائي بسيط لنطاق ATR% حول مركز القاعدة حسب حالة السوق الأخيرة، مع توسيع لطيف."""
     if atr_pct_series is None or len(atr_pct_series) < 50:
         return base_band
     recent = atr_pct_series.tail(200).clip(lower=0)
@@ -252,15 +254,18 @@ def adapt_atr_band(atr_pct_series: pd.Series, base_band: Tuple[float, float]) ->
     std = float(recent.std(ddof=0)) if recent.std(ddof=0) > 0 else 0.0
     lo, hi = base_band
     center = (lo + hi) / 2.0
-    # حرك النطاق قليلًا نحو الميديان، ووسّعه/ضيقه قليلًا حسب std
+    # انقل المركز نحو الميديان + وسّع بالانحراف المعياري
     shift = 0.5 * (med - center)
     widen = 0.5 * std
     new_lo = max(1e-5, lo + shift - widen)
     new_hi = hi + shift + widen
     if new_lo >= new_hi:
-        # fallback
-        return base_band
-    return (new_lo, new_hi)
+        new_lo, new_hi = lo, hi
+    # توسيع لطيف إضافي بنسبة 10% حول المركز
+    ctr = (new_lo + new_hi) / 2.0
+    half = (new_hi - new_lo) / 2.0
+    half *= 1.10
+    return (max(1e-5, ctr - half), ctr + half)
 
 # ========= بناء الأهداف/الوقف =========
 def _build_targets_r(entry: float, sl: float, tp_r: Tuple[float, ...]) -> List[float]:
@@ -287,13 +292,14 @@ def _protect_sl_with_swing(df, entry_price: float, atr: float) -> float:
     return base_sl
 
 # ========= سكور =========
-def score_signal(struct_ok: bool, rvol: float, atr_pct: float, ema_align: bool, mtf_ok: bool, srdist_R: float) -> Tuple[int, Dict[str, float]]:
+def score_signal(struct_ok: bool, rvol: float, atr_pct: float, ema_align: bool, mtf_pass: bool, srdist_R: float, mtf_has_frames: bool) -> Tuple[int, Dict[str, float]]:
     w = {"struct": 30, "rvol": 15, "atr": 15, "ema": 15, "mtf": 15, "srdist": 10}
     sc = 0.0; bd = {}
     bd["struct"] = w["struct"] if struct_ok else 0; sc += bd["struct"]
+
     rvol_min = _cfg["RVOL_MIN"]
     rvol_score = min(max((rvol - rvol_min) / max(0.5, rvol_min), 0), 1) * w["rvol"]; bd["rvol"] = rvol_score; sc += rvol_score
-    # ATR band سيتم تكييفها تلقائيًا قبل الاستدعاء
+
     lo, hi = _cfg["ATR_BAND"]
     center = (lo + hi)/2
     if not (lo <= atr_pct <= hi):
@@ -301,8 +307,21 @@ def score_signal(struct_ok: bool, rvol: float, atr_pct: float, ema_align: bool, 
     else:
         atr_score = (1 - abs(atr_pct - center)/max(center - lo, 1e-9)) * w["atr"]
         bd["atr"] = max(0, min(w["atr"], atr_score)); sc += bd["atr"]
+
     bd["ema"] = w["ema"] if ema_align else 0; sc += bd["ema"]
-    bd["mtf"] = w["mtf"] if mtf_ok else 0; sc += bd["mtf"]
+
+    # Balanced+: إذا لا توجد أطر HTF ⇒ لا خصم إضافي (سيأتي خصم 15 إذا frames موجودة ولم تجتز)
+    if mtf_has_frames:
+        bd["mtf"] = w["mtf"] if mtf_pass else 0
+        sc += bd["mtf"]
+        if not mtf_pass:
+            sc -= 15  # خصم إضافي عند توفر HTF وفشل شروطها
+            bd["mtf_penalty"] = -15
+    else:
+        bd["mtf"] = 0
+        bd["mtf_penalty"] = -15  # لا توجد HTF ⇒ عاملها كخصم 15 بدلاً من رفض الإشارة
+        sc -= 15
+
     srd = max(srdist_R, 0.0); srd_score = min(srd / 1.5, 1.0) * w["srdist"]; bd["srdist"] = srd_score; sc += srd_score
     return int(round(sc)), bd
 
@@ -337,11 +356,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
     atr = float(df["atr"].iloc[-2]); atr_pct = atr / max(price, 1e-9)
 
-    # نطاق ATR ديناميكي (يُعدّل القيم العالمية مؤقتًا لهذه المكالمة)
+    # نطاق ATR ديناميكي وموسّع قليلًا
     _base_lo, _base_hi = _cfg["ATR_BAND"]
     lo_dyn, hi_dyn = adapt_atr_band((df["atr"] / df["close"]).dropna(), (_base_lo, _base_hi))
-
-    # تذبذب ضمن النطاق
     if not (lo_dyn <= atr_pct <= hi_dyn): return None
 
     # RVOL (قبل جودة الشمعة لتمريره تلميحًا)
@@ -359,8 +376,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     sup = res = None
     if USE_SR: sup, res = get_sr_on_closed(df, SR_WINDOW)
     regime = detect_regime(df)
-    mtf_ok = pass_mtf_filter_any(ohlcv_htf)
-    if not mtf_ok: return None
+    mtf_has_frames, mtf_pass = pass_mtf_filter_any(ohlcv_htf)  # لا رفض مباشر
 
     # برايس أكشن
     rev_hammer  = is_hammer(closed)
@@ -384,8 +400,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     retest_band_lo = hhv_prev * (1.0 - 0.0025)
     retest_ok = ((retest_band_lo <= prev_l <= retest_band_hi) or (retest_band_lo <= prev2_l <= retest_band_hi))
 
-    hl_ok = float(closed["low"]) > float(prev["low"])
-
     seg = df.iloc[-120:]
     range_width = (seg["high"].max() - seg["low"].min())/max(seg["close"].iloc[-1],1e-9)
     range_atr = float(seg["atr"].iloc[-2])/max(price,1e-9)
@@ -395,12 +409,12 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     struct_ok = False
     reasons: List[str] = []
 
-    # اختيار الست-أب
+    # اختيار الست-أب — Pullback أوسع حول EMA21 (0.5%)
     pull_cond = (
         (regime in ("trend","mixed"))
         and (rev_hammer or rev_engulf or rev_insideb)
         and (
-            abs(price - float(closed["ema21"])) / max(price,1e-9) <= 0.003
+            abs(price - float(closed["ema21"])) / max(price,1e-9) <= 0.005  # Balanced+: 0.5%
             or (USE_FIB and _fib_ok(price, df))
         )
     )
@@ -419,12 +433,10 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     # SL وأهداف
     sl = _protect_sl_with_swing(df, price, atr)
 
-    # أهداف (3 أو 5) — RANGE/SWEEP تتكيف مع ATR تلقائيًا
+    # أهداف — RANGE/SWEEP تتكيف مع ATR تلقائيًا
     if ENABLE_MULTI_TARGETS:
         disp_mode = TARGETS_MODE_BY_SETUP.get(setup, "r")
         if disp_mode == "pct":
-            # استخدم مضاعفات ATR ديناميكيًا (تحويل إلى نسب للعرض)
-            # مضاعفات افتراضية ملائمة للنطاق/السويب
             atr_mults = (1.5, 2.5, 3.5, 4.5, 6.0)
             t_list, pct_vals = _build_targets_pct_from_atr(price, atr, atr_mults)
             targets_display_vals = pct_vals
@@ -443,38 +455,35 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     t_list[0] = t1
     if clamped: reasons.append("T1@ResClamp")
 
-    # رفض لو T1 صار قريب جدًا
+    # رفض لو T1 قريب جدًا
     if (t_list[0] - price)/max(price,1e-9) < MIN_T1_ABOVE_ENTRY: return None
-
     if not (sl < price < t_list[0] <= t_list[-1]): return None
 
     # مسافة المقاومة بـ R
     R_val = max(price - sl, 1e-9)
     srdist_R = ((res - price)/R_val) if (res is not None and res > price) else 10.0
 
-    # سكور — استخدم النطاق الديناميكي داخليًا
-    # (نحدّث مؤقتًا حدود ATR للاستخدام داخل الدالة)
+    # سكور — باستخدام نطاق ATR الديناميكي
     old_band = _cfg["ATR_BAND"]
     _cfg["ATR_BAND"] = (lo_dyn, hi_dyn)
-    score, bd = score_signal(struct_ok, rvol, atr_pct, ema_align, mtf_ok, srdist_R)
+    score, bd = score_signal(struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames)
     _cfg["ATR_BAND"] = old_band
     if score < _cfg["SCORE_MIN"]: return None
 
     # منطقة دخول ثنائية (أوتو)
     entries = None
-    if ENABLE_MULTI_ENTRIES:
-        width_r = max(ENTRY_ZONE_WIDTH_R * R_val, price * ENTRY_MIN_PCT)
-        width_r = min(width_r, ENTRY_MAX_R * R_val)
-        entry_low  = max(sl + 1e-6, price - width_r)
-        entry_high = price
-        if entry_low < entry_high:
-            entries = [round(entry_low, 6), round(entry_high, 6)]
+    width_r = max(ENTRY_ZONE_WIDTH_R * R_val, price * ENTRY_MIN_PCT)
+    width_r = min(width_r, ENTRY_MAX_R * R_val)
+    entry_low  = max(sl + 1e-6, price - width_r)
+    entry_high = price
+    if entry_low < entry_high:
+        entries = [round(entry_low, 6), round(entry_high, 6)]
 
     # حفظ آخر بار (داخليًا)
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
     _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
-    # أسباب مختصرة
+    # أسباب
     reasons_full: List[str] = []
     if price > float(closed["ema50"]): reasons_full.append("Price>EMA50")
     if float(closed["ema9"]) > float(closed["ema21"]): reasons_full.append("EMA9>EMA21")
@@ -484,8 +493,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if near_res: reasons_full.append("NearRes")
     if near_sup: reasons_full.append("NearSup")
     reasons_full.append(f"RVOL≥{round(_cfg['RVOL_MIN'],2)}")
-
-    # confluence = أول 6 نقاط الأكثر أهمية (مع الحفاظ على القائمة الكاملة للـdebug)
     confluence = (reasons + reasons_full)[:6]
 
     # رسائل
@@ -503,14 +510,12 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     # عرض للمشترك
     targets_display = {"mode": disp_mode, "values": list(targets_display_vals)}
 
-    # زمن الوصول لـ T1
+    # زمن الوصول لـ T1 (Balanced+)
     max_bars_to_tp1 = MAX_BARS_TO_TP1
-    if setup in ("BRK","SWEEP"): max_bars_to_tp1 = max(4, MAX_BARS_TO_TP1 - 1)
+    if setup in ("BRK","SWEEP"): max_bars_to_tp1 = max(6, MAX_BARS_TO_TP1 - 2)
 
     # وقف HTF اختياري
-    stop_rule = None
-    if ENABLE_STOP_RULE:
-        stop_rule = {"type": STOP_RULE_KIND, "tf": STOP_RULE_TF, "level": round(sl, 6)}
+    stop_rule = {"type": STOP_RULE_KIND, "tf": STOP_RULE_TF, "level": round(sl, 6)} if ENABLE_STOP_RULE else None
 
     # قيم متوافقة قديمة
     tp1 = t_list[0]; tp2 = t_list[1] if len(t_list) > 1 else t_list[0]
@@ -523,9 +528,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "symbol": symbol,
         "side": "LONG",
         "entry": entry_out,
-        "entries": entries,                 # NEW (أوتو)
+        "entries": entries,                 # NEW
         "sl":    round(sl, 6),
-        "targets": [round(x,6) for x in t_list],  # NEW
+        "targets": [round(x,6) for x in t_list],
         "tp1":   round(tp1, 6),
         "tp2":   round(tp2, 6),
         "tp3":   round(tp3, 6) if tp3 is not None else None,
@@ -535,8 +540,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "r":     round(entry_out - sl, 6),
         "score": int(score),
         "regime": regime,
-        "reasons": reasons_full,           # القائمة الكاملة
-        "confluence": confluence,          # خلاصة مختصرة
+        "reasons": reasons_full,            # كامل
+        "confluence": confluence,           # مختصر
 
         "features": {
             "rsi": float(closed["rsi"]),
@@ -550,7 +555,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             "setup": setup,
             "targets_display": targets_display,
             "score_breakdown": bd,
-            "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},  # لمراقبة التكيّف
+            "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},
         },
 
         "partials": PARTIAL_FRACTIONS[:len(t_list)],
@@ -565,6 +570,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "strategy_code": setup,
         "messages": messages,
 
-        "stop_rule": stop_rule,             # NEW
+        "stop_rule": stop_rule,
         "timestamp": datetime.utcnow().isoformat()
     }
