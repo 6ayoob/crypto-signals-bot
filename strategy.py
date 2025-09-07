@@ -71,7 +71,7 @@ USE_FIB = True
 SWING_LOOKBACK = 60
 FIB_TOL = 0.004
 
-# وقف HTF
+# وقف HTF (محفوظ في meta فقط، الوقف الفعلي breakeven_after مدعوم في run.py)
 STOP_RULE_TF = os.getenv("STOP_RULE_TF", "H4").upper()  # H1/H4/D1
 STOP_RULE_KIND = "htf_close_below"
 
@@ -291,38 +291,47 @@ def _protect_sl_with_swing(df, entry_price: float, atr: float) -> float:
         pass
     return base_sl
 
-# ========= سكور =========
-def score_signal(struct_ok: bool, rvol: float, atr_pct: float, ema_align: bool, mtf_pass: bool, srdist_R: float, mtf_has_frames: bool) -> Tuple[int, Dict[str, float]]:
+# ========= سكور (بدون تعديل _cfg عالميًا) =========
+def score_signal(
+    struct_ok: bool,
+    rvol: float,
+    atr_pct: float,
+    ema_align: bool,
+    mtf_pass: bool,
+    srdist_R: float,
+    mtf_has_frames: bool,
+    rvol_min: float,
+    atr_band: Tuple[float, float],
+) -> Tuple[int, Dict[str, float]]:
     w = {"struct": 30, "rvol": 15, "atr": 15, "ema": 15, "mtf": 15, "srdist": 10}
-    sc = 0.0; bd = {}
+    sc = 0.0; bd: Dict[str, float] = {}
+
     bd["struct"] = w["struct"] if struct_ok else 0; sc += bd["struct"]
 
-    rvol_min = _cfg["RVOL_MIN"]
-    rvol_score = min(max((rvol - rvol_min) / max(0.5, rvol_min), 0), 1) * w["rvol"]; bd["rvol"] = rvol_score; sc += rvol_score
+    rvol_score = min(max((rvol - rvol_min) / max(0.5, rvol_min), 0), 1) * w["rvol"]
+    bd["rvol"] = rvol_score; sc += rvol_score
 
-    lo, hi = _cfg["ATR_BAND"]
+    lo, hi = atr_band
     center = (lo + hi)/2
-    if not (lo <= atr_pct <= hi):
-        bd["atr"] = 0
-    else:
+    if lo <= atr_pct <= hi:
         atr_score = (1 - abs(atr_pct - center)/max(center - lo, 1e-9)) * w["atr"]
         bd["atr"] = max(0, min(w["atr"], atr_score)); sc += bd["atr"]
+    else:
+        bd["atr"] = 0
 
     bd["ema"] = w["ema"] if ema_align else 0; sc += bd["ema"]
 
-    # Balanced+: إذا لا توجد أطر HTF ⇒ لا خصم إضافي (سيأتي خصم 15 إذا frames موجودة ولم تجتز)
     if mtf_has_frames:
         bd["mtf"] = w["mtf"] if mtf_pass else 0
         sc += bd["mtf"]
         if not mtf_pass:
-            sc -= 15  # خصم إضافي عند توفر HTF وفشل شروطها
-            bd["mtf_penalty"] = -15
+            sc -= 15; bd["mtf_penalty"] = -15
     else:
-        bd["mtf"] = 0
-        bd["mtf_penalty"] = -15  # لا توجد HTF ⇒ عاملها كخصم 15 بدلاً من رفض الإشارة
-        sc -= 15
+        bd["mtf"] = 0; bd["mtf_penalty"] = -15; sc -= 15
 
-    srd = max(srdist_R, 0.0); srd_score = min(srd / 1.5, 1.0) * w["srdist"]; bd["srdist"] = srd_score; sc += srd_score
+    srd = max(srdist_R, 0.0)
+    bd["srdist"] = min(srd / 1.5, 1.0) * w["srdist"]; sc += bd["srdist"]
+
     return int(round(sc)), bd
 
 # ========= المولّد =========
@@ -463,11 +472,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     R_val = max(price - sl, 1e-9)
     srdist_R = ((res - price)/R_val) if (res is not None and res > price) else 10.0
 
-    # سكور — باستخدام نطاق ATR الديناميكي
-    old_band = _cfg["ATR_BAND"]
-    _cfg["ATR_BAND"] = (lo_dyn, hi_dyn)
-    score, bd = score_signal(struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames)
-    _cfg["ATR_BAND"] = old_band
+    # سكور — باستخدام نطاق ATR الديناميكي (بدون تعديل _cfg)
+    score, bd = score_signal(
+        struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
+        _cfg["RVOL_MIN"], (lo_dyn, hi_dyn)
+    )
     if score < _cfg["SCORE_MIN"]: return None
 
     # منطقة دخول ثنائية (أوتو)
@@ -514,8 +523,18 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     max_bars_to_tp1 = MAX_BARS_TO_TP1
     if setup in ("BRK","SWEEP"): max_bars_to_tp1 = max(6, MAX_BARS_TO_TP1 - 2)
 
-    # وقف HTF اختياري
-    stop_rule = {"type": STOP_RULE_KIND, "tf": STOP_RULE_TF, "level": round(sl, 6)} if ENABLE_STOP_RULE else None
+    # قاعدة وقف متوافقة مع run.py + حفظ نية HTF
+    stop_rule = None
+    if ENABLE_STOP_RULE:
+        stop_rule = {
+            "type": "breakeven_after",  # مدعوم حاليًا في monitor_open_trades
+            "at_idx": 0,                # بعد تحقق TP1
+            "meta": {
+                "intended": STOP_RULE_KIND,
+                "tf": STOP_RULE_TF,
+                "htf_level": round(sl, 6)
+            }
+        }
 
     # قيم متوافقة قديمة
     tp1 = t_list[0]; tp2 = t_list[1] if len(t_list) > 1 else t_list[0]
@@ -526,9 +545,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
     return {
         "symbol": symbol,
-        "side": "LONG",
+        "side": "buy",                   # موحّد ومتفّق مع بقية المنظومة
         "entry": entry_out,
-        "entries": entries,                 # NEW
+        "entries": entries,              # NEW
         "sl":    round(sl, 6),
         "targets": [round(x,6) for x in t_list],
         "tp1":   round(tp1, 6),
@@ -540,8 +559,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "r":     round(entry_out - sl, 6),
         "score": int(score),
         "regime": regime,
-        "reasons": reasons_full,            # كامل
-        "confluence": confluence,           # مختصر
+        "reasons": reasons_full,         # كامل
+        "confluence": confluence,        # مختصر
 
         "features": {
             "rsi": float(closed["rsi"]),
