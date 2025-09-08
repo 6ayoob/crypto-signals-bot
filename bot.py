@@ -15,7 +15,7 @@ import random
 import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -402,6 +402,27 @@ def format_signal_text_basic(sig: dict) -> str:
                 extra += f"\n🧠 كونفلوينس: <i>{_h(', '.join(sig['reasons'][:6]))}</i>"
             except Exception:
                 pass
+    # عرض حالة الـ Auto-Relax والعتبات الحالية إن توفرت
+    try:
+        f = sig.get("features", {}) or {}
+        lvl = f.get("relax_level")
+        thr = f.get("thresholds") or {}
+        if lvl is not None:
+            badge = "🟢" if lvl == 0 else ("🟡" if lvl == 1 else "🟠")
+            atr_band = thr.get("ATR_BAND") or (None, None)
+            extra += (
+                f"\n{badge} Auto-Relax: L{lvl} | "
+                f"SCORE_MIN={thr.get('SCORE_MIN','-')} | "
+                f"RVOL_MIN={thr.get('RVOL_MIN','-')} | "
+                f"ATR%∈[{_fmt_price(atr_band[0])}, {_fmt_price(atr_band[1])}]"
+            )
+            if 'MIN_T1_ABOVE_ENTRY' in thr:
+                try:
+                    extra += f" | T1≥{float(thr['MIN_T1_ABOVE_ENTRY'])*100:.1f}%"
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     strat_line = (
         f"\n🧭 النمط: <b>{_h(sig.get('strategy_code','-'))}</b> | ملف: <i>{_h(sig.get('profile','-'))}</i>"
@@ -628,6 +649,32 @@ async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300) -> list:
             return []
     return []
 
+# NEW: HTF support (H1/H4/D1)
+HTF_MAP = {"H1": ("1h", 220), "H4": ("4h", 220), "D1": ("1d", 220)}
+
+async def fetch_ohlcv_htf(symbol: str) -> dict:
+    """Fetches H1/H4/D1 OHLCV in parallel, honoring the public rate limiter."""
+    async def _one(tf_ccxt: str, limit: int) -> list:
+        for attempt in range(3):
+            try:
+                await RATE.wait()
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, lambda: exchange.fetch_ohlcv(symbol, timeframe=tf_ccxt, limit=limit))
+            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception:
+                return []
+        return []
+    tasks = {k: asyncio.create_task(_one(v[0], v[1])) for k, v in HTF_MAP.items()}
+    out = {}
+    for k, t in tasks.items():
+        try:
+            out[k] = await t
+        except Exception:
+            out[k] = []
+    # drop empties so strategy doesn't consider them as present
+    return {k: v for k, v in out.items() if v}
+
 async def fetch_ticker_price(symbol: str) -> Optional[float]:
     for attempt in range(3):
         try:
@@ -671,7 +718,8 @@ async def _scan_one_symbol(sym: str) -> Optional[dict]:
     data = await fetch_ohlcv(sym)
     if not data:
         return None
-    sig = check_signal(sym, data)
+    htf = await fetch_ohlcv_htf(sym)
+    sig = check_signal(sym, data, htf if htf else None)
     return sig if sig else None
 
 async def scan_and_dispatch():
@@ -975,6 +1023,18 @@ def _report_card(stats_24: dict, stats_7d: dict) -> str:
         part2 = f"\n📅 آخر 7 أيام — إشارات: <b>{n7}</b> | نسبة الربح: <b>{wr7:.1f}%</b> | صافي R: <b>{r7:+.2f}R</b>"
     except Exception:
         part2 = ""
+    # إضافة “منذ آخر إشارة” من strategy_state.json + تقدير مستوى Auto-Relax
+    try:
+        st_path = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
+        last_ts = (json.loads(Path(st_path).read_text(encoding="utf-8")).get("last_signal_ts") or 0)
+        if last_ts:
+            hours = max(0, (time.time() - float(last_ts)) / 3600.0)
+            h1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
+            h2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
+            lvl = 2 if hours >= h2 else (1 if hours >= h1 else 0)
+            part2 += f"\n⏳ منذ آخر إشارة: <b>{hours:.1f} ساعة</b> | Auto-Relax: <b>L{lvl}</b>"
+    except Exception:
+        pass
     return part1 + part2
 
 async def daily_report_once():
@@ -1340,7 +1400,7 @@ async def cmd_status(m: Message):
     await m.answer(txt_ok if ok else txt_no, parse_mode="HTML")
 
 # ---------------------------
-# Admin commands
+# Admin commands + Debug helpers
 # ---------------------------
 
 @dp.message(Command("admin_help"))
@@ -1356,6 +1416,8 @@ async def cmd_admin_help(m: Message):
         "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
         "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
         "• <code>/refstats &lt;user_id&gt;</code> – إحصاءات الإحالة للمستخدم\n"
+        "• <code>/debug_sig SYMBOL</code> – فحص فوري لرمز وإظهار سبب عدم الإشارة\n"
+        "• <code>/relax_status</code> – حالة Auto‑Relax ومنذ آخر إشارة\n"
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1553,7 +1615,7 @@ async def cmd_approve(m: Message):
             except Exception as e:
                 logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
     await m.answer(
-        f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}."
+        f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}."\
         f"{_bonus_applied_text(bonus_applied)}"
     )
     invite = await get_paid_invite_link(uid)
@@ -1635,6 +1697,57 @@ async def cmd_refstats(m: Message):
         f"- total_bonus_days: {st.get('total_bonus_days')}",
         parse_mode="HTML"
     )
+
+# ---- Admin debug helpers added ----
+
+@dp.message(Command("debug_sig"))
+async def cmd_debug_sig(m: Message, command: CommandObject):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    sym = (command.args or "").strip()
+    if not sym:
+        return await m.answer("استخدم: /debug_sig SYMBOL\nمثال: /debug_sig BTC/USDT")
+    await m.answer(f"⏳ فحص {sym} …")
+    try:
+        data = await fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=300)
+        if not data:
+            return await m.answer("لم أستطع جلب OHLCV.")
+        htf = await fetch_ohlcv_htf(sym)
+        sig = check_signal(sym, data, htf if htf else None)
+        if sig:
+            txt = format_signal_text_basic(sig)
+            return await m.answer("✅ إشارة متاحة:\n\n"+txt, parse_mode="HTML", disable_web_page_preview=True)
+        # لا توجد إشارة: اعرض مقاييس مفيدة
+        import pandas as pd
+        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+        close = float(df.iloc[-2]["close"]); vol = float(df.iloc[-2]["volume"])
+        vma20 = float(df["volume"].rolling(20, min_periods=1).mean().iloc[-2])
+        rvol = (vol / vma20) if vma20 > 0 else 0.0
+        await m.answer(
+            "ℹ️ لا توجد إشارة الآن.\n"
+            f"• السعر: <code>{_fmt_price(close)}</code>\n"
+            f"• RVOL≈ <b>{rvol:.2f}</b>\n"
+            f"• إطارات HTF المحمّلة: <b>{', '.join(htf.keys()) if htf else '—'}</b>\n"
+            "جرّب لاحقًا أو رموزًا أخرى.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await m.answer(f"خطأ أثناء الفحص: <code>{_h(str(e))}</code>", parse_mode="HTML")
+
+@dp.message(Command("relax_status"))
+async def cmd_relax(m: Message):
+    if m.from_user.id not in ADMIN_USER_IDS:
+        return
+    try:
+        st_path = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
+        last_ts = (json.loads(Path(st_path).read_text(encoding="utf-8")).get("last_signal_ts") or 0)
+        h1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
+        h2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
+        hours = 1e9 if not last_ts else max(0, (time.time() - float(last_ts))/3600.0)
+        lvl = 2 if hours >= h2 else (1 if hours >= h1 else 0)
+        await m.answer(f"Auto-Relax: L{lvl} | منذ آخر إشارة: {hours:.1f} ساعة")
+    except Exception as e:
+        await m.answer(f"تعذر قراءة الحالة: {e}")
 
 # ---------------------------
 # Startup checks & polling
