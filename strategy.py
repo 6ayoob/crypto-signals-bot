@@ -1,12 +1,13 @@
 from __future__ import annotations
 """
 strategy.py — R-based Router (BRK/PULL/RANGE/SWEEP) + S/R Clamp + MTF + Score
-Balanced+:
-  • MIN_T1_ABOVE_ENTRY = 1.0%
-  • ATR% adaptive + gentle widen
+Balanced+ (with Auto-Relax & Reject Logging):
+  • MIN_T1_ABOVE_ENTRY = 1.0% (relaxes to 0.8% / 0.6% on drought)
+  • ATR% adaptive + gentle widen (base & relax-aware)
   • Missing MTF ⇒ no hard reject (–15 score instead)
   • MAX_BARS_TO_TP1 = 8 (6 for BRK/SWEEP)
   • Pullback band near EMA21 = 0.5%
+  • Auto-Relax after 24/48h w/o signals (score/RVOL/ATR band easing)
 - متوافق مع check_signal(symbol, ohlcv[, ohlcv_htf]).
 """
 
@@ -16,6 +17,7 @@ import os
 import json
 import pandas as pd
 import math
+import time
 
 # ========= حساسية/سيولة/تذبذب =========
 MIN_QUOTE_VOL = 20_000
@@ -47,10 +49,6 @@ TARGETS_MODE_BY_SETUP = {"BRK": "r", "PULL": "r", "RANGE": "pct", "SWEEP": "pct"
 TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)                    # للـ BRK/PULL
 TARGETS_PCTS = (0.03, 0.06, 0.09, 0.12, 0.15)               # افتراضي RANGE/SWEEP (قد يُستبدل بـ ATR)
 ALWAYS_LOG_R = True
-MIN_T1_ABOVE_ENTRY = 0.010  # 1.0% (Balanced+)
-
-# تقسيم الكمية (يبقى اختياري للعرض/إدارة لاحقة)
-PARTIAL_FRACTIONS = [0.35, 0.25, 0.20, 0.12, 0.08]
 
 # التريلينغ بعد هدف متقدم
 TRAIL_AFTER_TP2 = True
@@ -85,6 +83,66 @@ MOTIVATION = {
     "sl":    "🛑 SL على {symbol}. حماية رأس المال أولًا — فرص أقوى قادمة 🔄",
     "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎",
 }
+
+# ========= حالة و لوج الرفض + Auto-Relax =========
+LOG_REJECTS = os.getenv("STRATEGY_LOG_REJECTS", "1").strip().lower() in ("1","true","yes","on")
+STATE_FILE = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
+AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
+AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
+
+def _now() -> int: return int(time.time())
+
+def _load_state():
+    try:
+        with open(STATE_FILE, "r") as f: return json.load(f)
+    except Exception:
+        return {"last_signal_ts": 0}
+
+def _save_state(s):
+    try:
+        with open(STATE_FILE, "w") as f: json.dump(s, f)
+    except Exception:
+        pass
+
+def mark_signal_now():
+    s = _load_state(); s["last_signal_ts"] = _now(); _save_state(s)
+
+def hours_since_last_signal() -> float:
+    ts = _load_state().get("last_signal_ts", 0)
+    if not ts: return 1e9
+    return (_now() - int(ts)) / 3600.0
+
+def relax_level() -> int:
+    h = hours_since_last_signal()
+    if h >= AUTO_RELAX_AFTER_HRS_2: return 2
+    if h >= AUTO_RELAX_AFTER_HRS_1: return 1
+    return 0
+
+def apply_relax(base_cfg: dict) -> dict:
+    """إرخاء تدريجي عند الجفاف: Score/RVOL/ATR band + MIN_T1."""
+    lvl = relax_level()
+    out = dict(base_cfg)
+    # Score
+    if lvl >= 1: out["SCORE_MIN"] = max(0, out["SCORE_MIN"] - 4)
+    if lvl >= 2: out["SCORE_MIN"] = max(0, out["SCORE_MIN"] - 4)
+    # RVOL
+    if lvl >= 1: out["RVOL_MIN"] = max(0.90, out["RVOL_MIN"] - 0.05)
+    if lvl >= 2: out["RVOL_MIN"] = max(0.85, out["RVOL_MIN"] - 0.05)
+    # ATR band (وسع بسيط أعلى/أسفل)
+    lo, hi = out["ATR_BAND"]
+    if lvl >= 1: lo, hi = lo * 0.9, hi * 1.1
+    if lvl >= 2: lo, hi = lo * 0.85, hi * 1.15
+    out["ATR_BAND"] = (max(1e-5, lo), max(hi, lo + 5e-5))
+    # T1 distance
+    out["MIN_T1_ABOVE_ENTRY"] = 0.010 if lvl == 0 else (0.008 if lvl == 1 else 0.006)
+    # Holdout تكيفي بسيط
+    out["HOLDOUT_BARS_EFF"] = max(1, base_cfg.get("HOLDOUT_BARS", 2) - lvl)
+    out["RELAX_LEVEL"] = lvl
+    return out
+
+def _log_reject(symbol: str, msg: str):
+    if LOG_REJECTS:
+        print(f"[strategy][reject] {symbol}: {msg}")
 
 # منع تكرار داخلي (داخل العملية فقط)
 _LAST_ENTRY_BAR_TS: dict[str, int] = {}
@@ -336,18 +394,24 @@ def score_signal(
 
 # ========= المولّد =========
 def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = None) -> Optional[Dict]:
-    if not ohlcv or len(ohlcv) < 80: return None
+    if not ohlcv or len(ohlcv) < 80:
+        _log_reject(symbol, "insufficient_bars")
+        return None
+
     df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna().reset_index(drop=True)
-    if len(df) < 60: return None
+    if len(df) < 60:
+        _log_reject(symbol, "after_cleaning_len<60")
+        return None
 
     # قصّ البيانات لتحسين الأداء
     df = _trim(df, 240)
-
     df = add_indicators(df)
-    if len(df) < 60: return None
+    if len(df) < 60:
+        _log_reject(symbol, "after_indicators_len<60")
+        return None
 
     prev2  = df.iloc[-4] if len(df) >= 4 else df.iloc[-3]
     prev   = df.iloc[-3]
@@ -355,31 +419,52 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     cur_ts = int(closed["timestamp"])
     price  = float(closed["close"])
 
+    # تطبيق Auto-Relax على العتبات
+    thr = apply_relax(_cfg)
+    MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
+    holdout_eff = thr.get("HOLDOUT_BARS_EFF", _cfg.get("HOLDOUT_BARS", 2))
+
     # منع التكرار + Holdout
-    if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts: return None
+    if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts:
+        _log_reject(symbol, "duplicate_bar")
+        return None
     cur_idx = len(df) - 2
-    if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < HOLDOUT_BARS: return None
+    if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < holdout_eff:
+        _log_reject(symbol, f"holdout<{holdout_eff}")
+        return None
 
     # سيولة
-    if price * float(closed["volume"]) < MIN_QUOTE_VOL: return None
+    if price * float(closed["volume"]) < MIN_QUOTE_VOL:
+        _log_reject(symbol, "low_quote_vol")
+        return None
 
     atr = float(df["atr"].iloc[-2]); atr_pct = atr / max(price, 1e-9)
 
-    # نطاق ATR ديناميكي وموسّع قليلًا
-    _base_lo, _base_hi = _cfg["ATR_BAND"]
-    lo_dyn, hi_dyn = adapt_atr_band((df["atr"] / df["close"]).dropna(), (_base_lo, _base_hi))
-    if not (lo_dyn <= atr_pct <= hi_dyn): return None
+    # نطاق ATR ديناميكي (مبني على عتبة مريحة عند الجفاف)
+    base_lo, base_hi = thr["ATR_BAND"]
+    lo_dyn, hi_dyn = adapt_atr_band((df["atr"] / df["close"]).dropna(), (base_lo, base_hi))
+    if not (lo_dyn <= atr_pct <= hi_dyn):
+        _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_dyn:.4f},{hi_dyn:.4f}]")
+        return None
 
     # RVOL (قبل جودة الشمعة لتمريره تلميحًا)
     vma = float(closed.get("vol_ma20") or 0.0)
     rvol = (float(closed["volume"]) / (vma + 1e-9)) if vma > 0 else 0.0
-    if rvol < _cfg["RVOL_MIN"]: return None
+    if rvol < thr["RVOL_MIN"]:
+        _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f}")
+        return None
 
     # اتجاه/جودة
-    if not (price > float(closed["open"])): return None
+    if not (price > float(closed["open"])):
+        _log_reject(symbol, "close<=open")
+        return None
     ema_align = (float(closed["ema9"]) > float(closed["ema21"]) > float(closed["ema50"])) or (price > float(closed["ema50"]))
-    if not ema_align: return None
-    if not candle_quality(closed, rvol_hint=rvol): return None
+    if not ema_align:
+        _log_reject(symbol, "ema_align_false")
+        return None
+    if not candle_quality(closed, rvol_hint=rvol):
+        _log_reject(symbol, "candle_quality_fail")
+        return None
 
     # S/R + نظام السوق + MTF
     sup = res = None
@@ -437,7 +522,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     elif had_sweep and (rev_engulf or candle_quality(closed, rvol) or price > float(closed["ema21"])):
         setup = "SWEEP"; struct_ok = True; reasons += ["Liquidity Sweep"]
 
-    if setup is None: return None
+    if setup is None:
+        _log_reject(symbol, "no_setup_match")
+        return None
 
     # SL وأهداف
     sl = _protect_sl_with_swing(df, price, atr)
@@ -465,8 +552,12 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if clamped: reasons.append("T1@ResClamp")
 
     # رفض لو T1 قريب جدًا
-    if (t_list[0] - price)/max(price,1e-9) < MIN_T1_ABOVE_ENTRY: return None
-    if not (sl < price < t_list[0] <= t_list[-1]): return None
+    if (t_list[0] - price)/max(price,1e-9) < MIN_T1_ABOVE_ENTRY:
+        _log_reject(symbol, f"t1_entry_gap<{MIN_T1_ABOVE_ENTRY:.3%}")
+        return None
+    if not (sl < price < t_list[0] <= t_list[-1]):
+        _log_reject(symbol, "bounds_invalid(sl<price<t1<=tN) fail")
+        return None
 
     # مسافة المقاومة بـ R
     R_val = max(price - sl, 1e-9)
@@ -475,9 +566,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     # سكور — باستخدام نطاق ATR الديناميكي (بدون تعديل _cfg)
     score, bd = score_signal(
         struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
-        _cfg["RVOL_MIN"], (lo_dyn, hi_dyn)
+        thr["RVOL_MIN"], (lo_dyn, hi_dyn)
     )
-    if score < _cfg["SCORE_MIN"]: return None
+    if score < thr["SCORE_MIN"]:
+        _log_reject(symbol, f"score<{thr['SCORE_MIN']} (got {score})")
+        return None
 
     # منطقة دخول ثنائية (أوتو)
     entries = None
@@ -501,7 +594,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if is_inside_break(prev2, prev, closed): reasons_full.append("InsideBreak")
     if near_res: reasons_full.append("NearRes")
     if near_sup: reasons_full.append("NearSup")
-    reasons_full.append(f"RVOL≥{round(_cfg['RVOL_MIN'],2)}")
+    reasons_full.append(f"RVOL≥{round(thr['RVOL_MIN'],2)}")
     confluence = (reasons + reasons_full)[:6]
 
     # رسائل
@@ -543,6 +636,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
     entry_out = round(sum(entries)/len(entries), 6) if entries else round(price, 6)
 
+    # حدّث حالة الجفاف
+    mark_signal_now()
+
     return {
         "symbol": symbol,
         "side": "buy",                   # موحّد ومتفّق مع بقية المنظومة
@@ -575,9 +671,17 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             "targets_display": targets_display,
             "score_breakdown": bd,
             "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},
+            "relax_level": thr["RELAX_LEVEL"],
+            "thresholds": {
+                "SCORE_MIN": thr["SCORE_MIN"],
+                "RVOL_MIN": thr["RVOL_MIN"],
+                "ATR_BAND": thr["ATR_BAND"],
+                "MIN_T1_ABOVE_ENTRY": MIN_T1_ABOVE_ENTRY,
+                "HOLDOUT_BARS_EFF": holdout_eff,
+            },
         },
 
-        "partials": PARTIAL_FRACTIONS[:len(t_list)],
+        "partials": [0.35, 0.25, 0.20, 0.12, 0.08][:len(t_list)],
         "trail_after_tp2": TRAIL_AFTER_TP2,
         "trail_atr_mult": TRAIL_AFTER_TP2_ATR if TRAIL_AFTER_TP2 else None,
         "max_bars_to_tp1": max_bars_to_tp1 if USE_MAX_BARS_TO_TP1 else None,
