@@ -107,7 +107,7 @@ if ENABLE_DB_LOCK:
             ENABLE_DB_LOCK = False
 
 # Strategy & Symbols
-from strategy import check_signal  # NOTE: your new stronger strategy
+from strategy import check_signal  # NOTE: strategy applies Auto‑Relax + scoring
 from symbols import SYMBOLS
 import symbols as symbols_mod  # لإعادة توليد القائمة دوريًا
 
@@ -131,20 +131,16 @@ START_BANNER_EMOJI = os.getenv("START_BANNER_EMOJI", "🚀")
 REF_BONUS_DAYS = int(os.getenv("REF_BONUS_DAYS", "2"))
 SHOW_REF_IN_START = os.getenv("SHOW_REF_IN_START", "1") == "1"
 
+# === New safety gates (tunable) ===
+STRICT_MTF_GATE = os.getenv("STRICT_MTF_GATE", "1") == "1"  # يرفض أي إشارة لا تنال نقاط MTF كاملة
+SPREAD_MAX_PCT  = float(os.getenv("SPREAD_MAX_PCT", "0.0025"))  # أقصى سبريد 0.25%
+TIME_EXIT_ENABLED = os.getenv("TIME_EXIT_ENABLED", "1") == "1"
+TIME_EXIT_DEFAULT_BARS = int(os.getenv("TIME_EXIT_DEFAULT_BARS", "8"))
+TIME_EXIT_GRACE_SEC = int(os.getenv("TIME_EXIT_GRACE_SEC", "45"))
+HTF_FETCH_PARALLEL = os.getenv("HTF_FETCH_PARALLEL", "0") == "1"  # لتخفيف ضغط الاتصالات
+
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
-
-# === TUNED HTTP POOL (reduces "Connection pool is full") ===
-try:
-    from requests.adapters import HTTPAdapter
-    sess = exchange.session  # ccxt uses requests session
-    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=0)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    logger.info("HTTP pool tuned: pool_maxsize=100")
-except Exception as e:
-    logger.warning(f"HTTP pool tuning skipped: {e}")
-
 AVAILABLE_SYMBOLS: List[str] = []
 AVAILABLE_SYMBOLS_LOCK = asyncio.Lock()
 
@@ -177,8 +173,9 @@ SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "60"))  # 6
 MONITOR_INTERVAL_SEC = int(os.getenv("MONITOR_INTERVAL_SEC", "15"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "10"))
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
+# ⚠️ لتقليل ضغط اتصالات urllib3 (pool=10/host)، خفّضنا التوازي الافتراضي
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "8"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
 
 # Risk V2
 RISK_STATE_FILE = Path("risk_state.json")
@@ -441,7 +438,7 @@ def format_signal_text_basic(sig: dict) -> str:
         if sig.get("strategy_code") else ""
     )
 
-    stop_line = f"\n📏 قاعدة الوقف: <i>{_humanize_stop_rule(stop_line := sig.get('stop_rule')) if (stop_line:=sig.get('stop_rule')) else _humanize_stop_rule(None)}</i>"
+    stop_line = f"\n📏 قاعدة الوقف: <i>{_humanize_stop_rule(stop_rule)}</i>"
 
     return (
         f"🚀 <b>{title}</b>\n"
@@ -452,15 +449,14 @@ def format_signal_text_basic(sig: dict) -> str:
         f"{targets_block}"
         f"{strat_line}\n"
         f"⏰ (UTC): <code>{_h(sig.get('timestamp') or datetime.utcnow().strftime('%Y-%m-%d %H:%M'))}</code>"
-        f"{extra}\n"
-        f"{_humanize_stop_rule(sig.get('stop_rule')) and '📏 قاعدة الوقف: ' + '<i>' + _humanize_stop_rule(sig.get('stop_rule')) + '</i>' or ''}\n"
+        f"{extra}{stop_line}\n"
         "━━━━━━━━━━━━━━\n"
         "⚡️ <i>قاعدة المخاطرة: أقصى 1% لكل صفقة، وبدون مطاردة للسعر.</i>"
     )
 
 def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
     res = getattr(t, "result", "") or ""
-    emoji = {"tp1": "🎯", "tp2": "🏆", "tp3": "🥇", "tp4": "🥈", "tp5": "🥉", "sl": "🛑"}.get(res, "ℹ️")
+    emoji = {"tp1": "🎯", "tp2": "🏆", "tp3": "🥇", "tp4": "🥈", "tp5": "🥉", "sl": "🛑", "time": "⌛"}.get(res, "ℹ️")
     result_label = {
         "tp1": "تحقق الهدف 1 — خطوة ممتازة!",
         "tp2": "تحقق الهدف 2 — إنجاز رائع!",
@@ -468,6 +464,7 @@ def format_close_text(t: Trade, r_multiple: float | None = None) -> str:
         "tp4": "تحقق الهدف 4 — رائعة!",
         "tp5": "تحقق الهدف 5 — قمة الصفقة!",
         "sl": "وقف الخسارة — حماية رأس المال",
+        "time": "خروج زمني — الحركة لم تتفعّل سريعًا"
     }.get(res, "إغلاق")
 
     r_line = f"\n📐 R: <b>{round(r_multiple, 3)}</b>" if r_multiple is not None else ""
@@ -665,27 +662,33 @@ async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300) -> list:
 # NEW: HTF support (H1/H4/D1)
 HTF_MAP = {"H1": ("1h", 220), "H4": ("4h", 220), "D1": ("1d", 220)}
 
-# === HTF FETCH (sequential to reduce connection pressure) ===
 async def fetch_ohlcv_htf(symbol: str) -> dict:
-    """Fetches H1/H4/D1 OHLCV sequentially (safer for connection pool), honoring the public rate limiter."""
-    out: Dict[str, list] = {}
-    for k, (tf_ccxt, limit) in HTF_MAP.items():
+    """Fetches H1/H4/D1 OHLCV; parallelism optional to reduce connection pool pressure."""
+    async def _one(tf_ccxt: str, limit: int) -> list:
         for attempt in range(3):
             try:
                 await RATE.wait()
                 loop = asyncio.get_event_loop()
-                data = await loop.run_in_executor(
-                    None, lambda: exchange.fetch_ohlcv(symbol, timeframe=tf_ccxt, limit=limit)
-                )
-                out[k] = data or []
-                break
+                return await loop.run_in_executor(None, lambda: exchange.fetch_ohlcv(symbol, timeframe=tf_ccxt, limit=limit))
             except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
                 await asyncio.sleep(0.5 * (attempt + 1))
-            except Exception as e:
-                logger.debug(f"HTF fetch error [{symbol} {tf_ccxt}]: {e}")
+            except Exception:
+                return []
+        return []
+
+    if HTF_FETCH_PARALLEL:
+        tasks = {k: asyncio.create_task(_one(v[0], v[1])) for k, v in HTF_MAP.items()}
+        out = {}
+        for k, t in tasks.items():
+            try:
+                out[k] = await t
+            except Exception:
                 out[k] = []
-                break
-    # drop empties so strategy doesn't treat them as present
+    else:
+        out = {}
+        for k, v in HTF_MAP.items():
+            out[k] = await _one(v[0], v[1])
+
     return {k: v for k, v in out.items() if v}
 
 async def fetch_ticker_price(symbol: str) -> Optional[float]:
@@ -702,6 +705,21 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
             logger.warning(f"❌ FETCH_TICKER ERROR [{symbol}]: {e}")
             return None
     return None
+
+async def fetch_spread_pct(symbol: str) -> Optional[float]:
+    """Return (ask-bid)/mid if both bid/ask available; None otherwise."""
+    try:
+        await RATE.wait()
+        loop = asyncio.get_event_loop()
+        ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return None
+        mid = (bid + ask) / 2.0
+        return (ask - bid) / max(mid, 1e-9)
+    except Exception:
+        return None
 
 # ---------------------------
 # Dedupe signals
@@ -757,6 +775,27 @@ async def scan_and_dispatch():
             sigs = await asyncio.gather(*[_guarded_scan(s) for s in batch])
 
             for sig in filter(None, sigs):
+                # === Extra safety gates BEFORE persisting/sending ===
+                # 1) Strict MTF gate (require full MTF points)
+                try:
+                    bd = ((sig.get('features') or {}).get('score_breakdown') or {})
+                    mtf_points = float(bd.get('mtf', 0))
+                    if STRICT_MTF_GATE and mtf_points < 15:
+                        logger.info(f"⛔ MTF_STRICT skip {sig['symbol']} (mtf_points={mtf_points})")
+                        continue
+                except Exception:
+                    if STRICT_MTF_GATE:
+                        continue
+
+                # 2) Spread sanity
+                try:
+                    sp = await fetch_spread_pct(sig["symbol"])  # None = can\'t measure → allow
+                    if sp is not None and sp > SPREAD_MAX_PCT:
+                        logger.info(f"⛔ Spread>{SPREAD_MAX_PCT:.4f} skip {sig['symbol']} (spread={sp:.4f})")
+                        continue
+                except Exception:
+                    pass
+
                 if _should_skip_duplicate(sig):
                     logger.info(f"⏱️ DEDUPE SKIP {sig['symbol']}")
                     continue
@@ -822,7 +861,7 @@ async def loop_signals():
         await asyncio.sleep(max(1.0, SIGNAL_SCAN_INTERVAL_SEC - elapsed))
 
 # ---------------------------
-# Monitor open trades (multi-target + dynamic stop)
+# Monitor open trades (multi-target + dynamic stop + time exit)
 # ---------------------------
 
 def _tp_key(idx: int) -> str:
@@ -854,8 +893,19 @@ def _stop_triggered_by_rule(t: Trade, price: float, last_hit_idx: int) -> bool:
         return price >= effective_sl
     return price <= effective_sl
 
+def timeframe_to_seconds(tf: str) -> int:
+    tf = (tf or "5m").lower().strip()
+    if tf.endswith("ms"): return 0
+    if tf.endswith("s"): return int(tf[:-1])
+    if tf.endswith("m"): return int(tf[:-1]) * 60
+    if tf.endswith("h"): return int(tf[:-1]) * 3600
+    if tf.endswith("d"): return int(tf[:-1]) * 86400
+    if tf.endswith("w"): return int(tf[:-1]) * 7 * 86400
+    return 300
+
 async def monitor_open_trades():
     from types import SimpleNamespace
+    tf_sec = timeframe_to_seconds(TIMEFRAME)
     while True:
         try:
             with get_session() as s:
@@ -897,6 +947,58 @@ async def monitor_open_trades():
                         for idx, tgt in enumerate(tgts):
                             if price >= float(tgt):
                                 new_hit_idx = max(new_hit_idx, idx)
+
+                    # Time-based exit BEFORE closing on last target
+                    if TIME_EXIT_ENABLED:
+                        try:
+                            created_at: Optional[datetime] = getattr(t, "created_at", None)
+                            if created_at is None and hasattr(t, "opened_at"):
+                                created_at = getattr(t, "opened_at")  # fallback
+                            if created_at and isinstance(created_at, datetime):
+                                # Only if TP1 not hit yet
+                                eff_last = int(getattr(t, "last_hit_idx", -1) or -1)
+                                if eff_last < 0:
+                                    # determine bars budget
+                                    bars_budget = None
+                                    # prefer per-trade saved value if exists
+                                    if hasattr(t, "max_bars_to_tp1") and t.max_bars_to_tp1:
+                                        bars_budget = int(t.max_bars_to_tp1)
+                                    else:
+                                        # strategy might store in extra JSON; try parse
+                                        try:
+                                            extra = json.loads(getattr(t, "extra_json", "") or "{}")
+                                            bars_budget = int(extra.get("max_bars_to_tp1")) if extra.get("max_bars_to_tp1") is not None else None
+                                        except Exception:
+                                            bars_budget = None
+                                    if bars_budget is None:
+                                        # default; try speed-up if strategy_code is BRK/SWEEP
+                                        bars_budget = TIME_EXIT_DEFAULT_BARS
+                                        try:
+                                            if getattr(t, "strategy_code", None) in ("BRK", "SWEEP"):
+                                                bars_budget = max(6, TIME_EXIT_DEFAULT_BARS - 2)
+                                        except Exception:
+                                            pass
+                                    # evaluate elapsed
+                                    elapsed = (datetime.now(timezone.utc) - created_at.replace(tzinfo=timezone.utc)).total_seconds()
+                                    if elapsed >= bars_budget * tf_sec + TIME_EXIT_GRACE_SEC:
+                                        # close by time
+                                        result = "time"
+                                        exit_px = float(price)
+                                        r_multiple = on_trade_closed_update_risk(t, result, exit_px)
+                                        try:
+                                            close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ close_trade warn (time-exit): {e}")
+                                        t.result = result
+                                        msg = format_close_text(t, r_multiple)
+                                        extra_msg = (MESSAGES_CACHE.get(t.id, {}) or {}).get("time")
+                                        if extra_msg:
+                                            msg += "\n\n" + extra_msg
+                                        await notify_subscribers(msg)
+                                        await asyncio.sleep(0.05)
+                                        continue
+                        except Exception as e:
+                            logger.debug(f"time-exit check warn: {e}")
 
                     # No targets reached
                     if new_hit_idx < 0:
@@ -1430,7 +1532,7 @@ async def cmd_admin_help(m: Message):
         "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
         "• <code>/refstats &lt;user_id&gt;</code> – إحصاءات الإحالة للمستخدم\n"
         "• <code>/debug_sig SYMBOL</code> – فحص فوري لرمز وإظهار سبب عدم الإشارة\n"
-        "• <code>/relax_status</code> – حالة Auto-Relax ومنذ آخر إشارة\n"
+        "• <code>/relax_status</code> – حالة Auto‑Relax ومنذ آخر إشارة\n"
     )
     await m.answer(txt, parse_mode="HTML")
 
