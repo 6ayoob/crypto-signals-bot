@@ -150,6 +150,7 @@ _LAST_SIGNAL_BAR_IDX: dict[str, int] = {}
 HOLDOUT_BARS = _cfg["HOLDOUT_BARS"]
 
 # ========= أدوات مساعدة للأداء/التكيّف =========
+
 def _trim(df: pd.DataFrame, n: int = 240) -> pd.DataFrame:
     """قصّ البيانات لتسريع الحسابات بدون التأثير على المنطق."""
     return df.tail(n).copy()
@@ -187,6 +188,7 @@ def add_indicators(df):
     return df
 
 # ========= S/R & Fib =========
+
 def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < window + 3: return None, None
     hi = float(df.iloc[-(window+1):-1]["high"].max())
@@ -218,6 +220,7 @@ def _fib_ok(price: float, df: pd.DataFrame) -> bool:
         return False
 
 # ========= نظام السوق =========
+
 def detect_regime(df) -> str:
     c = df["close"]; e50 = df["ema50"]
     up = (c.iloc[-1] > e50.iloc[-1]) and (e50.diff(10).iloc[-1] > 0)
@@ -228,6 +231,7 @@ def detect_regime(df) -> str:
     return "range" if width <= 6 * atrp else "mixed"
 
 # ========= برايس أكشن =========
+
 def candle_quality(row, rvol_hint: float | None = None) -> bool:
     o = float(row["open"]); c = float(row["close"]); h = float(row["high"]); l = float(row["low"])
     tr = max(h - l, 1e-9); body = abs(c - o); upper_wick = h - max(c, o)
@@ -252,12 +256,13 @@ def is_inside_break(pprev, prev, cur) -> bool:
     return cond_inside and (float(cur["high"]) > float(prev["high"])) and (float(cur["close"]) > float(prev["high"]))
 
 def swept_liquidity(prev, cur) -> bool:
-    return (float(cur["low"]) < float(prev["low"])) and (float(cur["close"]) > float(prev["close"]))
+    return (float(cur["low"]) < float(prev["low"]) and (float(cur["close"]) > float(prev["close"])) )
 
 def near_level(price: float, level: Optional[float], tol: float) -> bool:
     return (level is not None) and (abs(price - level) / max(level, 1e-9) <= tol)
 
 # ========= MTF =========
+
 def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
     try:
         df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
@@ -303,6 +308,7 @@ def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool]:
     return True, (ok_count >= 1)
 
 # ========= ATR Band تكيفي =========
+
 def adapt_atr_band(atr_pct_series: pd.Series, base_band: Tuple[float, float]) -> Tuple[float, float]:
     """تعديل تلقائي بسيط لنطاق ATR% حول مركز القاعدة حسب حالة السوق الأخيرة، مع توسيع لطيف."""
     if atr_pct_series is None or len(atr_pct_series) < 50:
@@ -326,6 +332,7 @@ def adapt_atr_band(atr_pct_series: pd.Series, base_band: Tuple[float, float]) ->
     return (max(1e-5, ctr - half), ctr + half)
 
 # ========= بناء الأهداف/الوقف =========
+
 def _build_targets_r(entry: float, sl: float, tp_r: Tuple[float, ...]) -> List[float]:
     R = max(entry - sl, 1e-9)
     return [entry + r*R for r in tp_r]
@@ -350,6 +357,7 @@ def _protect_sl_with_swing(df, entry_price: float, atr: float) -> float:
     return base_sl
 
 # ========= سكور (بدون تعديل _cfg عالميًا) =========
+
 def score_signal(
     struct_ok: bool,
     rvol: float,
@@ -393,6 +401,7 @@ def score_signal(
     return int(round(sc)), bd
 
 # ========= المولّد =========
+
 def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = None) -> Optional[Dict]:
     if not ohlcv or len(ohlcv) < 80:
         _log_reject(symbol, "insufficient_bars")
