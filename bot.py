@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import json
 import hashlib
@@ -1283,7 +1284,7 @@ async def cb_req_sub(q: CallbackQuery):
     except Exception:
         pass
     await q.message.answer(
-        "📩 تم إرسال طلبك للأدمن.\n"
+        "📩 تم إرسال طلبك للأدمن。\n"
         "يرجى التحويل ثم مراسلة الأدمن لتأكيد التفعيل.\n\n"
         "الخطط:\n"
         f"{price_line}"
@@ -1387,7 +1388,7 @@ async def cmd_help(m: Message):
         "• <code>/ref</code> – رابط الإحالة وإحصاءاتك\n"
         "• <code>/use_ref CODE</code> – ربط كود إحالة يدويًا\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
-        "📞 <b>تواصل خاص مع الأدمن</ب>:\n" + _contact_line()
+        "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1417,7 +1418,7 @@ async def cmd_admin_help(m: Message):
         "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
         "• <code>/refstats &lt;user_id&gt;</code> – إحصاءات الإحالة للمستخدم\n"
         "• <code>/debug_sig SYMBOL</code> – فحص فوري لرمز وإظهار سبب عدم الإشارة\n"
-        "• <code>/relax_status</code> – حالة Auto‑Relax ومنذ آخر إشارة\n"
+        "• <code>/relax_status</code> – حالة Auto-Relax ومنذ آخر إشارة\n"
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1446,6 +1447,15 @@ async def cb_admin_manual(q: CallbackQuery):
     ADMIN_FLOW[aid] = {"stage": "await_user"}
     await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
     await q.answer()
+
+# NEW: cancel admin flow handler (fixes missing callback)
+@dp.callback_query(F.data == "admin_cancel")
+async def cb_admin_cancel(q: CallbackQuery):
+    aid = q.from_user.id
+    if aid in ADMIN_USER_IDS and aid in ADMIN_FLOW:
+        ADMIN_FLOW.pop(aid, None)
+    await q.message.answer("تم إلغاء العملية.")
+    await q.answer("أُلغي.", show_alert=False)
 
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
 
