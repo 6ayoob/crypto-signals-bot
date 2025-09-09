@@ -1,4 +1,3 @@
-from __future__ import annotations
 import asyncio
 import json
 import hashlib
@@ -134,6 +133,18 @@ SHOW_REF_IN_START = os.getenv("SHOW_REF_IN_START", "1") == "1"
 
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
+
+# === TUNED HTTP POOL (reduces "Connection pool is full") ===
+try:
+    from requests.adapters import HTTPAdapter
+    sess = exchange.session  # ccxt uses requests session
+    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=0)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    logger.info("HTTP pool tuned: pool_maxsize=100")
+except Exception as e:
+    logger.warning(f"HTTP pool tuning skipped: {e}")
+
 AVAILABLE_SYMBOLS: List[str] = []
 AVAILABLE_SYMBOLS_LOCK = asyncio.Lock()
 
@@ -430,7 +441,7 @@ def format_signal_text_basic(sig: dict) -> str:
         if sig.get("strategy_code") else ""
     )
 
-    stop_line = f"\n📏 قاعدة الوقف: <i>{_humanize_stop_rule(stop_rule)}</i>"
+    stop_line = f"\n📏 قاعدة الوقف: <i>{_humanize_stop_rule(stop_line := sig.get('stop_rule')) if (stop_line:=sig.get('stop_rule')) else _humanize_stop_rule(None)}</i>"
 
     return (
         f"🚀 <b>{title}</b>\n"
@@ -441,7 +452,8 @@ def format_signal_text_basic(sig: dict) -> str:
         f"{targets_block}"
         f"{strat_line}\n"
         f"⏰ (UTC): <code>{_h(sig.get('timestamp') or datetime.utcnow().strftime('%Y-%m-%d %H:%M'))}</code>"
-        f"{extra}{stop_line}\n"
+        f"{extra}\n"
+        f"{_humanize_stop_rule(sig.get('stop_rule')) and '📏 قاعدة الوقف: ' + '<i>' + _humanize_stop_rule(sig.get('stop_rule')) + '</i>' or ''}\n"
         "━━━━━━━━━━━━━━\n"
         "⚡️ <i>قاعدة المخاطرة: أقصى 1% لكل صفقة، وبدون مطاردة للسعر.</i>"
     )
@@ -653,27 +665,27 @@ async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300) -> list:
 # NEW: HTF support (H1/H4/D1)
 HTF_MAP = {"H1": ("1h", 220), "H4": ("4h", 220), "D1": ("1d", 220)}
 
+# === HTF FETCH (sequential to reduce connection pressure) ===
 async def fetch_ohlcv_htf(symbol: str) -> dict:
-    """Fetches H1/H4/D1 OHLCV in parallel, honoring the public rate limiter."""
-    async def _one(tf_ccxt: str, limit: int) -> list:
+    """Fetches H1/H4/D1 OHLCV sequentially (safer for connection pool), honoring the public rate limiter."""
+    out: Dict[str, list] = {}
+    for k, (tf_ccxt, limit) in HTF_MAP.items():
         for attempt in range(3):
             try:
                 await RATE.wait()
                 loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, lambda: exchange.fetch_ohlcv(symbol, timeframe=tf_ccxt, limit=limit))
+                data = await loop.run_in_executor(
+                    None, lambda: exchange.fetch_ohlcv(symbol, timeframe=tf_ccxt, limit=limit)
+                )
+                out[k] = data or []
+                break
             except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
                 await asyncio.sleep(0.5 * (attempt + 1))
-            except Exception:
-                return []
-        return []
-    tasks = {k: asyncio.create_task(_one(v[0], v[1])) for k, v in HTF_MAP.items()}
-    out = {}
-    for k, t in tasks.items():
-        try:
-            out[k] = await t
-        except Exception:
-            out[k] = []
-    # drop empties so strategy doesn't consider them as present
+            except Exception as e:
+                logger.debug(f"HTF fetch error [{symbol} {tf_ccxt}]: {e}")
+                out[k] = []
+                break
+    # drop empties so strategy doesn't treat them as present
     return {k: v for k, v in out.items() if v}
 
 async def fetch_ticker_price(symbol: str) -> Optional[float]:
@@ -1284,7 +1296,7 @@ async def cb_req_sub(q: CallbackQuery):
     except Exception:
         pass
     await q.message.answer(
-        "📩 تم إرسال طلبك للأدمن。\n"
+        "📩 تم إرسال طلبك للأدمن.\n"
         "يرجى التحويل ثم مراسلة الأدمن لتأكيد التفعيل.\n\n"
         "الخطط:\n"
         f"{price_line}"
@@ -1388,7 +1400,7 @@ async def cmd_help(m: Message):
         "• <code>/ref</code> – رابط الإحالة وإحصاءاتك\n"
         "• <code>/use_ref CODE</code> – ربط كود إحالة يدويًا\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
-        "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
+        "📞 <b>تواصل خاص مع الأدمن</ب>:\n" + _contact_line()
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1447,15 +1459,6 @@ async def cb_admin_manual(q: CallbackQuery):
     ADMIN_FLOW[aid] = {"stage": "await_user"}
     await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
     await q.answer()
-
-# NEW: cancel admin flow handler (fixes missing callback)
-@dp.callback_query(F.data == "admin_cancel")
-async def cb_admin_cancel(q: CallbackQuery):
-    aid = q.from_user.id
-    if aid in ADMIN_USER_IDS and aid in ADMIN_FLOW:
-        ADMIN_FLOW.pop(aid, None)
-    await q.message.answer("تم إلغاء العملية.")
-    await q.answer("أُلغي.", show_alert=False)
 
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
 
