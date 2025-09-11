@@ -6,6 +6,17 @@ import os
 def _as_bool(v: str | None, default: bool = True) -> bool:
     if v is None: return default
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
+# config.py — مسارات تشغيل موحّدة
+from pathlib import Path
+import os
+
+# مجلد تشغيل قابل للكتابة على Render (افتراضي /tmp؛ ويمكن تغييره بمتغير بيئة)
+APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ملف الرموز الذي كان يُكتب داخل /mnt/data
+STRATEGY_SYMBOLS_FILENAME = os.getenv("STRATEGY_SYMBOLS_FILENAME", "strategy_crypto_v2_5_symbols.py")
+STRATEGY_SYMBOLS_PATH = APP_DATA_DIR / STRATEGY_SYMBOLS_FILENAME
 
 # ========= تلغرام أساسي =========
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # ضعها في Render (إلزامي)
