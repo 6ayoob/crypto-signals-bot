@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 from collections import deque
 import random
-
+from strategy import check_signal
 import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
