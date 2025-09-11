@@ -1,55 +1,37 @@
-# Create a new version of the crypto strategy that reads a per-symbol config file
-code = r'''# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-strategy_crypto_symbols.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
-Balanced+ v2.5 — Per-Symbol Profiles (JSON/CSV)
+strategy.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
+Balanced+ v2.5 — Per-Symbol Profiles (JSON/CSV) — Ready for Render
 
-المقصود بهذه النسخة:
-- لديك ملف للعملات (سِمبلز) وتريد إعدادات دقيقة لكل رمز، ليس فقط BTC.
-- يمكن تعريف إعدادات/حُرّاس لكل رمز (ATR_BAND / RVOL / MIN_QUOTE_VOL / EMA-distance / Funding / OI / ساعات BRK / حُرّاس سوق مبنية على عدة رموز مثل BTC, ETH, SOL, BNB...).
+الهدف:
+- نسخة استراتيجية متكاملة تُستورد مباشرة: from strategy import check_signal
+- دعم بروفايلات لكل رمز عبر ملف إعدادات خارجي (JSON/CSV) اختياري.
+- عدم الكتابة في /mnt/data. جميع الملفات المؤقتة/الحالة تُكتب افتراضيًا في /tmp/market-watchdog
+  (يمكن تغييره عبر APP_DATA_DIR)، والـ STATE_FILE عبر STRATEGY_STATE_FILE.
 
-## ملف الإعدادات
-- حدد مسار الملف عبر ENV: SYMBOLS_FILE (افتراضي: symbols_config.json ثم symbols.csv إن لم يوجد).
-- يدعم JSON أو CSV. أمثلة أسفل بالشرح.
-
-### JSON مثال (symbols_config.json)
-{
-  "BTCUSDT": {"class":"major", "atr_lo":0.0020, "atr_hi":0.0240, "rvol_min":1.00, "min_quote_vol":20000,
-              "ema50_req_R":0.25, "ema200_req_R":0.35, "vbr_min_dev_atr":0.6, "oi_window":10, "oi_down_thr":0.0,
-              "max_pos_funding":0.00025, "brk_hour_start":11, "brk_hour_end":23, "guard_refs":["BTCUSDT","ETHUSDT"]},
-  "SOLUSDT": {"class":"alt",   "atr_lo":0.0025, "atr_hi":0.0300, "rvol_min":1.05, "min_quote_vol":120000,
-              "ema50_req_R":0.30, "ema200_req_R":0.45, "vbr_min_dev_atr":0.7, "oi_window":14, "oi_down_thr":-0.03,
-              "max_pos_funding":0.00020, "brk_hour_start":11, "brk_hour_end":23, "guard_refs":["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT"]}
-}
-
-### CSV مثال (symbols.csv)
-symbol,class,atr_lo,atr_hi,rvol_min,min_quote_vol,ema50_req_R,ema200_req_R,vbr_min_dev_atr,oi_window,oi_down_thr,max_pos_funding,brk_hour_start,brk_hour_end,guard_refs
-BTCUSDT,major,0.0020,0.0240,1.00,20000,0.25,0.35,0.6,10,0.0,0.00025,11,23,"BTCUSDT;ETHUSDT"
-SOLUSDT,alt,0.0025,0.0300,1.05,120000,0.30,0.45,0.7,14,-0.03,0.00020,11,23,"BTCUSDT;ETHUSDT;BNBUSDT;SOLUSDT"
-
-## market_state في features (اختياري لكنه قوي للحُرّاس)
-مرِّر في ohlcv_htf=dict(..., features={
-    "market_state": {
-        "BTCUSDT":{"close":..,"ema200":..,"rsi_h1":..},
-        "ETHUSDT":{"close":..,"ema200":..,"rsi_h1":..},
-        "SOLUSDT":{"close":..,"ema200":..,"rsi_h1":..},
-        ...
-    },
-    "funding_rate": 0.00012,
-    "oi_hist": [...],
-})
-- إن لم تُوفّر market_state: سيستخدم المنطق القديم majors_state إن وجد، وإلا يتجاوز الحارس.
-
-Signature:
-    check_signal(symbol: str, ohlcv: List[[ts,o,h,l,c,v]], ohlcv_htf: Optional[dict|list]) -> Optional[dict]
+ENV (اختياري):
+  APP_DATA_DIR=/tmp/market-watchdog
+  STRATEGY_STATE_FILE=/tmp/market-watchdog/strategy_state.json
+  SYMBOLS_FILE=symbols_config.json  (أو symbols.csv)
+  RISK_MODE=conservative|balanced|aggressive
+  BRK_HOUR_START=11  BRK_HOUR_END=23
+  MAX_POS_FUNDING_MAJ=0.00025  MAX_POS_FUNDING_ALT=0.00025
 """
 
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import os, json, math, time, csv
 import pandas as pd
 import numpy as np
+
+# ========= مسارات قابلة للكتابة (متوافقة مع Render) =========
+APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ملف حالة الاستراتيجية (آخر إشارة) — افتراضي داخل APP_DATA_DIR
+STATE_FILE = os.getenv("STRATEGY_STATE_FILE", str(APP_DATA_DIR / "strategy_state.json"))
 
 # ========= أساسيات =========
 VOL_MA = 20
@@ -88,7 +70,6 @@ USE_FIB, SWING_LOOKBACK, FIB_TOL = True, 60, 0.004
 
 # حالة و Relax
 LOG_REJECTS = os.getenv("STRATEGY_LOG_REJECTS", "1").strip().lower() in ("1","true","yes","on")
-STATE_FILE = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
 AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
 AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
 
@@ -103,18 +84,25 @@ MOTIVATION = {
     "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎",
 }
 
+# تتبعات لمنع التكرار/الهولد أوت
+_LAST_ENTRY_BAR_TS: Dict[str, int] = {}
+_LAST_SIGNAL_BAR_IDX: Dict[str, int] = {}
+
 # ========== أدوات عامة ==========
 def _now() -> int: return int(time.time())
 
 def _load_state():
     try:
-        with open(STATE_FILE, "r") as f: return json.load(f)
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
     except Exception:
         return {"last_signal_ts": 0}
 
 def _save_state(s):
     try:
-        with open(STATE_FILE, "w") as f: json.dump(s, f)
+        Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(s, f)
     except Exception:
         pass
 
@@ -159,7 +147,15 @@ def _log_reject(symbol: str, msg: str):
         print(f"[strategy][reject] {symbol}: {msg}")
 
 # ========= تحميل إعدادات السِمبلز =========
-SYMBOLS_FILE_CANDIDATES = [os.getenv("SYMBOLS_FILE", "symbols_config.json"), "symbols.csv"]
+# ترتيب البحث: ENV -> cwd json/csv -> APP_DATA_DIR json/csv
+SYMBOLS_FILE_ENV = os.getenv("SYMBOLS_FILE", "symbols_config.json")
+SYMBOLS_FILE_CANDIDATES = [
+    SYMBOLS_FILE_ENV,
+    "symbols_config.json",
+    "symbols.csv",
+    str(APP_DATA_DIR / "symbols_config.json"),
+    str(APP_DATA_DIR / "symbols.csv"),
+]
 _SYMBOL_PROFILES: Dict[str, dict] = {}
 
 def _load_symbols_file():
@@ -601,7 +597,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
     # منع التكرار + Holdout
-    _LAST_ENTRY_BAR_TS.setdefault("##", 0)  # حيلة لإنشاء القاموس
+    _LAST_ENTRY_BAR_TS.setdefault("##", 0)  # bootstrap
     if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts:
         _log_reject(symbol, "duplicate_bar"); return None
     cur_idx = len(df) - 2
@@ -657,7 +653,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             except Exception:
                 pass
 
-    # Breadth adjust (احتفاظ بميزة اختيارية)
+    # Breadth adjust (اختياري)
     breadth_pct = None
     majors_state = feats.get("majors_state", [])
     try:
@@ -675,7 +671,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     except Exception:
         pass
 
-    # حارس سوق بالـ guard_refs (يدعم basket واسعة)
+    # حارس سوق بالـ guard_refs
     if not market_guard_ok(prof, feats):
         _log_reject(symbol, "market_guard_block"); return None
 
@@ -692,7 +688,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
                 avwap_ok = price >= avwap_val * (1 - 0.002)
 
     ema_align = ((float(closed["ema9"]) > float(closed["ema21"]) > float(closed["ema50"])) or (price > float(closed["ema50"])))
-    ema_align = ema_align and above_vwap and avwap_ok
+    ema_align = ema_align && above_vwap and avwap_ok if False else (ema_align and above_vwap and avwap_ok)  # guard for Py<3.11
 
     if not (price > float(closed["open"])):
         _log_reject(symbol, "close<=open"); return None
@@ -765,7 +761,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
                 setup = "PULL"; struct_ok = True; reasons += ["Pullback Reclaim"]
 
-    if (setup is None) and range_env and near_sup and (rev_hammer or candle_quality(closed, rvol)) and nr_recent:
+    if (setup is None) and range_env and near_sup and (rev_hammer أو candle_quality(closed, rvol)) and nr_recent:
         setup = "RANGE"; struct_ok = True; reasons += ["Range Rotation (NR)"]
 
     vbr_min_dev = float(prof["vbr_min_dev_atr"])
@@ -858,7 +854,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if is_inside_break(prev2, prev, closed): reasons_full.append("InsideBreak")
     if near_res: reasons_full.append("NearRes")
     if near_sup: reasons_full.append("NearSup")
-    if bool(df["nr7"].iloc[-2] or df["nr7"].iloc[-3] or df["nr4"].iloc[-2]): reasons_full.append("NR7/NR4")
     if USE_VWAP and above_vwap: reasons_full.append("VWAP OK")
     if USE_ANCHORED_VWAP and avwap_val is not None and avwap_ok: reasons_full.append("AVWAP OK")
     if setup == "VBR": reasons_full.append("VBR")
@@ -980,8 +975,3 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "stop_rule": stop_rule,
         "timestamp": datetime.utcnow().isoformat()
     }
-'''
-path = "/mnt/data/strategy_crypto_v2_5_symbols.py"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
-print(path)
