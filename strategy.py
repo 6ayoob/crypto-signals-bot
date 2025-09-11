@@ -1,5 +1,4 @@
-# Create the full strategy file with VBR integrated and make it downloadable
-code = r'''# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 """
 strategy.py — R-based Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
@@ -663,7 +662,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     # PULL: قرب EMA21 + شمعة إيجابية + فوق VWAP/AVWAP (أغلب الحالات)
     pull_cond = (
         (setup is None) and (regime in ("trend","mixed"))
-        and (rev_hammer or rev_engulf or rev_insideb)
+        and (rev_hammer او rev_engulf او rev_insideb)
         and (abs(price - float(closed["ema21"])) / max(price,1e-9) <= 0.005 or (USE_FIB and _fib_ok(price, df)))
         and above_vwap and avwap_ok
     )
@@ -890,8 +889,3 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "stop_rule": stop_rule,
         "timestamp": datetime.utcnow().isoformat()
     }
-'''
-path = "/mnt/data/strategy_v2_3_vbr.py"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
-path
