@@ -688,7 +688,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
                 avwap_ok = price >= avwap_val * (1 - 0.002)
 
     ema_align = ((float(closed["ema9"]) > float(closed["ema21"]) > float(closed["ema50"])) or (price > float(closed["ema50"])))
-    ema_align = ema_align && above_vwap and avwap_ok if False else (ema_align and above_vwap and avwap_ok)  # guard for Py<3.11
+    ema_align = ema_align and above_vwap and avwap_ok
 
     if not (price > float(closed["open"])):
         _log_reject(symbol, "close<=open"); return None
@@ -761,7 +761,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
                 setup = "PULL"; struct_ok = True; reasons += ["Pullback Reclaim"]
 
-    if (setup is None) and range_env and near_sup and (rev_hammer أو candle_quality(closed, rvol)) and nr_recent:
+    if (setup is None) and range_env and near_sup and (rev_hammer or candle_quality(closed, rvol)) and nr_recent:
         setup = "RANGE"; struct_ok = True; reasons += ["Range Rotation (NR)"]
 
     vbr_min_dev = float(prof["vbr_min_dev_atr"])
