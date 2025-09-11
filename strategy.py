@@ -1,30 +1,27 @@
-# -*- coding: utf-8 -*-
+# Write the full crypto-optimized strategy file and provide it for download
+code = r'''# -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-strategy.py — R-based Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
-Balanced+ v2.3 — Production-Ready (with VBR)
+strategy_crypto.py — R-based Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
+Balanced+ v2.4 (Crypto presets: Majors vs Alts)
 
-الجديد/المدمج:
-- VWAP + Anchored VWAP (من آخر سوينغ) كفلتر/توافق.
-- Funding-Rate Guard (تجنب الازدحام عند تمويل موجب مرتفع).
-- Open Interest Trend (رفض عند OI هابط إن توفر).
-- NR7/NR4 awareness + Parabolic/Gaps guard.
-- Breadth-based adjust (يخفض/يرفع SCORE_MIN حسب حالة السوق العامة).
-- Data QC (كشف شموع شاذة) + Regime shift hints.
-- Dynamic ATR% → مهلة TP1 وزيّادة أمان BRK (حد أقصى لبعد الاختراق).
-- إضافة VBR (VWAP Band Reversion) كلونغ في بيئات الهدوء/الرينج.
-- نفس المخرجات/المفاتيح المتوافقة مع مشروعك.
-
-Signature:
-    check_signal(symbol: str, ohlcv: List[[ts,o,h,l,c,v]], ohlcv_htf: Optional[dict|list]) -> Optional[dict]
+الجديد في نسخة الكريبتو (v2.4):
+- Presets تلقائية حسب الرمز (Majors: BTC/ETH) مقابل Alts (باقي الأزواج).
+- ATR_BAND/RVOL/MIN_QUOTE_VOL/EMA-distance تتكيّف حسب التصنيف (Majors/Alts).
+- BTC-Guard: يمنع لونغ على الألتز إذا BTC (H1 تقريبًا من features) تحت EMA200.
+- Funding guard لكل فئة (MAJ/ALT) بقيم قابلة للتعديل عبر ENV.
+- OI window=14 للألتز مع حد هبوط مسموح -3% كحد أقصى.
+- تفعيل جلسة BRK “أوروبا+أمريكا” 11:00–23:00 بتوقيت الرياض.
+- إصلاحات وتوافق كامل مع check_signal(..) السابقة.
 
 تمرير ميزات خارجية (اختياري) عبر ohlcv_htf=dict:
 {
   "H1": [...], "H4": [...], "D1": [...],
   "features": {
-      "funding_rate": 0.0001,        # 0.01% لكل 8 ساعات — ككسر عشري
-      "oi_hist": [.. أرقام ..],      # لائحة OI (أحدثها آخر عنصر)
-      "majors_state": [{"close":..,"ema200":..}, ...]  # لقياس Breadth
+      "funding_rate": 0.00012,                  # 0.012%/8h ككسر عشري
+      "oi_hist": [.. أرقام ..],                 # لائحة OI (أحدثها آخر عنصر)
+      "majors_state": [{"close":..,"ema200":..}, ...]  # قياس حالة BTC/ETH
+      # (اختياري) "rsi_h1_btc": 50.0
   }
 }
 """
@@ -35,8 +32,8 @@ import os, json, math, time
 import pandas as pd
 import numpy as np
 
-# ========= حساسية/سيولة/تذبذب =========
-MIN_QUOTE_VOL = 20_000          # تقدير سيولة: close*volume (لآخر شمعة مغلقة)
+# ========= حساسية/سيولة/تذبذب (قِيَم افتراضية عامة) =========
+MIN_QUOTE_VOL = 20_000          # تقدير سيولة: close*volume (آخر شمعة)
 VOL_MA = 20
 ATR_PERIOD = 14
 EMA_FAST, EMA_SLOW, EMA_TREND, EMA_LONG = 9, 21, 50, 200
@@ -50,20 +47,25 @@ RISK_PROFILES = {
 }
 _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 
-# ========= مفاتيح الميزات (تبديل سريع) =========
+# ========= مفاتيح ميّزات عامة =========
 USE_VWAP            = True
 USE_ANCHORED_VWAP   = True
-VWAP_TOL_BELOW      = 0.002       # يسمح بالشراء فوق/حول VWAP بهامش 0.2%
-VWAP_MAX_DIST_PCT   = 0.008       # إن كان السعر أعلى من VWAP بمقدار كبير جدًا → حذر
+VWAP_TOL_BELOW      = 0.002       # سماحية 0.2% تحت VWAP
+VWAP_MAX_DIST_PCT   = 0.008       # تحذير إن بَعُد عن VWAP أكثر من 0.8% (لمنطق داخلي)
 
 USE_FUNDING_GUARD   = True
-# ملاحظة: القيمة ككسر عشري. 0.0002 = 0.02%
-MAX_POS_FUNDING     = float(os.getenv("MAX_POS_FUNDING", "0.0002"))
+# حدود تمويل حسب الفئة (ENV قابلة للتعديل)
+MAX_POS_FUNDING_MAJ = float(os.getenv("MAX_POS_FUNDING_MAJ", "0.00025"))  # 0.025%/8h
+MAX_POS_FUNDING_ALT = float(os.getenv("MAX_POS_FUNDING_ALT", "0.00025"))  # 0.025%/8h
 
 USE_OI_TREND        = True
 USE_BREADTH_ADJUST  = True
 USE_PARABOLIC_GUARD = True
-MAX_SEQ_BULL        = 3           # أقصى شموع خضراء متتالية قبل دخول جديد (بحالة ATR% مرتفع)
+MAX_SEQ_BULL        = 3           # أقصى شموع خضراء متتالية قبل دخول جديد مع ATR% مرتفع
+
+# BRK جلسة أوربا/أمريكا بتوقيت الرياض (ENV: BRK_HOUR_START/END)
+BRK_HOUR_START = int(os.getenv("BRK_HOUR_START", "11"))
+BRK_HOUR_END   = int(os.getenv("BRK_HOUR_END",   "23"))
 
 # BRK أمان
 MAX_BRK_DIST_ATR    = 0.90        # لا نطارد اختراقًا بعيدًا عن القمة السابقة > 0.9×ATR
@@ -73,10 +75,9 @@ BREAKOUT_BUFFER     = 0.0015
 RSI_EXHAUSTION           = 78.0
 DIST_EMA50_EXHAUST_ATR   = 2.8
 
-# VBR (VWAP Band Reversion)
+# VBR (VWAP Band Reversion) — baseline، سنعدّل للألتز داخليًا
 VBR_ENABLE = True
-VBR_MIN_DEV_ATR = 0.6   # أقل انحراف عن VWAP بوحدات ATR
-VBR_ATR_MAX = 0.015     # لا نفعّل VBR إذا التذبذب عالي جدًا
+VBR_MIN_DEV_ATR_BASE = 0.6   # Majors baseline; للألتز نرفعه إلى 0.7
 
 # تريلينغ/خروج زمني
 TRAIL_AFTER_TP2 = True
@@ -93,9 +94,8 @@ ENTRY_MAX_R        = 0.60
 ENABLE_MULTI_TARGETS = True
 TARGETS_MODE_BY_SETUP = {"BRK": "r", "PULL": "r", "RANGE": "pct", "SWEEP": "pct", "VBR":"pct"}
 TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)              # للـ BRK/PULL
-# RANGE/SWEEP/VBR (مضاعفات ATR تُحوّل لنِسَب):
-ATR_MULT_RANGE = (1.5, 2.5, 3.5, 4.5, 6.0)
-ATR_MULT_VBR   = (0.0, 0.6, 1.2, 1.8, 2.4)
+ATR_MULT_RANGE = (1.5, 2.5, 3.5, 4.5, 6.0)            # RANGE/SWEEP
+ATR_MULT_VBR   = (0.0, 0.6, 1.2, 1.8, 2.4)            # VBR
 
 # S/R & Fib
 USE_SR = True
@@ -111,6 +111,10 @@ LOG_REJECTS = os.getenv("STRATEGY_LOG_REJECTS", "1").strip().lower() in ("1","tr
 STATE_FILE = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
 AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
 AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
+
+# Majors list (ENV قابلة للتعديل)
+MAJORS_DEFAULT = "BTCUSDT,BTCUSD,ETHUSDT,ETHUSD"
+MAJORS = set([s.strip().upper() for s in os.getenv("MAJORS", MAJORS_DEFAULT).split(",") if s.strip()])
 
 # رسائل
 MOTIVATION = {
@@ -177,6 +181,10 @@ def apply_relax(base_cfg: dict) -> dict:
 def _log_reject(symbol: str, msg: str):
     if LOG_REJECTS:
         print(f"[strategy][reject] {symbol}: {msg}")
+
+def is_major(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return s in MAJORS or s.replace("/", "") in MAJORS or s.replace("-", "") in MAJORS
 
 # منع تكرار داخلي
 _LAST_ENTRY_BAR_TS: dict[str, int] = {}
@@ -358,7 +366,6 @@ def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool]:
     return True, (ok_count >= 1)
 
 def extract_features(ohlcv_htf) -> Dict[str, object]:
-    """يسحب ميزات خارجية (اختيارية) من ohlcv_htf إذا كانت dict."""
     out: Dict[str, object] = {}
     if isinstance(ohlcv_htf, dict):
         feats = ohlcv_htf.get("features") or {}
@@ -503,28 +510,47 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     # QC قبل أي شيء
     atr = float(df["atr"].iloc[-2]); atr_pct = atr / max(price, 1e-9)
     if bar_is_outlier(closed, atr):
-        _log_reject(symbol, "bar_outlier")
-        return None
+        _log_reject(symbol, "bar_outlier"); return None
 
-    thr = apply_relax(_cfg)
+    # تصنيف الرمز
+    major = is_major(symbol)
+
+    # بناء قاعدة إعدادات حسب الفئة ثم تطبيق Auto-Relax عليها
+    base_cfg = dict(_cfg)
+    if major:
+        base_cfg["ATR_BAND"] = (0.0020, 0.0240)
+        base_cfg["RVOL_MIN"] = max(base_cfg.get("RVOL_MIN", 1.0), 1.00)
+        min_quote_vol_eff = max(MIN_QUOTE_VOL, 20_000)
+        ema50_req, ema200_req = 0.25, 0.35
+        vbr_min_dev = max(VBR_MIN_DEV_ATR_BASE, 0.6)
+        oi_window, oi_down_thr = 10, 0.0
+        max_pos_funding_eff = MAX_POS_FUNDING_MAJ
+    else:
+        base_cfg["ATR_BAND"] = (0.0025, 0.0300)
+        base_cfg["RVOL_MIN"] = max(base_cfg.get("RVOL_MIN", 1.0), 1.05)
+        min_quote_vol_eff = max(MIN_QUOTE_VOL, 100_000)
+        ema50_req, ema200_req = 0.30, 0.45
+        vbr_min_dev = max(VBR_MIN_DEV_ATR_BASE, 0.7)
+        oi_window, oi_down_thr = 14, -0.03
+        max_pos_funding_eff = MAX_POS_FUNDING_ALT
+
+    thr = apply_relax(base_cfg)
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
-    holdout_eff = thr.get("HOLDOUT_BARS_EFF", _cfg.get("HOLDOUT_BARS", 2))
+    holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
     # منع التكرار + Holdout
     if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts:
-        _log_reject(symbol, "duplicate_bar")
-        return None
+        _log_reject(symbol, "duplicate_bar"); return None
     cur_idx = len(df) - 2
     if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < holdout_eff:
-        _log_reject(symbol, f"holdout<{holdout_eff}")
-        return None
+        _log_reject(symbol, f"holdout<{holdout_eff}"); return None
 
     # سيولة
-    if price * float(closed["volume"]) < MIN_QUOTE_VOL:
-        _log_reject(symbol, "low_quote_vol")
+    if price * float(closed["volume"]) < min_quote_vol_eff:
+        _log_reject(symbol, f"low_quote_vol<{min_quote_vol_eff}")
         return None
 
-    # نطاق ATR ديناميكي
+    # نطاق ATR ديناميكي (حسب الفئة)
     base_lo, base_hi = thr["ATR_BAND"]
     lo_dyn, hi_dyn = adapt_atr_band((df["atr"] / df["close"]).dropna(), (base_lo, base_hi))
     if not (lo_dyn <= atr_pct <= hi_dyn):
@@ -539,7 +565,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f} and no spike")
         return None
 
-    # MTF + Features
+    # MTF + ميزات خارجية
     regime = detect_regime(df)
     mtf_has_frames, mtf_pass = pass_mtf_filter_any(ohlcv_htf)
     feats = extract_features(ohlcv_htf)
@@ -548,27 +574,27 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if USE_FUNDING_GUARD:
         fr = feats.get("funding_rate")
         try:
-            if fr is not None and float(fr) > MAX_POS_FUNDING:
-                _log_reject(symbol, f"funding_rate_high={float(fr):.5f}")
+            if fr is not None and float(fr) > max_pos_funding_eff:
+                _log_reject(symbol, f"funding_rate_high={float(fr):.5f}>{max_pos_funding_eff:.5f}")
                 return None
         except Exception:
             pass
 
-    # OI trend
+    # OI trend (window حسب الفئة)
     oi_sc = None
     if USE_OI_TREND:
         oi_hist = feats.get("oi_hist")
-        if isinstance(oi_hist, (list, tuple)) and len(oi_hist) >= 10:
+        if isinstance(oi_hist, (list, tuple)) and len(oi_hist) >= oi_window:
             try:
-                s = pd.Series(oi_hist[-10:], dtype="float64")
+                s = pd.Series(oi_hist[-oi_window:], dtype="float64")
                 oi_sc = float((s.iloc[-1] - s.iloc[0]) / max(s.iloc[0], 1e-9))
-                if oi_sc < 0:
-                    _log_reject(symbol, f"oi_downtrend={oi_sc:.2%}")
+                if oi_sc < oi_down_thr:
+                    _log_reject(symbol, f"oi_downtrend={oi_sc:.2%} < {oi_down_thr:.2%}")
                     return None
             except Exception:
                 pass
 
-    # Breadth adjust
+    # Breadth adjust (اختياري — يحتفظ بنفس المنطق)
     breadth_pct = None
     if USE_BREADTH_ADJUST:
         majors_state = feats.get("majors_state", [])
@@ -587,6 +613,23 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         except Exception:
             pass
 
+    # BTC-guard للألتز: لا لونغ إذا BTC تحت EMA200 (من majors_state إن وُجد)
+    if not major:
+        try:
+            majors_state = feats.get("majors_state", [])
+            if majors_state:
+                btc = majors_state[0]  # نتوقع أول عنصر BTC
+                btc_close = float(btc.get("close", 0))
+                btc_ema200 = float(btc.get("ema200", 0))
+                if btc_close > 0 and btc_ema200 > 0 and (btc_close <= btc_ema200):
+                    _log_reject(symbol, "btc_guard_block (BTC<=EMA200)"); return None
+                # (اختياري) RSI guard إن وُفّر
+                rsi_btc = float(feats.get("rsi_h1_btc", 50.0))
+                if rsi_btc < 48.0:
+                    _log_reject(symbol, "btc_guard_block (RSI_H1_BTC<48)"); return None
+        except Exception:
+            pass
+
     # اتجاه/جودة + VWAP/AVWAP
     vwap_now = float(df["vwap"].iloc[-2]) if USE_VWAP else price
     above_vwap = (not USE_VWAP) or (price >= vwap_now * (1 - VWAP_TOL_BELOW))
@@ -599,7 +642,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             avwap_val = avwap_from_index(df, lo_idx)
             if avwap_val is not None:
                 avwap_ok = price >= avwap_val * (1 - 0.002)  # سماحية 0.2%
-        # إن لم نتمكن من حسابه لا نرفض
 
     ema_align = ((float(closed["ema9"]) > float(closed["ema21"]) > float(closed["ema50"])) or (price > float(closed["ema50"])))
     ema_align = ema_align and above_vwap and avwap_ok
@@ -649,24 +691,40 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             _log_reject(symbol, "parabolic_runup")
             return None
 
+    # EMA distance guards (حسب الفئة) — مفعّل لصفقات الاتجاه فقط
+    ema50 = float(closed["ema50"]); ema200 = float(closed["ema200"])
+    dist50_atr = (price - ema50) / max(atr, 1e-9)
+    dist200_atr = (price - ema200) / max(atr, 1e-9)
+    trend_guard = (dist50_atr >= ema50_req) and (dist200_atr >= ema200_req)
+    mixed_guard = (dist50_atr >= (0.15 if major else 0.20))
+
     # اختيار الست-أب
     setup = None
     struct_ok = False
     reasons: List[str] = []
 
-    # BRK: اختراق + إعادة اختبار + ليس بعيدًا جدًا بالـ ATR + RVOL/Spike
+    # BRK: اختراق + إعادة اختبار + ليس بعيدًا جدًا بالـ ATR + RVOL/Spike + داخل ساعات الجلسة
     brk_far = (price - hhv_prev) / max(atr, 1e-9) > MAX_BRK_DIST_ATR
-    if (regime in ("trend","mixed")) and breakout_ok and retest_ok and (rev_insideb or rev_engulf or candle_quality(closed, rvol)) and not brk_far and (rvol >= thr["RVOL_MIN"] or vol_spike):
-        setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest"]
+    # وقت الرياض من timestamp
+    try:
+        ts_sec = cur_ts/1000.0 if cur_ts > 1e12 else cur_ts
+        hr_riyadh = (datetime.utcfromtimestamp(ts_sec).hour + 3) % 24
+    except Exception:
+        hr_riyadh = 12  # افتراضي آمن
+    brk_in_session = (BRK_HOUR_START <= hr_riyadh <= BRK_HOUR_END)
 
-    # PULL: قرب EMA21 + شمعة إيجابية + فوق VWAP/AVWAP (أغلب الحالات)
+    if (regime in ("trend","mixed")) and breakout_ok and retest_ok and (rev_insideb or rev_engulf or candle_quality(closed, rvol)) and not brk_far and (rvol >= thr["RVOL_MIN"] or vol_spike) and brk_in_session:
+        if (regime == "trend" and trend_guard) or (regime == "mixed" and mixed_guard):
+            setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest", "SessionOK"]
+
+    # PULL: قرب EMA21 + شمعة إيجابية + فوق VWAP/AVWAP + حراسة EMA-distance
     pull_cond = (
         (setup is None) and (regime in ("trend","mixed"))
-        and (rev_hammer او rev_engulf او rev_insideb)
+        and (rev_hammer or rev_engulf or rev_insideb)
         and (abs(price - float(closed["ema21"])) / max(price,1e-9) <= 0.005 or (USE_FIB and _fib_ok(price, df)))
         and above_vwap and avwap_ok
     )
-    if pull_cond:
+    if pull_cond and ((regime == "trend" and trend_guard) or (regime == "mixed" and mixed_guard)):
         setup = "PULL"; struct_ok = True; reasons += ["Pullback Reclaim"]
 
     # RANGE: قرب دعم + NR + شمعة انعكاسية
@@ -674,9 +732,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         setup = "RANGE"; struct_ok = True; reasons += ["Range Rotation (NR)"]
 
     # --- VBR: VWAP Band Reversion (long-only) ---
-    if (setup is None and VBR_ENABLE and range_env and atr_pct <= VBR_ATR_MAX and nr_recent):
+    if (setup is None and VBR_ENABLE and range_env and atr_pct <= 0.015 and nr_recent):
         dev_atr = (vwap_now - price) / max(atr, 1e-9)  # موجب إذا تحت VWAP
-        if dev_atr >= VBR_MIN_DEV_ATR and (rev_hammer or rev_engulf or candle_quality(closed, rvol)):
+        if dev_atr >= vbr_min_dev and (rev_hammer or rev_engulf or candle_quality(closed, rvol)):
             setup = "VBR"; struct_ok = True; reasons += ["VWAP Band Reversion"]
 
     # SWEEP: كسر قاع سابق مع استرجاع + أي شمعة جودة أو أعلى EMA21
@@ -705,9 +763,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         if disp_mode == "pct":
             if setup == "VBR":
                 t_list, pct_vals = _build_targets_pct_from_atr(price, atr, ATR_MULT_VBR)
-                # اجعل T1 ≈ VWAP (لو كانت أقل):
                 if t_list and USE_VWAP:
-                    t_list[0] = max(t_list[0], vwap_now)
+                    t_list[0] = max(t_list[0], vwap_now)  # T1≈VWAP
                 targets_display_vals = pct_vals
             else:
                 t_list, pct_vals = _build_targets_pct_from_atr(price, atr, ATR_MULT_RANGE)
@@ -775,6 +832,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if USE_VWAP and above_vwap: reasons_full.append("VWAP OK")
     if USE_ANCHORED_VWAP and avwap_val is not None and avwap_ok: reasons_full.append("AVWAP OK")
     if setup == "VBR": reasons_full.append("VBR")
+    if not major: reasons_full.append("ALT Preset")
+    else: reasons_full.append("MAJ Preset")
     reasons_full.append(f"RVOL≥{round(thr['RVOL_MIN'],2)}")
     confluence = (reasons + reasons_full)[:6]
 
@@ -807,7 +866,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         return base[:n]
     partials = _partials_for(score, len(t_list))
 
-    # قاعدة وقف متوافقة مع منظومتك (breakeven بعد T1)
+    # قاعدة وقف متوافقة مع المنظومة (breakeven بعد T1)
     stop_rule = {
         "type": "breakeven_after",
         "at_idx": 0,
@@ -854,6 +913,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             "ema9": float(closed["ema9"]),
             "ema21": float(closed["ema21"]),
             "ema50": float(closed["ema50"]),
+            "ema200": float(closed["ema200"]),
             "vwap": float(vwap_now) if USE_VWAP else None,
             "avwap": float(avwap_val) if (USE_ANCHORED_VWAP and avwap_val is not None) else None,
             "sup": float(sup) if sup is not None else None,
@@ -864,13 +924,20 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},
             "relax_level": thr["RELAX_LEVEL"],
             "breadth_pct": breadth_pct,
-            "oi_trend_10": oi_sc,
+            "oi_trend_window": oi_window if USE_OI_TREND else None,
+            "oi_trend_lookback_return": oi_sc,
             "thresholds": {
                 "SCORE_MIN": thr["SCORE_MIN"],
                 "RVOL_MIN": thr["RVOL_MIN"],
                 "ATR_BAND": thr["ATR_BAND"],
                 "MIN_T1_ABOVE_ENTRY": MIN_T1_ABOVE_ENTRY,
                 "HOLDOUT_BARS_EFF": holdout_eff,
+                "EMA50_req_R": ema50_req,
+                "EMA200_req_R": ema200_req,
+                "VBR_MIN_DEV_ATR": vbr_min_dev,
+                "BRK_HOURS_RIYADH": (BRK_HOUR_START, BRK_HOUR_END),
+                "MIN_QUOTE_VOL_EFF": min_quote_vol_eff,
+                "MAX_POS_FUNDING_EFF": max_pos_funding_eff,
             },
         },
 
@@ -889,3 +956,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "stop_rule": stop_rule,
         "timestamp": datetime.utcnow().isoformat()
     }
+'''
+path = "/mnt/data/strategy_crypto_v2_4.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
+path
