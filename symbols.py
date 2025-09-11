@@ -4,26 +4,30 @@ symbols.py — توسيع ذكي لقائمة الأزواج من OKX (SPOT / SW
 - يعرّف: SYMBOLS (قائمة)، SYMBOLS_META (قاموس معلومات إضافية)
 - يدعم: كاش JSON، فلاتر (مين/إكسترا/إستبعاد)، و CLI للطباعة/التصدير.
 
+مهم (توافق خلفي):
+- list_symbols(inst, target, min_usd_vol) الآن تُرجع **قائمة** فقط افتراضيًا.
+- إن أردت الميتا أيضًا، استعمل: list_symbols(..., return_meta=True) → (list, meta)
+
 ENV (اختياري):
   APP_DATA_DIR=/tmp/market-watchdog
-  INST_TYPE=SPOT|SWAP_USDT|BOTH       (افتراضي SPOT)
+  INST_TYPE=SPOT|SWAP_USDT|BOTH
   TARGET_SYMBOLS_COUNT=100
-  MIN_24H_USD_VOL=0                   (فلتر سيولة تقديرية)
-  AUTO_EXPAND_SYMBOLS=1               (إن 0: يعتمد فقط على INCLUDE_SYMBOLS)
-  USE_SYMBOLS_CACHE=1                 (تفعيل الكاش)
+  MIN_24H_USD_VOL=0
+  AUTO_EXPAND_SYMBOLS=1
+  USE_SYMBOLS_CACHE=1
   DEBUG_SYMBOLS=0
   OKX_BASE=https://www.okx.com
   OKX_TIMEOUT_SEC=12
   SYMBOLS_CACHE_PATH=<path/to/json>   (افتراضي داخل APP_DATA_DIR)
-  INCLUDE_SYMBOLS=BTC/USDT,ETH/USDT   (قائمة مفصولة بفواصل)
-  EXCLUDE_SYMBOLS=XYZ/USDT            (قائمة مفصولة بفواصل)
+  INCLUDE_SYMBOLS=BTC/USDT,ETH/USDT
+  EXCLUDE_SYMBOLS=XYZ/USDT
   EXCLUDE_STABLES=1
   EXCLUDE_MEME=0
 """
 
 from __future__ import annotations
 import os, time, random, json, argparse
-from typing import Iterable, List, Tuple, Dict, Optional
+from typing import Iterable, List, Tuple, Dict, Optional, Union
 from pathlib import Path
 
 # ===== إعداد المسارات القابلة للكتابة =====
@@ -89,7 +93,7 @@ def _is_leveraged(sym: str) -> bool:
 def _okx_get_json(url: str, attempts: int = 3) -> Optional[Dict]:
     if requests is None:
         return None
-    headers = {"User-Agent": "symbols/1.1 (+okx)", "Accept": "application/json"}
+    headers = {"User-Agent": "symbols/1.2 (+okx)", "Accept": "application/json"}
     for a in range(attempts):
         try:
             r = requests.get(url, timeout=TIMEOUT_SEC, headers=headers)
@@ -97,7 +101,6 @@ def _okx_get_json(url: str, attempts: int = 3) -> Optional[Dict]:
                 time.sleep((2 ** a) + random.random()); continue
             r.raise_for_status()
             j = r.json()
-            # OKX عادةً تُعيد code=0 عند النجاح
             if str(j.get("code","0")) not in ("0","200"):
                 time.sleep((2 ** a) + random.random()); continue
             return j
@@ -111,7 +114,6 @@ def _usd_liquidity_approx(it: Dict) -> float:
       - إذا تواجد volUsd: يُستخدم مباشرة
       - وإلّا: volCcy24h أو vol24h × last
     """
-    last = 0.0
     try:
         last = float(it.get("last", 0.0) or 0.0)
     except Exception:
@@ -202,11 +204,11 @@ def _write_cache(key: str, symbols_meta: Dict[str, Dict]) -> None:
         pass
 
 # ===== المنتج النهائي =====
-def list_symbols(inst: str, target: int, min_usd_vol: float) -> Tuple[List[str], Dict[str, Dict]]:
+def list_symbols(inst: str, target: int, min_usd_vol: float, *, return_meta: bool = False
+                 ) -> Union[List[str], Tuple[List[str], Dict[str, Dict]]]:
     """
-    يعيد (symbols, meta) حيث:
-      symbols: قائمة رموز مثل ["BTC/USDT", ...]
-      meta: {symbol: {"volUsd": float|None, "source": "SPOT|SWAP|FORCED|STATIC"}}
+    افتراضيًا تُرجِع قائمة فقط (توافقًا مع الإصدارات القديمة).
+    عيّن return_meta=True لتحصل على (list, meta).
     """
     inst = inst.upper().strip()
     ranked = get_ranked(inst)
@@ -217,8 +219,9 @@ def list_symbols(inst: str, target: int, min_usd_vol: float) -> Tuple[List[str],
         if cached:
             syms = [(k, cached[k].get("volUsd", 0.0)) for k in cached.keys()]
             syms.sort(key=lambda x: x[1], reverse=True)
-            symbols = [s for s, _ in syms]
-            return symbols[:target], cached
+            symbols = [s for s, _ in syms][:target]
+            if return_meta: return symbols, cached
+            return symbols
 
     out_syms: List[str] = []
     meta: Dict[str, Dict] = {}
@@ -248,7 +251,9 @@ def list_symbols(inst: str, target: int, min_usd_vol: float) -> Tuple[List[str],
     # كاش ميتا
     _write_cache(f"meta_{inst}", meta)
 
-    return out_syms[:target], meta
+    out_syms = out_syms[:target]
+    if return_meta: return out_syms, meta
+    return out_syms
 
 def _prepare_symbols() -> Tuple[List[str], Dict[str, Dict]]:
     """
@@ -258,7 +263,8 @@ def _prepare_symbols() -> Tuple[List[str], Dict[str, Dict]]:
         base = _dedupe_keep_order([_alias_symbol(_normalize_symbol(s)) for s in INCLUDE_SYMBOLS])
         return base[:TARGET_SYMBOLS_COUNT], {s: {"volUsd": None, "source": "STATIC"} for s in base}
     try:
-        return list_symbols(INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL)
+        # نطلب الميتا صراحة هنا
+        return list_symbols(INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL, return_meta=True)  # (list, meta)
     except Exception:
         # fallback: include فقط
         base = _dedupe_keep_order([_alias_symbol(_normalize_symbol(s)) for s in INCLUDE_SYMBOLS])
@@ -281,9 +287,14 @@ def main():
     ap.add_argument("--target", type=int, default=TARGET_SYMBOLS_COUNT)
     ap.add_argument("--minvol", type=float, default=MIN_24H_USD_VOL)
     ap.add_argument("--export", default="", help="اكتب meta إلى ملف JSON")
+    ap.add_argument("--with-meta", action="store_true", help="أعد الميتا مع القوائم في CLI")
     args = ap.parse_args()
 
-    syms, meta = list_symbols(args.inst, args.target, args.minvol)
+    if args.with_meta:
+        syms, meta = list_symbols(args.inst, args.target, args.minvol, return_meta=True)
+    else:
+        syms = list_symbols(args.inst, args.target, args.minvol)
+        meta = {}
 
     if args.to_print:
         print(f"[list] {args.inst} total={len(syms)} (minvol={args.minvol})")
@@ -296,7 +307,7 @@ def main():
     if args.export:
         try:
             with open(args.export, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
+                json.dump(meta or {}, f, ensure_ascii=False, indent=2)
             print(f"[export] wrote meta → {args.export}")
         except Exception as e:
             print(f"[export][err] {e}")
