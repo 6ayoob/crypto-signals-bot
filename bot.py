@@ -107,7 +107,7 @@ if ENABLE_DB_LOCK:
             ENABLE_DB_LOCK = False
 
 # Strategy & Symbols
-from strategy import check_signal  # NOTE: strategy applies Auto‑Relax + scoring
+from strategy import check_signal  # NOTE: strategy applies Auto-Relax + scoring
 from symbols import SYMBOLS
 import symbols as symbols_mod  # لإعادة توليد القائمة دوريًا
 
@@ -228,6 +228,20 @@ def _fmt_price(x: Any) -> str:
         return f"{v:.6f}"
     except Exception:
         return str(x)
+
+# --- tuple/list safety helpers for symbols.py interop ---
+def _ensure_symbols_list(obj) -> List[str]:
+    """
+    يقبل list أو (list, meta) ويرجّع List[str] مسطّحة.
+    """
+    if isinstance(obj, tuple):
+        obj = obj[0]
+    if not isinstance(obj, (list, tuple)):
+        try:
+            obj = list(obj)
+        except Exception:
+            return []
+    return [s for s in obj if isinstance(s, str)]
 
 async def _get_bot_username() -> str:
     global _BOT_USERNAME
@@ -562,12 +576,12 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
 
     cooldown_reason = None
     if float(state["r_today"]) <= -MAX_DAILY_LOSS_R:
-        cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
+        cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOس_R}R"  # NOTE: typo fix: but keeping as is to not break
     if int(state["loss_streak"]) >= MAX_LOSSES_STREAK:
         if cooldown_reason:
             cooldown_reason += f" + {MAX_LOSSES_STREAK} خسائر متتالية"
         else:
-            cooldown_reason = f"{MAX_LOSSES_STREAK} خسائر متتالية"
+            cooldown_reason = f"{MAX_LOسSES_STREAK} خسائر متتالية"
 
     if cooldown_reason:
         until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
@@ -615,6 +629,8 @@ async def rebuild_available_symbols(new_symbols: List[str]):
     """
     global AVAILABLE_SYMBOLS
     try:
+        # ⬅️ سطّح المدخل (list أو (list, meta))
+        new_symbols = _ensure_symbols_list(new_symbols)
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, exchange.load_markets)
         all_markets = set(exchange.markets.keys())
@@ -632,7 +648,8 @@ async def refresh_symbols_periodically():
     """
     while True:
         try:
-            fresh = symbols_mod._prepare_symbols()  # نفس منطق symbols.py
+            fresh_raw = symbols_mod._prepare_symbols()   # قد تكون (list, meta)
+            fresh = _ensure_symbols_list(fresh_raw)      # ⬅️ نستخلص List[str]
             await rebuild_available_symbols(fresh)
             sample = ", ".join(fresh[:10])
             logger.info(f"[symbols] refreshed → {len(fresh)} | first 10: {sample}")
@@ -789,7 +806,7 @@ async def scan_and_dispatch():
 
                 # 2) Spread sanity
                 try:
-                    sp = await fetch_spread_pct(sig["symbol"])  # None = can\'t measure → allow
+                    sp = await fetch_spread_pct(sig["symbol"])  # None = can't measure → allow
                     if sp is not None and sp > SPREAD_MAX_PCT:
                         logger.info(f"⛔ Spread>{SPREAD_MAX_PCT:.4f} skip {sig['symbol']} (spread={sp:.4f})")
                         continue
@@ -1129,12 +1146,12 @@ def render_daily_report(stats: dict) -> str:
     )
     return msg
 
-def _report_card(stats_24: dict, stats_7d: dict) -> str:
+def _report_card(stats_24: dict, stats_7: dict) -> str:
     part1 = render_daily_report(stats_24)
     try:
-        wr7 = float(stats_7d.get("win_rate", 0.0))
-        n7 = int(stats_7d.get("signals", 0))
-        r7 = float(stats_7d.get("r_sum", 0.0))
+        wr7 = float(stats_7.get("win_rate", 0.0))
+        n7 = int(stats_7.get("signals", 0))
+        r7 = float(stats_7.get("r_sum", 0.0))
         part2 = f"\n📅 آخر 7 أيام — إشارات: <b>{n7}</b> | نسبة الربح: <b>{wr7:.1f}%</b> | صافي R: <b>{r7:+.2f}R</b>"
     except Exception:
         part2 = ""
@@ -1532,7 +1549,7 @@ async def cmd_admin_help(m: Message):
         "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
         "• <code>/refstats &lt;user_id&gt;</code> – إحصاءات الإحالة للمستخدم\n"
         "• <code>/debug_sig SYMBOL</code> – فحص فوري لرمز وإظهار سبب عدم الإشارة\n"
-        "• <code>/relax_status</code> – حالة Auto‑Relax ومنذ آخر إشارة\n"
+        "• <code>/relax_status</code> – حالة Auto-Relax ومنذ آخر إشارة\n"
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1949,7 +1966,7 @@ async def main():
 
     # بناء أولي بالقائمة الحالية من symbols.py (مرة واحدة عند الإقلاع)
     try:
-        await rebuild_available_symbols(SYMBOLS)
+        await rebuild_available_symbols(SYMBOLS)  # SYMBOLS بالفعل قائمة
     except Exception:
         pass
 
