@@ -4,11 +4,11 @@ from __future__ import annotations
 strategy.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
 Balanced+ v3.0 — إشارات أدق + ATR متكيّف بالـ quantiles + حارس سوق ذكي
 
-الهدف:
-- نسخة استراتيجية متكاملة تُستورد مباشرة: from strategy import check_signal
-- دعم بروفايلات لكل رمز عبر ملف إعدادات خارجي (JSON/CSV) اختياري.
-- عدم الكتابة في /mnt/data. جميع الملفات المؤقتة/الحالة تُكتب افتراضيًا في /tmp/market-watchdog
-  (يمكن تغييره عبر APP_DATA_DIR)، والـ STATE_FILE عبر STRATEGY_STATE_FILE.
+التحديثات المطلوبة:
+- رفع BREADTH_MIN_RATIO إلى 0.60
+- خفض RSI_EXHAUSTION إلى 76.0
+- تقليص Auto-Relax إلى مرحلتين (6 و 12 ساعة)
+- إعادة نظام التخفيف للوضع الطبيعي بعد صفقتين ناجحتين (عبر عدّاد داخلي في STATE_FILE)
 
 ENV (اختياري):
   APP_DATA_DIR=/tmp/market-watchdog
@@ -17,6 +17,7 @@ ENV (اختياري):
   RISK_MODE=conservative|balanced|aggressive
   BRK_HOUR_START=11  BRK_HOUR_END=23
   MAX_POS_FUNDING_MAJ=0.00025  MAX_POS_FUNDING_ALT=0.00025
+  BREADTH_MIN_RATIO=0.60
 """
 
 from datetime import datetime
@@ -30,7 +31,7 @@ import numpy as np
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ملف حالة الاستراتيجية (آخر إشارة) — افتراضي داخل APP_DATA_DIR
+# ملف حالة الاستراتيجية (آخر إشارة + عداد انتصارات التخفيف)
 STATE_FILE = os.getenv("STRATEGY_STATE_FILE", str(APP_DATA_DIR / "strategy_state.json"))
 
 # ========= أساسيات =========
@@ -51,12 +52,13 @@ VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.002, 0.008
 USE_FUNDING_GUARD, USE_OI_TREND, USE_BREADTH_ADJUST = True, True, True
 USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 3
 MAX_BRK_DIST_ATR, BREAKOUT_BUFFER = 0.90, 0.0015
-RSI_EXHAUSTION, DIST_EMA50_EXHAUST_ATR = 78.0, 2.8
+# ▼ خفّضنا عتبة الإنهاك (RSI) حسب طلبك
+RSI_EXHAUSTION, DIST_EMA50_EXHAUST_ATR = 76.0, 2.8
 
 # أهداف / دخول
 TRAIL_AFTER_TP2, TRAIL_AFTER_TP2_ATR = True, 1.0
 USE_MAX_BARS_TO_TP1, MAX_BARS_TO_TP1_BASE = True, 8
-ENTRY_ZONE_WIDTH_R, ENTRY_MIN_PCT, ENTRY_MAX_R = 0.25, 0.005, 0.60  # (يُخفَّف لاحقًا ديناميكيًا)
+ENTRY_ZONE_WIDTH_R, ENTRY_MIN_PCT, ENTRY_MAX_R = 0.25, 0.005, 0.60
 ENABLE_MULTI_TARGETS = True
 TARGETS_MODE_BY_SETUP = {"BRK": "r", "PULL": "r", "RANGE": "pct", "SWEEP": "pct", "VBR":"pct"}
 TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)
@@ -70,8 +72,11 @@ USE_FIB, SWING_LOOKBACK, FIB_TOL = True, 60, 0.004
 
 # حالة و Relax
 LOG_REJECTS = os.getenv("STRATEGY_LOG_REJECTS", "1").strip().lower() in ("1","true","yes","on")
-AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
-AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
+# ▼ قلّصنا المستويات إلى 6 و 12 ساعة
+AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "6"))
+AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "12"))
+# ▼ حد Breadth الأدنى (قابل للتهيئة عبر ENV)
+BREADTH_MIN_RATIO = float(os.getenv("BREADTH_MIN_RATIO", "0.60"))
 
 # رسائل
 MOTIVATION = {
@@ -94,9 +99,14 @@ def _now() -> int: return int(time.time())
 def _load_state():
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            s = json.load(f)
+            if "relax_wins" not in s:
+                s["relax_wins"] = 0
+            if "last_signal_ts" not in s:
+                s["last_signal_ts"] = 0
+            return s
     except Exception:
-        return {"last_signal_ts": 0}
+        return {"last_signal_ts": 0, "relax_wins": 0}
 
 def _save_state(s):
     try:
@@ -121,7 +131,9 @@ def relax_level() -> int:
     return 0
 
 def apply_relax(base_cfg: dict) -> dict:
-    """إرخاء تدريجي عند الجفاف: Score/RVOL/ATR band + MIN_T1."""
+    """إرخاء تدريجي عند الجفاف: Score/RVOL/ATR band + MIN_T1.
+    العودة للوضع الطبيعي تتم تلقائيًا عندما يتم تسجيل صفقتين ناجحتين عبر register_trade_result.
+    """
     lvl = relax_level()
     out = dict(base_cfg)
     # Score
@@ -130,7 +142,7 @@ def apply_relax(base_cfg: dict) -> dict:
     # RVOL
     if lvl >= 1: out["RVOL_MIN"] = max(0.90, out["RVOL_MIN"] - 0.05)
     if lvl >= 2: out["RVOL_MIN"] = max(0.85, out["RVOL_MIN"] - 0.05)
-    # ATR band widen (يُعدل لاحقًا بعد التكيّف)
+    # ATR band widen
     lo, hi = out["ATR_BAND"]
     if lvl >= 1: lo, hi = lo * 0.9, hi * 1.1
     if lvl >= 2: lo, hi = lo * 0.85, hi * 1.15
@@ -142,9 +154,23 @@ def apply_relax(base_cfg: dict) -> dict:
     out["RELAX_LEVEL"] = lvl
     return out
 
-def _log_reject(symbol: str, msg: str):
-    if LOG_REJECTS:
-        print(f"[strategy][reject] {symbol}: {msg}")
+# ========== واجهة لإعادة ضبط التخفيف بعد صفقتين ناجحتين ==========
+# استدعِ هذه الدالة من نظام التنفيذ بعد إغلاق كل صفقة مع تمرير PnL الصافي
+# إذا وصل عداد الانتصارات إلى 2، نعيد last_signal_ts إلى الآن ونصفر العداد ⇒ إلغاء التخفيف فورًا
+
+def register_trade_result(pnl_net: float):
+    try:
+        s = _load_state()
+        wins = int(s.get("relax_wins", 0))
+        if float(pnl_net) > 0:
+            wins += 1
+        s["relax_wins"] = wins
+        if wins >= 2:
+            s["relax_wins"] = 0
+            s["last_signal_ts"] = _now()
+        _save_state(s)
+    except Exception:
+        pass
 
 # ========= تحميل إعدادات السِمبلز =========
 # ترتيب البحث: ENV -> cwd json/csv -> APP_DATA_DIR json/csv
@@ -531,7 +557,8 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
                     if c_ > e_: above += 1
                 except Exception:
                     pass
-            breadth_ok = (above / max(1, len(maj))) >= 0.55
+            # ▼ رفعنا العتبة إلى 0.60
+            breadth_ok = (above / max(1, len(maj))) >= BREADTH_MIN_RATIO
 
     # 2) Funding
     try:
@@ -1053,3 +1080,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "stop_rule": stop_rule,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+# ========= لوج رفضات =========
+def _log_reject(symbol: str, msg: str):
+    if LOG_REJECTS:
+        print(f"[strategy][reject] {symbol}: {msg}")
