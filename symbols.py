@@ -58,7 +58,8 @@ EXCLUDE_MEME    = bool(int(os.getenv("EXCLUDE_MEME", "0")))
 # جديد: إتاحة تخصيص الرافعة عبر ENV
 _DEF_LEV = {"3L","3S","5L","5S","UP","DOWN"}
 try:
-    _ENV_LEV = {x.strip().upper() for x in (os.getenv("EXCLUDE_LEVERAGED_SUFFIXES", ",".join(sorted(_DEF_LEV))).split(",") if x.strip()}
+    env_raw = os.getenv("EXCLUDE_LEVERAGED_SUFFIXES", ",".join(sorted(_DEF_LEV)))
+    _ENV_LEV = {x.strip().upper() for x in env_raw.split(",") if x.strip()}
     LEVERAGED_SUFFIXES = _ENV_LEV or _DEF_LEV
 except Exception:
     LEVERAGED_SUFFIXES = _DEF_LEV
