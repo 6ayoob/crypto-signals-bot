@@ -108,7 +108,8 @@ if ENABLE_DB_LOCK:
 
 # Strategy & Symbols
 from strategy import check_signal  # NOTE: strategy applies Auto-Relax + scoring
-from symbols import SYMBOLS
+from symbols import list_symbols, INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL
+SYMBOLS = list_symbols(INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL)
 import symbols as symbols_mod  # لإعادة توليد القائمة دوريًا
 
 # ---------------------------
