@@ -114,7 +114,7 @@ SPREAD_MAX_PCT  = float(os.getenv("SPREAD_MAX_PCT", "0.0025"))  # أقصى سب�
 TIME_EXIT_ENABLED = os.getenv("TIME_EXIT_ENABLED", "1") == "1"
 TIME_EXIT_DEFAULT_BARS = int(os.getenv("TIME_EXIT_DEFAULT_BARS", "8"))
 TIME_EXIT_GRACE_SEC = int(os.getenv("TIME_EXIT_GRACE_SEC", "45"))
-HTF_FETCH_PARALLEL = os.getenv("HTF_FETCH_PARALLEL", "0") == "1"  # لتخفيف ضغط الاتصالات
+HTF_FETCH_PARALLEL = os.getenv("HTF_FETCH_PARALLEL", "0") == "1"  # لتقليل ضغط الاتصالات
 
 # OKX
 exchange = ccxt.okx({"enableRateLimit": True})
@@ -630,12 +630,16 @@ async def rebuild_available_symbols(new_symbols: List[str] | Tuple[List[str], Di
     """
     global AVAILABLE_SYMBOLS
     try:
-        # افصل القائمة والميتا إن وصل tuple
         meta: Dict[str, dict] = {}
         if isinstance(new_symbols, tuple):
             raw_list, meta = new_symbols
         else:
             raw_list = _ensure_symbols_list(new_symbols)
+
+        # حماية: لو القائمة الواردة فارغة — لا نلمس الحالية
+        if not raw_list:
+            logger.warning("rebuild_available_symbols: incoming list is EMPTY — skipped (keeping previous).")
+            return
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, exchange.load_markets)
@@ -658,6 +662,11 @@ async def rebuild_available_symbols(new_symbols: List[str] | Tuple[List[str], Di
             a = adapt(s)
             (filtered if a else skipped).append(a or s)
 
+        # حماية: لو الناتج الفِلْتَري فارغ — لا نلمس الحالية
+        if not filtered:
+            logger.warning("rebuild_available_symbols: FILTERED result is EMPTY — skipped (keeping previous).")
+            return
+
         async with AVAILABLE_SYMBOLS_LOCK:
             AVAILABLE_SYMBOLS = filtered
         logger.info(f"✅ symbols reloaded: {len(filtered)} symbols. Skipped {len(skipped)}.")
@@ -669,13 +678,21 @@ async def refresh_symbols_periodically():
     يعيد توليد الرموز من symbols.py كل SYMBOLS_REFRESH_HOURS ثم يعيد بناء AVAILABLE_SYMBOLS.
     يستفيد من (list, meta) العائدة من _prepare_symbols().
     """
+    # تأخير أولي لتجنّب الكتابة فوق قائمة الإقلاع الصحيحة لو أول تحديث رجع فارغ
+    init_delay = int(os.getenv("SYMBOLS_INIT_DELAY_SEC", "60"))
+    if init_delay > 0:
+        await asyncio.sleep(init_delay)
+
     while True:
         try:
             # _prepare_symbols في symbols.py تُرجع (list, meta)
             fresh_list, fresh_meta = symbols_mod._prepare_symbols()
-            await rebuild_available_symbols((fresh_list, fresh_meta))
-            sample = ", ".join(fresh_list[:10])
-            logger.info(f"[symbols] refreshed → {len(fresh_list)} | first 10: {sample}")
+            if not fresh_list:
+                logger.warning("[symbols] refresh returned EMPTY — keeping previous AVAILABLE_SYMBOLS.")
+            else:
+                await rebuild_available_symbols((fresh_list, fresh_meta))
+                sample = ", ".join(fresh_list[:10])
+                logger.info(f"[symbols] refreshed → {len(fresh_list)} | first 10: {sample}")
         except Exception as e:
             logger.exception(f"[symbols] refresh failed: {e}")
         await asyncio.sleep(SYMBOLS_REFRESH_HOURS * 3600)
