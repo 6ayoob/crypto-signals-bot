@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 from collections import deque
 import random
-from strategy import check_signal
+
 import ccxt
 import pytz
 from aiogram import Bot, Dispatcher, F
@@ -81,36 +81,12 @@ except Exception:
         return {"referred_count": 0, "paid_count": 0, "total_bonus_days": 0}
     def db_list_active_uids(s): return []
 
-# ---------- Leader Lock ----------
-ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
-LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
-SERVICE_NAME = os.getenv("SERVICE_NAME", "svc")
-LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))  # seconds
-
-acquire_or_steal_leader_lock = heartbeat_leader_lock = release_leader_lock = None
-if ENABLE_DB_LOCK:
-    try:
-        from database import acquire_or_steal_leader_lock as _acq
-        from database import heartbeat_leader_lock as _hb
-        from database import release_leader_lock as _rel
-        acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock = _acq, _hb, _rel
-    except Exception:
-        try:
-            from database import try_acquire_leader_lock as _try_acq
-            def acquire_or_steal_leader_lock(name, holder, ttl_seconds=300):
-                return _try_acq(name, holder)
-            def heartbeat_leader_lock(name, holder):
-                return True
-            def release_leader_lock(name, holder):
-                pass
-        except Exception:
-            ENABLE_DB_LOCK = False
-
 # Strategy & Symbols
 from strategy import check_signal  # NOTE: strategy applies Auto-Relax + scoring
 from symbols import list_symbols, INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL
+import symbols as symbols_mod  # لاستخدام SYMBOLS_META و _prepare_symbols()
+
 SYMBOLS = list_symbols(INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL)
-import symbols as symbols_mod  # لإعادة توليد القائمة دوريًا
 
 # ---------------------------
 # Logging
@@ -231,6 +207,7 @@ def _fmt_price(x: Any) -> str:
         return str(x)
 
 # --- tuple/list safety helpers for symbols.py interop ---
+
 def _ensure_symbols_list(obj) -> List[str]:
     """
     يقبل list أو (list, meta) ويرجّع List[str] مسطّحة.
@@ -379,7 +356,7 @@ async def welcome_text(user_id: Optional[int] = None) -> str:
         "الخطط:\n"
         f"{price_line}"
         "للاشتراك: اضغط <b>«🔑 طلب اشتراك»</b> وسيقوم الأدمن بالتفعيل.\n"
-        f"✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
+        "✨ جرّب الإصدار الكامل مجانًا لمدة <b>يوم واحد</b>.\n\n"
         f"{wallet_line}"
         f"{ref_hint}"
         "📞 تواصل مباشر:\n" + _contact_line()
@@ -577,12 +554,12 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
 
     cooldown_reason = None
     if float(state["r_today"]) <= -MAX_DAILY_LOSS_R:
-        cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOس_R}R"  # NOTE: typo fix: but keeping as is to not break
+        cooldown_reason = f"حد الخسارة اليومي −{MAX_DAILY_LOSS_R}R"
     if int(state["loss_streak"]) >= MAX_LOSSES_STREAK:
         if cooldown_reason:
             cooldown_reason += f" + {MAX_LOSSES_STREAK} خسائر متتالية"
         else:
-            cooldown_reason = f"{MAX_LOسSES_STREAK} خسائر متتالية"
+            cooldown_reason = f"{MAX_LOSSES_STREAK} خسائر متتالية"
 
     if cooldown_reason:
         until = datetime.now(timezone.utc) + timedelta(hours=COOLDOWN_HOURS)
@@ -603,40 +580,84 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
     return r_multiple
 
 # ---------------------------
-# OKX
+# OKX — build AVAILABLE_SYMBOLS with swap adaptation
 # ---------------------------
 
 async def load_okx_markets_and_filter():
+    """يبني AVAILABLE_SYMBOLS من SYMBOLS مع تكييف :USDT لعقود السواب."""
     global AVAILABLE_SYMBOLS
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, exchange.load_markets)
-        all_markets = set(exchange.markets.keys())
-        filtered = [s for s in SYMBOLS if s in all_markets]
-        skipped = [s for s in SYMBOLS if s not in all_markets]
+        markets = set(exchange.markets.keys())
+
+        def adapt(sym: str, src: str | None = None) -> Optional[str]:
+            # src يمكن أن تكون "SPOT" أو "SWAP" من SYMBOLS_META لو توفرت
+            if sym in markets:
+                return sym
+            base_try = f"{sym}:USDT"
+            if (src == "SWAP" or src is None) and base_try in markets:
+                return base_try
+            no_colon = sym.replace(":USDT", "")
+            if no_colon in markets:
+                return no_colon
+            return None
+
+        syms = list(SYMBOLS)
+        meta = getattr(symbols_mod, "SYMBOLS_META", {}) or {}
+        filtered, skipped = [], []
+        for s in syms:
+            src = (meta.get(s) or {}).get("source")
+            m = adapt(s, src)
+            if m:
+                filtered.append(m)
+            else:
+                skipped.append(s)
+
         async with AVAILABLE_SYMBOLS_LOCK:
             AVAILABLE_SYMBOLS = filtered
-        logger.info(f"✅ OKX: Loaded {len(filtered)} symbols. Skipped {len(skipped)}: {skipped}")
+        logger.info(f"✅ OKX: Loaded {len(filtered)} symbols. Skipped {len(skipped)}: {skipped[:12]}")
     except Exception as e:
         logger.exception(f"❌ load_okx_markets error: {e}")
         async with AVAILABLE_SYMBOLS_LOCK:
             AVAILABLE_SYMBOLS = []
 
-# --- NEW: إعادة بناء القائمة وتحديثها دورياً ---
+# --- NEW: إعادة بناء القائمة وتحديثها دورياً مع تكييف السواب ---
 
-async def rebuild_available_symbols(new_symbols: List[str]):
+async def rebuild_available_symbols(new_symbols: List[str] | Tuple[List[str], Dict[str, dict]]):
     """
-    يفلتر الرموز بحسب أسواق OKX المتاحة، ويحدّث AVAILABLE_SYMBOLS بشكل آمن.
+    يقبل list أو (list, meta). يكيّف الترميز لعقود السواب (:USDT) قبل الفلترة.
     """
     global AVAILABLE_SYMBOLS
     try:
-        # ⬅️ سطّح المدخل (list أو (list, meta))
-        new_symbols = _ensure_symbols_list(new_symbols)
+        # افصل القائمة والميتا إن وصل tuple
+        meta: Dict[str, dict] = {}
+        if isinstance(new_symbols, tuple):
+            raw_list, meta = new_symbols
+        else:
+            raw_list = _ensure_symbols_list(new_symbols)
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, exchange.load_markets)
-        all_markets = set(exchange.markets.keys())
-        filtered = [s for s in new_symbols if s in all_markets]
-        skipped = [s for s in new_symbols if s not in all_markets]
+        markets = set(exchange.markets.keys())
+
+        def adapt(sym: str) -> Optional[str]:
+            if sym in markets:
+                return sym
+            src = (meta.get(sym) or {}).get("source")
+            cand = f"{sym}:USDT"
+            if (src == "SWAP" or src is None) and cand in markets:
+                return cand
+            no_colon = sym.replace(":USDT", "")
+            if no_colon in markets:
+                return no_colon
+            return None
+
+        filtered, skipped = [], []
+        for s in raw_list:
+            a = adapt(s)
+            (filtered if a else skipped).append(a or s)
+
         async with AVAILABLE_SYMBOLS_LOCK:
             AVAILABLE_SYMBOLS = filtered
         logger.info(f"✅ symbols reloaded: {len(filtered)} symbols. Skipped {len(skipped)}.")
@@ -645,15 +666,16 @@ async def rebuild_available_symbols(new_symbols: List[str]):
 
 async def refresh_symbols_periodically():
     """
-    يعيد توليد SYMBOLS من symbols.py كل SYMBOLS_REFRESH_HOURS ثم يعيد بناء AVAILABLE_SYMBOLS.
+    يعيد توليد الرموز من symbols.py كل SYMBOLS_REFRESH_HOURS ثم يعيد بناء AVAILABLE_SYMBOLS.
+    يستفيد من (list, meta) العائدة من _prepare_symbols().
     """
     while True:
         try:
-            fresh_raw = symbols_mod._prepare_symbols()   # قد تكون (list, meta)
-            fresh = _ensure_symbols_list(fresh_raw)      # ⬅️ نستخلص List[str]
-            await rebuild_available_symbols(fresh)
-            sample = ", ".join(fresh[:10])
-            logger.info(f"[symbols] refreshed → {len(fresh)} | first 10: {sample}")
+            # _prepare_symbols في symbols.py تُرجع (list, meta)
+            fresh_list, fresh_meta = symbols_mod._prepare_symbols()
+            await rebuild_available_symbols((fresh_list, fresh_meta))
+            sample = ", ".join(fresh_list[:10])
+            logger.info(f"[symbols] refreshed → {len(fresh_list)} | first 10: {sample}")
         except Exception as e:
             logger.exception(f"[symbols] refresh failed: {e}")
         await asyncio.sleep(SYMBOLS_REFRESH_HOURS * 3600)
@@ -1520,7 +1542,7 @@ async def cmd_help(m: Message):
         "• <code>/ref</code> – رابط الإحالة وإحصاءاتك\n"
         "• <code>/use_ref CODE</code> – ربط كود إحالة يدويًا\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
-        "📞 <b>تواصل خاص مع الأدمن</ب>:\n" + _contact_line()
+        "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1924,19 +1946,46 @@ async def resilient_polling():
 async def main():
     init_db()
     hb_task = None
-    holder = f"{SERVICE_NAME}:{os.getpid()}"
+    holder = f"{os.getenv('SERVICE_NAME', 'svc')}:{os.getpid()}"
 
     def _on_sigterm(*_):
         try:
             logger.info("SIGTERM received → releasing leader lock and shutting down…")
-            if ENABLE_DB_LOCK and release_leader_lock:
-                release_leader_lock(LEADER_LOCK_NAME, holder)
-        except Exception as e:
-            logger.warning(f"release_leader_lock on SIGTERM warn: {e}")
+            if os.getenv("ENABLE_DB_LOCK", "1") != "0":
+                try:
+                    from database import release_leader_lock
+                    release_leader_lock(os.getenv("LEADER_LOCK_NAME", "telebot_poller"), holder)
+                except Exception as e:
+                    logger.warning(f"release_leader_lock on SIGTERM warn: {e}")
+        except Exception:
+            pass
     try:
         signal.signal(signal.SIGTERM, _on_sigterm)
     except Exception:
         pass
+
+    # Leader lock (compat shim)
+    ENABLE_DB_LOCK = os.getenv("ENABLE_DB_LOCK", "1") != "0"
+    LEADER_TTL = int(os.getenv("LEADER_TTL", "300"))
+    LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
+    acquire_or_steal_leader_lock = heartbeat_leader_lock = release_leader_lock = None
+    if ENABLE_DB_LOCK:
+        try:
+            from database import acquire_or_steal_leader_lock as _acq
+            from database import heartbeat_leader_lock as _hb
+            from database import release_leader_lock as _rel
+            acquire_or_steal_leader_lock, heartbeat_leader_lock, release_leader_lock = _acq, _hb, _rel
+        except Exception:
+            try:
+                from database import try_acquire_leader_lock as _try_acq
+                def acquire_or_steal_leader_lock(name, holder, ttl_seconds=300):
+                    return _try_acq(name, holder)
+                def heartbeat_leader_lock(name, holder):
+                    return True
+                def release_leader_lock(name, holder):
+                    pass
+            except Exception:
+                ENABLE_DB_LOCK = False
 
     if ENABLE_DB_LOCK and acquire_or_steal_leader_lock:
         got = False
@@ -1965,9 +2014,9 @@ async def main():
 
     await load_okx_markets_and_filter()
 
-    # بناء أولي بالقائمة الحالية من symbols.py (مرة واحدة عند الإقلاع)
+    # بناء أولي بالقائمة الحالية من symbols.py (مع الميتا)
     try:
-        await rebuild_available_symbols(SYMBOLS)  # SYMBOLS بالفعل قائمة
+        await rebuild_available_symbols((SYMBOLS, getattr(symbols_mod, "SYMBOLS_META", {}) or {}))
     except Exception:
         pass
 
@@ -2000,7 +2049,7 @@ async def main():
             pass
         raise
     finally:
-        if ENABLE_DB_LOCK and release_leader_lock:
+        if ENABLE_DB_LOCK and 'release_leader_lock' in globals() and release_leader_lock:
             try:
                 release_leader_lock(LEADER_LOCK_NAME, holder)
                 logger.info("Leader lock released.")
