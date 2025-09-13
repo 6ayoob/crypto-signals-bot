@@ -837,7 +837,7 @@ async def scan_and_dispatch():
                 try:
                     bd = ((sig.get('features') or {}).get('score_breakdown') or {})
                     mtf_points = float(bd.get('mtf', 0))
-                    if STRICT_MTF_GATE and mtf_points < 15:
+                    if STRICT_MTF_GATE and mtf_points < 13:
                         logger.info(f"⛔ MTF_STRICT skip {sig['symbol']} (mtf_points={mtf_points})")
                         continue
                 except Exception:
