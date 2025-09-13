@@ -1,32 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-symbols.py — توسيع ذكي لقائمة الأزواج من OKX (SPOT / SWAP_USDT / BOTH)
-- يعرّف: SYMBOLS (قائمة)، SYMBOLS_META (قاموس معلومات إضافية)
-- يدعم: كاش JSON، فلاتر (مين/إكسترا/إستبعاد)، و CLI للطباعة/التصدير.
-- جديد (v1.4): مُحوِّل أسماء CCXT لعقود السواب + أعلام CLI إضافية.
+ symbols.py — توليد ذكي لقائمة الأزواج من OKX (SPOT / SWAP_USDT / BOTH)
+ - يعرّف: SYMBOLS (قائمة)، SYMBOLS_META (قاموس معلومات إضافية)
+ - يدعم: كاش JSON، فلاتر، و CLI للطباعة/التصدير.
+ - v1.4.2: Fallback إلى urllib إذا لم تتوفر requests.
 
-مهم (توافق خلفي):
-- list_symbols(inst, target, min_usd_vol) الآن تُرجع **قائمة** فقط افتراضيًا.
-- إن أردت الميتا أيضًا، استعمل: list_symbols(..., return_meta=True) → (list, meta)
-- لا تغيير على التواقيع القديمة.
+ مهم (توافق خلفي):
+ - list_symbols(inst, target, min_usd_vol) تُرجع **قائمة** فقط افتراضيًا.
+ - إن أردت الميتا: list_symbols(..., return_meta=True) → (list, meta)
 
-ENV (اختياري):
-  APP_DATA_DIR=/tmp/market-watchdog
-  INST_TYPE=SPOT|SWAP_USDT|BOTH
-  TARGET_SYMBOLS_COUNT=100
-  MIN_24H_USD_VOL=0
-  AUTO_EXPAND_SYMBOLS=1
-  USE_SYMBOLS_CACHE=1
-  DEBUG_SYMBOLS=0
-  OKX_BASE=https://www.okx.com
-  OKX_TIMEOUT_SEC=12
-  SYMBOLS_CACHE_PATH=<path/to/json>   (افتراضي داخل APP_DATA_DIR)
-  INCLUDE_SYMBOLS=BTC/USDT,ETH/USDT
-  EXCLUDE_SYMBOLS=XYZ/USDT
-  EXCLUDE_STABLES=1
-  EXCLUDE_MEME=0
-  # جديد:
-  EXCLUDE_LEVERAGED_SUFFIXES=3L,3S,5L,5S,UP,DOWN
+ ENV (اختياري):
+   APP_DATA_DIR=/tmp/market-watchdog
+   INST_TYPE=SPOT|SWAP_USDT|BOTH
+   TARGET_SYMBOLS_COUNT=100
+   MIN_24H_USD_VOL=0
+   AUTO_EXPAND_SYMBOLS=1
+   USE_SYMBOLS_CACHE=1
+   DEBUG_SYMBOLS=0
+   OKX_BASE=https://www.okx.com
+   OKX_TIMEOUT_SEC=12
+   SYMBOLS_CACHE_PATH=<path/to/json>
+   INCLUDE_SYMBOLS=BTC/USDT,ETH/USDT
+   EXCLUDE_SYMBOLS=XYZ/USDT
+   EXCLUDE_STABLES=1
+   EXCLUDE_MEME=0
+   EXCLUDE_LEVERAGED_SUFFIXES=3L,3S,5L,5S,UP,DOWN
 """
 
 from __future__ import annotations
@@ -55,7 +53,7 @@ MIN_24H_USD_VOL = float(os.getenv("MIN_24H_USD_VOL", "0"))
 EXCLUDE_STABLES = bool(int(os.getenv("EXCLUDE_STABLES", "1")))
 EXCLUDE_MEME    = bool(int(os.getenv("EXCLUDE_MEME", "0")))
 
-# جديد: إتاحة تخصيص الرافعة عبر ENV
+# تخصيص لواحق الأزواج ذات الرافعة عبر ENV
 _DEF_LEV = {"3L","3S","5L","5S","UP","DOWN"}
 try:
     env_raw = os.getenv("EXCLUDE_LEVERAGED_SUFFIXES", ",".join(sorted(_DEF_LEV)))
@@ -64,10 +62,13 @@ try:
 except Exception:
     LEVERAGED_SUFFIXES = _DEF_LEV
 
+# ===== HTTP: requests (اختياري) + urllib fallback =====
 try:
     import requests  # اختياري
-except Exception:
+except Exception:  # pragma: no cover
     requests = None
+
+import urllib.request
 
 # ===== مساعدات ENV =====
 
@@ -85,15 +86,12 @@ EXCLUDE_SYMBOLS = set(_parse_csv_env("EXCLUDE_SYMBOLS"))
 
 _STABLE_BASES = {"USDC","DAI","TUSD","USDD","FDUSD","USDE","USDT"}
 _MEME_BASES = {
-    # القائمة قابلة للتوسيع
     "PEPE","DOGE","SHIB","ELON","FLOKI","WIF","BONK","PENGU","TURBO","NOT","TRUMP","DEGEN","MEME","DOGS","VINE","CAT"
 }
 
-# Aliases موسّعة (يمكن تحديثها مع الوقت)
+# Aliases قابلة للتوسعة
 _ALIASES: Dict[str, str] = {
     "RENDER/USDT": "RNDR/USDT",
-    # أمثلة إضافية إن وجِدت مستقبلاً
-    # "TIA/USDT": "CELESTIA/USDT",  # توضيح: مجرّد مثال — غيّر وفق حاجتك
 }
 
 # ===== الأدوات الأساسية =====
@@ -113,30 +111,38 @@ def _is_leveraged(sym: str) -> bool:
     base = sym.split("/", 1)[0]
     return any(base.endswith(suf) for suf in LEVERAGED_SUFFIXES)
 
+# ===== HTTP helper =====
+
 def _okx_get_json(url: str, attempts: int = 3) -> Optional[Dict]:
-    if requests is None:
-        return None
-    headers = {"User-Agent": "symbols/1.4 (+okx)", "Accept": "application/json"}
+    headers = {"User-Agent": "symbols/1.4.2 (+okx)", "Accept": "application/json"}
+
+    def _urllib_fetch(u: str):
+        req = urllib.request.Request(u, headers=headers)
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as r:
+            if getattr(r, "status", 200) != 200:
+                return None
+            return json.loads(r.read().decode("utf-8"))
+
     for a in range(attempts):
         try:
-            r = requests.get(url, timeout=TIMEOUT_SEC, headers=headers)
-            if r.status_code in (429, 524, 520, 502, 503):
-                time.sleep((2 ** a) + random.random()); continue
-            r.raise_for_status()
-            j = r.json()
-            if str(j.get("code","0")) not in ("0","200"):
-                time.sleep((2 ** a) + random.random()); continue
-            return j
+            if requests is not None:
+                r = requests.get(url, timeout=TIMEOUT_SEC, headers=headers)
+                if r.status_code in (429, 524, 520, 502, 503):
+                    time.sleep((2 ** a) + random.random()); continue
+                r.raise_for_status()
+                j = r.json()
+            else:
+                j = _urllib_fetch(url)
+            if j and str(j.get("code","0")) in ("0","200"):
+                return j
         except Exception:
-            time.sleep((2 ** a) + random.random())
+            pass
+        time.sleep((2 ** a) + random.random())
     return None
 
+# ===== تقدير السيولة بالدولار =====
+
 def _usd_liquidity_approx(it: Dict) -> float:
-    """
-    يحاول تقدير حجم USD:
-      - إذا تواجد volUsd: يُستخدم مباشرة
-      - وإلّا: volCcy24h أو vol24h × last
-    """
     try:
         last = float(it.get("last", 0.0) or 0.0)
     except Exception:
@@ -153,6 +159,8 @@ def _usd_liquidity_approx(it: Dict) -> float:
         except Exception:
             continue
     return 0.0
+
+# ===== فلاتر =====
 
 def _filter_symbol(sym: str) -> bool:
     base = sym.split("/", 1)[0]
@@ -174,37 +182,30 @@ def _okx_tickers(inst_type: str) -> List[Dict]:
     return j.get("data", []) if j and isinstance(j.get("data"), list) else []
 
 def get_ranked(inst: str) -> List[Tuple[str, float, str]]:
-    """
-    يعيد قائمة [(symbol, usdLiquidity, source)] حيث source ∈ {SPOT, SWAP}
-    رمز الإرجاع دائمًا بصيغة "BASE/USDT" بغض النظر عن السورس.
+    """يعيد [(symbol, usdLiquidity, source)] حيث source ∈ {SPOT, SWAP}.
+    دائمًا نُرجع الرمز كـ "BASE/USDT" بغض النظر عن المصدر.
     """
     inst = inst.upper().strip()
     rows: List[Tuple[str, float, str]] = []
 
     if inst in ("SPOT", "BOTH"):
         for it in _okx_tickers("SPOT"):
-            instId = str(it.get("instId",""))
-            if not instId:
-                continue
-            instId = instId.upper()
+            instId = str(it.get("instId", "")).upper()
             if not instId.endswith("-USDT"):
                 continue
-            sym = instId.replace("-", "/")  # X/USDT
+            sym = instId.replace("-", "/")
             rows.append((sym, _usd_liquidity_approx(it), "SPOT"))
 
     if inst in ("SWAP_USDT", "BOTH"):
         for it in _okx_tickers("SWAP"):
-            instId = str(it.get("instId",""))
-            if not instId:
-                continue
-            instId = instId.upper()  # مثال: BTC-USDT-SWAP
+            instId = str(it.get("instId", "")).upper()  # مثل: BTC-USDT-SWAP
             if not instId.endswith("-USDT-SWAP"):
                 continue
             base = instId.split("-USDT-SWAP", 1)[0]
             sym = f"{base}/USDT"
             rows.append((sym, _usd_liquidity_approx(it), "SWAP"))
 
-    # دمج فريد مع تفضيل الأعلى سيولة
+    # دمج وتفضيل الأعلى سيولة
     best: Dict[str, Tuple[str, float, str]] = {}
     for sym, vol, src in rows:
         s = _alias_symbol(_normalize_symbol(sym))
@@ -238,7 +239,7 @@ def _write_cache(key: str, symbols_meta: Dict[str, Dict]) -> None:
         if not isinstance(base, dict):
             base = {}
         base[key] = symbols_meta
-        tmp = Path(CACHE_PATH + ".tmp")
+        tmp = Path(str(CACHE_PATH) + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(base, f, ensure_ascii=False, indent=2)
         Path(tmp).replace(CACHE_PATH)
@@ -249,10 +250,6 @@ def _write_cache(key: str, symbols_meta: Dict[str, Dict]) -> None:
 
 def list_symbols(inst: str, target: int, min_usd_vol: float, *, return_meta: bool = False
                  ) -> Union[List[str], Tuple[List[str], Dict[str, Dict]]]:
-    """
-    افتراضيًا تُرجِع قائمة فقط (توافقًا مع الإصدارات القديمة).
-    عيّن return_meta=True لتحصل على (list, meta).
-    """
     inst = inst.upper().strip()
     ranked = get_ranked(inst)
 
@@ -271,7 +268,7 @@ def list_symbols(inst: str, target: int, min_usd_vol: float, *, return_meta: boo
     meta: Dict[str, Dict] = {}
     seen = set()
 
-    # أضف include أولاً
+    # include أولًا
     for add in INCLUDE_SYMBOLS:
         a = _alias_symbol(_normalize_symbol(add))
         if a not in seen and _filter_symbol(a):
@@ -304,19 +301,11 @@ def list_symbols(inst: str, target: int, min_usd_vol: float, *, return_meta: boo
         return out_syms, meta
     return out_syms
 
-# ===== Helpers: CCXT name conversion (اختياري) =====
+# ===== تحويل أسماء إلى صيغة ccxt (اختياري) =====
 
 def to_ccxt_names(symbols: List[str] | Tuple[List[str], Dict[str, Dict]],
                   meta: Optional[Dict[str, Dict]] = None,
                   prefer_swap: bool = True) -> List[str]:
-    """
-    يحوّل أسماء "BASE/USDT" إلى الشكل الذي تستخدمه ccxt عند OKX لعقود السواب:
-      SPOT → "BASE/USDT"
-      SWAP → "BASE/USDT:USDT" (عندما meta[sym]["source"] == "SWAP")
-    إذا لم تُمرّر meta:
-      - إن كان symbols بالشكل (list, meta) ستُستخلص تلقائيًا.
-      - وإلا ستُعامَل كل الرموز كـ SPOT.
-    """
     if isinstance(symbols, tuple) and meta is None:
         symbols, meta = symbols  # type: ignore
     meta = meta or {}
@@ -333,25 +322,18 @@ def to_ccxt_names(symbols: List[str] | Tuple[List[str], Dict[str, Dict]],
 # ===== منفذ نهائي لتهيئة الرموز =====
 
 def _prepare_symbols() -> Tuple[List[str], Dict[str, Dict]]:
-    """
-    المنفذ النهائي الذي يجهّز SYMBOLS/SYMBOLS_META
-    """
     if not AUTO_EXPAND_SYMBOLS:
         base = _dedupe_keep_order([_alias_symbol(_normalize_symbol(s)) for s in INCLUDE_SYMBOLS])
         return base[:TARGET_SYMBOLS_COUNT], {s: {"volUsd": None, "source": "STATIC"} for s in base}
     try:
-        # نطلب الميتا صراحة هنا
-        return list_symbols(INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL, return_meta=True)  # (list, meta)
+        return list_symbols(INST_TYPE, TARGET_SYMBOLS_COUNT, MIN_24H_USD_VOL, return_meta=True)
     except Exception:
-        # fallback: include فقط
         base = _dedupe_keep_order([_alias_symbol(_normalize_symbol(s)) for s in INCLUDE_SYMBOLS])
         return base[:TARGET_SYMBOLS_COUNT], {s: {"volUsd": None, "source": "STATIC"} for s in base}
 
 # === نقاط التصدير ===
 SYMBOLS, SYMBOLS_META = _prepare_symbols()
-__all__ = [
-    "SYMBOLS", "SYMBOLS_META", "list_symbols", "get_ranked", "to_ccxt_names"
-]
+__all__ = ["SYMBOLS", "SYMBOLS_META", "list_symbols", "get_ranked", "to_ccxt_names"]
 
 # ===== Debug =====
 if DEBUG_SYMBOLS:
@@ -368,7 +350,6 @@ def main():
     ap.add_argument("--minvol", type=float, default=MIN_24H_USD_VOL)
     ap.add_argument("--export", default="", help="اكتب meta إلى ملف JSON")
     ap.add_argument("--with-meta", action="store_true", help="أعد الميتا مع القوائم في CLI")
-    # جديد:
     ap.add_argument("--ccxt", action="store_true", help="حوّل الأسماء لشكل ccxt (SWAP → :USDT)")
     ap.add_argument("--export-ccxt", default="", help="اكتب قائمة الرموز بصيغة ccxt إلى ملف نصي")
     args = ap.parse_args()
@@ -379,7 +360,6 @@ def main():
         syms = list_symbols(args.inst, args.target, args.minvol)
         meta = {}
 
-    # تحويل لأسماء ccxt عند الطلب
     ccxt_syms: Optional[List[str]] = None
     if args.ccxt:
         ccxt_syms = to_ccxt_names((syms, meta) if meta else syms, meta or None, prefer_swap=True)
