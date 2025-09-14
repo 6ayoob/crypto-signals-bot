@@ -782,8 +782,12 @@ async def fetch_spread_pct(symbol: str) -> Optional[float]:
 # Dedupe signals
 # ---------------------------
 
+def _norm_sym_for_dedupe(sym: Optional[str]) -> str:
+    s = (sym or "").upper()
+    return s.replace(":USDT", "/USDT")
+
 def _should_skip_duplicate(sig: dict) -> bool:
-    sym = sig.get("symbol")
+    sym = _norm_sym_for_dedupe(sig.get("symbol"))
     if not sym:
         return False
     now = time.time()
@@ -1609,7 +1613,6 @@ async def cb_admin_help_btn(q: CallbackQuery):
         return await q.answer()
     await cmd_admin_help(q.message)
     await q.answer()
-
 @dp.callback_query(F.data == "admin_manual")
 async def cb_admin_manual(q: CallbackQuery):
     aid = q.from_user.id
@@ -1620,6 +1623,18 @@ async def cb_admin_manual(q: CallbackQuery):
     await q.answer()
 
 ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
+
+# ⬇️ NEW: إلغاء جلسة الأدمن
+@dp.callback_query(F.data == "admin_cancel")
+async def cb_admin_cancel(q: CallbackQuery):
+    if q.from_user.id not in ADMIN_USER_IDS:
+        return await q.answer("غير مُصرّح.", show_alert=True)
+    ADMIN_FLOW.pop(q.from_user.id, None)
+    try:
+        await q.message.answer("❎ تم إلغاء العملية.", parse_mode="HTML")
+    except Exception:
+        pass
+    await q.answer("تم.")
 
 @dp.message(F.text)
 async def admin_manual_router(m: Message):
@@ -1761,116 +1776,7 @@ async def cb_admin_skip_ref(q: CallbackQuery):
         ADMIN_FLOW.pop(aid, None)
         await q.message.answer(f"❌ فشل التفعيل: {e}")
     await q.answer("تم.")
-
-@dp.message(Command("approve"))
-async def cmd_approve(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    parts = (m.text or "").strip().split()
-    if len(parts) not in (3, 4) or parts[2] not in ("2w", "4w", "gift1d"):
-        return await m.answer("استخدم: /approve <user_id> <2w|4w|gift1d> [reference]")
-    uid = int(parts[1]); plan = parts[2]
-    txh = parts[3] if len(parts) == 4 else None
-    if plan == "2w":
-        dur = SUB_DURATION_2W
-    elif plan == "4w":
-        dur = SUB_DURATION_4W
-    else:
-        dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
-    with get_session() as s:
-        end_at = approve_paid(s, uid, plan, dur, tx_hash=txh)
-        bonus_applied = False
-        if REFERRAL_ENABLED and plan in ("2w","4w"):
-            try:
-                res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
-                bonus_applied = bool(res)
-            except Exception as e:
-                logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
-    await m.answer(
-        f"تم التفعيل للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}."\
-        f"{_bonus_applied_text(bonus_applied)}"
-    )
-    invite = await get_paid_invite_link(uid)
-    if invite:
-        try:
-            msg = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
-            if bonus_applied:
-                msg += f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)."
-            await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
-        except Exception as e:
-            logger.warning(f"SEND INVITE ERROR (/approve): {e}")
-
-@dp.message(Command("activate"))
-async def cmd_activate(m: Message):
-    await cmd_approve(m)
-
-@dp.message(Command("gift1d"))
-async def cmd_gift1d(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    parts = (m.text or "").strip().split()
-    if len(parts) != 2:
-        return await m.answer("استخدم: /gift1d <user_id>")
-    uid = int(parts[1])
-    with get_session() as s:
-        end_at = approve_paid(s, uid, "gift1d", timedelta(hours=GIFT_ONE_DAY_HOURS))
-    await m.answer(f"🎁 تم منح يوم مجاني للمستخدم {uid}. صالح حتى {end_at.strftime('%Y-%m-%d %H:%M UTC')}.")
-    invite = await get_paid_invite_link(uid)
-    if invite:
-        try:
-            await bot.send_message(uid, "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:", reply_markup=invite_kb(invite))
-        except Exception as e:
-            logger.warning(f"SEND INVITE ERROR (/gift1d): {e}")
-
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    txt = m.text.partition(" ")[2].strip()
-    if not txt:
-        return await m.answer("استخدم: /broadcast <text>")
-    uids = list_active_user_ids(); sent = 0
-    for uid in uids:
-        try:
-            await bot.send_message(uid, txt, parse_mode="HTML", disable_web_page_preview=True)
-            sent += 1; await asyncio.sleep(0.02)
-        except Exception:
-            pass
-    await m.answer(f"تم الإرسال إلى {sent} مشترك.")
-
-@dp.message(Command("force_report"))
-async def cmd_force_report(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    with get_session() as s:
-        stats_24 = get_stats_24h(s); stats_7d = get_stats_7d(s)
-    await send_channel(_report_card(stats_24, stats_7d))
-    await m.answer("تم إرسال التقرير للقناة.")
-
-@dp.message(Command("refstats"))
-async def cmd_refstats(m: Message):
-    if m.from_user.id not in ADMIN_USER_IDS:
-        return
-    parts = (m.text or "").strip().split()
-    if len(parts) != 2:
-        return await m.answer("استخدم: /refstats <user_id>")
-    uid = int(parts[1])
-    if not REFERRAL_ENABLED:
-        return await m.answer("ميزة الإحالات غير مفعلة.")
-    with get_session() as s:
-        try:
-            st = get_ref_stats(s, uid)
-        except Exception as e:
-            return await m.answer(f"فشل قراءة الإحصاءات: {e}")
-    await m.answer(
-        f"📈 Referral stats for {uid}\n"
-        f"- referred_count: {st.get('referred_count')}\n"
-        f"- paid_count: {st.get('paid_count')}\n"
-        f"- total_bonus_days: {st.get('total_bonus_days')}",
-        parse_mode="HTML"
-    )
-
-# ---- Admin debug helpers added ----
+# ---- Admin debug helpers ----
 
 @dp.message(Command("debug_sig"))
 async def cmd_debug_sig(m: Message, command: CommandObject):
