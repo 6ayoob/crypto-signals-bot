@@ -2,20 +2,24 @@
 from __future__ import annotations
 """
 strategy.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
-Balanced+ v3.1 — إشارات أدق + ATR متكيّف بالـ quantiles + حارس سوق ذكي
-Pro Upgrades: Multi-AVWAP Confluence (2/3), Adaptive Trailing, Probabilistic ETA
+Balanced+ v3.2 — إشارات أدق + ATR متكيّف بالـ quantiles + حارس سوق ذكي
 
-التحديثات المطلوبة (مطبّقة):
-- رفع BREADTH_MIN_RATIO إلى 0.60
-- خفض RSI_EXHAUSTION إلى 76.0
-- تقليص Auto-Relax إلى مرحلتين (6 و 12 ساعة)
-- العودة للوضع الطبيعي بعد صفقتين ناجحتين عبر register_trade_result
+تحديث #1 (جاهز للإنتاج)
+- تقليص Auto-Relax إلى مرحلتين (6 و 12 ساعة) + العودة للوضع الطبيعي بعد صفقتين ناجحتين.
+- رفع BREADTH_MIN_RATIO إلى 0.60.
+- خفض RSI_EXHAUSTION إلى 76.0.
+- Patch A: بوابة السيولة أسهل (نافذة 10/شموع + عتبة ديناميكية أخف + حد أدنى للشمعة).
+- Patch B: تسامح خفيف مع Spike (z20) محسوب بالـ ATR.
+- Patch C: تعزيز طفيف لـ RVOL_MIN عند قوة Breadth.
+- محوّل انتقائية تلقائي (DSC): يبدّل بين "ناعمة/متوسطة/صارمة" وفق حالة السوق وهدف عدد الإشارات.
 
 ENV (اختياري):
   APP_DATA_DIR=/tmp/market-watchdog
   STRATEGY_STATE_FILE=/tmp/market-watchdog/strategy_state.json
   SYMBOLS_FILE=symbols_config.json  (أو symbols.csv)
   RISK_MODE=conservative|balanced|aggressive
+  SELECTIVITY_MODE=auto|soft|balanced|strict
+  TARGET_SIGNALS_PER_DAY=2
   BRK_HOUR_START=11  BRK_HOUR_END=23
   MAX_POS_FUNDING_MAJ=0.00025  MAX_POS_FUNDING_ALT=0.00025
   BREADTH_MIN_RATIO=0.60
@@ -48,8 +52,12 @@ RISK_PROFILES = {
 }
 _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 
+# محوّل الانتقائية (DSC)
+SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "auto").lower()  # soft|balanced|strict|auto
+TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "2"))
+
 USE_VWAP, USE_ANCHORED_VWAP = True, True
-VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.002, 0.008   # سيتم ضبطها ديناميكيًا
+VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.002, 0.008
 USE_FUNDING_GUARD, USE_OI_TREND, USE_BREADTH_ADJUST = True, True, True
 USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 3
 MAX_BRK_DIST_ATR, BREAKOUT_BUFFER = 0.90, 0.0015
@@ -98,13 +106,13 @@ def _load_state():
     try:
         with open(STATE_FILE, "r") as f:
             s = json.load(f)
-            if "relax_wins" not in s:
-                s["relax_wins"] = 0
-            if "last_signal_ts" not in s:
-                s["last_signal_ts"] = 0
+            s.setdefault("relax_wins", 0)
+            s.setdefault("last_signal_ts", 0)
+            s.setdefault("signals_day_date", "")
+            s.setdefault("signals_today", 0)
             return s
     except Exception:
-        return {"last_signal_ts": 0, "relax_wins": 0}
+        return {"last_signal_ts": 0, "relax_wins": 0, "signals_day_date": "", "signals_today": 0}
 
 def _save_state(s):
     try:
@@ -114,8 +122,20 @@ def _save_state(s):
     except Exception:
         pass
 
+def _reset_daily_counters(s: dict):
+    try:
+        day = datetime.utcnow().strftime("%Y-%m-%d")
+        if s.get("signals_day_date") != day:
+            s["signals_day_date"] = day
+            s["signals_today"] = 0
+    except Exception:
+        pass
+
 def mark_signal_now():
-    s = _load_state(); s["last_signal_ts"] = _now(); _save_state(s)
+    s = _load_state(); _reset_daily_counters(s)
+    s["last_signal_ts"] = _now()
+    s["signals_today"] = int(s.get("signals_today", 0)) + 1
+    _save_state(s)
 
 def hours_since_last_signal() -> float:
     ts = _load_state().get("last_signal_ts", 0)
@@ -128,8 +148,35 @@ def relax_level() -> int:
     if h >= AUTO_RELAX_AFTER_HRS_1: return 1
     return 0
 
-def apply_relax(base_cfg: dict) -> dict:
-    """إرخاء تدريجي عند الجفاف: Score/RVOL/ATR band + MIN_T1 + Holdout."""
+# ========= محوّل الانتقائية (DSC) =========
+def _get_selectivity_mode(breadth_pct: Optional[float]) -> str:
+    if SELECTIVITY_MODE in ("soft","balanced","strict"):
+        return SELECTIVITY_MODE
+    s = _load_state(); _reset_daily_counters(s)
+    sigs = int(s.get("signals_today", 0))
+    if breadth_pct is None:
+        breadth_pct = 0.5
+    if sigs < TARGET_SIGNALS_PER_DAY and breadth_pct >= 0.65:
+        return "soft"
+    if breadth_pct <= 0.40 or sigs >= TARGET_SIGNALS_PER_DAY * 1.5:
+        return "strict"
+    return "balanced"
+
+def _apply_selectivity_mode(thr: dict, mode: str) -> dict:
+    out = dict(thr)
+    if mode == "soft":
+        out["SCORE_MIN"] = max(60, out["SCORE_MIN"] - 4)
+        out["RVOL_MIN"]  = max(0.80, out["RVOL_MIN"] - 0.03)
+        lo, hi = out["ATR_BAND"]; out["ATR_BAND"] = (lo*0.95, hi*1.08)
+    elif mode == "strict":
+        out["SCORE_MIN"] = min(90, out["SCORE_MIN"] + 4)
+        out["RVOL_MIN"]  = min(1.20, out["RVOL_MIN"] + 0.03)
+        lo, hi = out["ATR_BAND"]; out["ATR_BAND"] = (lo*1.05, hi*0.95)
+    out["SELECTIVITY_MODE"] = mode
+    return out
+
+def apply_relax(base_cfg: dict, breadth_hint: Optional[float] = None) -> dict:
+    """إرخاء تدريجي عند الجفاف + دمج محوّل الانتقائية (DSC)."""
     lvl = relax_level()
     out = dict(base_cfg)
     if lvl >= 1: out["SCORE_MIN"] = max(0, out["SCORE_MIN"] - 4)
@@ -143,6 +190,8 @@ def apply_relax(base_cfg: dict) -> dict:
     out["MIN_T1_ABOVE_ENTRY"] = 0.010 if lvl == 0 else (0.008 if lvl == 1 else 0.006)
     out["HOLDOUT_BARS_EFF"] = max(1, base_cfg.get("HOLDOUT_BARS", 2) - lvl)
     out["RELAX_LEVEL"] = lvl
+    mode = _get_selectivity_mode(breadth_hint)
+    out = _apply_selectivity_mode(out, mode)
     return out
 
 # ========= إعادة ضبط التخفيف بعد صفقتين ناجحتين ==========
@@ -266,14 +315,16 @@ def rsi(series, period=14):
     gain = d.where(d > 0, 0.0); loss = -d.where(d < 0, 0.0)
     ag = gain.ewm(alpha=1/period, adjust=False).mean()
     al = loss.ewm(alpha=1/period, adjust=False).mean().replace(0, 1e-9)
-    rs = ag / al; return 100 - (100 / (1 + rs))
+    rs = ag / al
+    return 100 - (100 / (1 + rs))
 
 def macd_cols(df, fast=12, slow=26, signal=9):
     df["ema_fast"] = ema(df["close"], fast)
     df["ema_slow"] = ema(df["close"], slow)
     df["macd"] = df["ema_fast"] - df["ema_slow"]
     df["macd_signal"] = df["macd"].ewm(span=signal, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]; return df
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    return df
 
 def atr_series(df, period=14):
     c = df["close"].shift(1)
@@ -411,7 +462,7 @@ def swept_liquidity(prev, cur) -> bool:
 def near_level(price: float, level: Optional[float], tol: float) -> bool:
     return (level is not None) and (abs(price - level) / max(level, 1e-9) <= tol)
 
-# ========= أدوات مساعدة للـ ATR =========
+# ========= أدوات ATR =========
 def _ema_smooth(s: pd.Series, span: int = 5) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
 
@@ -578,9 +629,6 @@ def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> p
 
 # ----- Patch A (1/2): خفض نسبة الميديان من 0.15 → 0.12 -----
 def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
-    """
-    خفضنا الافتراضي pct_of_median من 0.15 → 0.12 لتجنب تضخيم العتبة في الأيام الهادئة.
-    """
     try:
         x = qv_hist.dropna().tail(240)
         med = float(x.median()) if len(x) else 0.0
@@ -696,12 +744,30 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if atr_pct > 0.020 and macd_slope_3 < 0:
         _log_reject(symbol, "parabolic_macd_cooling"); return None
 
-    # بروفايل + Relax
+    # بروفايل + ميزات خارجية أولية (للـ breadth)
     prof = get_symbol_profile(symbol)
+    regime = detect_regime(df)
+    mtf_has_frames, mtf_pass, d1_ok = pass_mtf_filter_any(ohlcv_htf)
+    feats = extract_features(ohlcv_htf)
+
+    # Breadth hint
+    breadth_pct = None
+    majors_state = feats.get("majors_state", [])
+    try:
+        if isinstance(majors_state, list) and majors_state:
+            above = 0
+            for x in majors_state:
+                c_ = float(x.get("close", 0)); e_ = float(x.get("ema200", 0))
+                if c_ > 0 and e_ > 0 and c_ > e_: above += 1
+            breadth_pct = above / max(1, len(majors_state))
+    except Exception:
+        breadth_pct = None
+
+    # قواعد Relax + DSC
     base_cfg = dict(_cfg)
     base_cfg["ATR_BAND"] = (prof["atr_lo"], prof["atr_hi"])
     base_cfg["RVOL_MIN"] = max(base_cfg.get("RVOL_MIN", 1.0), float(prof["rvol_min"]))
-    thr = apply_relax(base_cfg)
+    thr = apply_relax(base_cfg, breadth_hint=breadth_pct)
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
@@ -733,17 +799,12 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     rvol = float(closed["volume"]) / base_vol
     z20 = float(df["vol_z20"].iloc[-2])
 
-    # ----- Patch B: تساهل بسيط مع Z20 كسبايك -----
+    # Patch B: تساهل بسيط مع Z20 كسبايك
     spike_z = 1.2 - min(0.3, (atr_pct / 0.02) * 0.2)
     spike_ok = (z20 >= (spike_z - 0.15))
     if rvol < thr["RVOL_MIN"] and not spike_ok:
         _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f} and no spike (rv={rvol:.2f}, z={z20:.2f}, spike_th={spike_z:.2f})")
         return None
-
-    # MTF + ميزات خارجية
-    regime = detect_regime(df)
-    mtf_has_frames, mtf_pass, d1_ok = pass_mtf_filter_any(ohlcv_htf)
-    feats = extract_features(ohlcv_htf)
 
     # OI trend (للسكور فقط)
     oi_sc = None
@@ -756,26 +817,14 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     except Exception:
         oi_sc = None
 
-    # Breadth adjust
-    breadth_pct = None
-    majors_state = feats.get("majors_state", [])
+    # Breadth adjust (Patch C)
     try:
-        if isinstance(majors_state, list) and majors_state:
-            above = 0
-            for x in majors_state:
-                c_ = float(x.get("close", 0)); e_ = float(x.get("ema200", 0))
-                if c_ > 0 and e_ > 0 and c_ > e_: above += 1
-            breadth_pct = above / max(1, len(majors_state))
-            if USE_BREADTH_ADJUST:
-                if breadth_pct >= 0.65:
-                    thr["SCORE_MIN"] = max(60, thr["SCORE_MIN"] - 4)
-                    # ----- Patch C: Boost RVOL_MIN طفيف عند قوة Breadth -----
-                    try:
-                        thr["RVOL_MIN"] = max(0.80, float(thr.get("RVOL_MIN", 1.0)) - 0.05)
-                    except Exception:
-                        pass
-                elif breadth_pct <= 0.35:
-                    thr["SCORE_MIN"] = min(86, thr["SCORE_MIN"] + 4)
+        if USE_BREADTH_ADJUST and breadth_pct is not None:
+            if breadth_pct >= 0.65:
+                thr["SCORE_MIN"] = max(60, thr["SCORE_MIN"] - 4)
+                thr["RVOL_MIN"] = max(0.80, float(thr.get("RVOL_MIN", 1.0)) - 0.05)
+            elif breadth_pct <= 0.35:
+                thr["SCORE_MIN"] = min(86, thr["SCORE_MIN"] + 4)
     except Exception:
         pass
 
@@ -784,12 +833,15 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         _log_reject(symbol, "market_guard_block"); return None
 
     # --- اتجاه ناعم (2 من 3) + VWAP/AVWAP (Confluence 2/3) ---
+    vwap_now = float(df["vwap"].iloc[-2]) if USE_VWAP else price
+    vw_tol = _vwap_tol_pct(atr_pct)
+
     ema50_slope_pos = float(df["ema50"].diff(10).iloc[-2]) > 0
     macd_pos = float(df["macd_hist"].iloc[-2]) > 0
     price_above_ema50 = price > float(closed["ema50"])
     two_of_three = sum([ema50_slope_pos, macd_pos, price_above_ema50]) >= 2
 
-    # مراسي AVWAP: قاع السوينغ، قمة السوينغ، بداية آخر يوم UTC
+    # مراسي AVWAP: قاع/قمة سوينغ + بداية يوم
     avwap_swing_low = avwap_swing_high = avwap_day = None
     if USE_ANCHORED_VWAP:
         hhv, llv, hi_idx, lo_idx = recent_swing(df, SWING_LOOKBACK)
@@ -802,9 +854,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             avwap_day = avwap_from_index(df, int(day_start_idx))
         except Exception:
             avwap_day = None
-
-    vwap_now = float(df["vwap"].iloc[-2]) if USE_VWAP else price
-    vw_tol = _vwap_tol_pct(atr_pct)
 
     def _above(x: Optional[float], tol: float = vw_tol):
         return True if x is None else (price >= x * (1 - tol))
@@ -1117,6 +1166,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
                 "MIN_QUOTE_VOL_EFF": prof["min_quote_vol"],
                 "MAX_POS_FUNDING_EFF": prof["max_pos_funding"],
                 "GUARD_REFS": prof.get("guard_refs"),
+                "SELECTIVITY_MODE": thr.get("SELECTIVITY_MODE"),
             },
         },
 
@@ -1138,10 +1188,5 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
 # ========= لوج رفضات =========
 def _log_reject(symbol: str, msg: str):
-    """سجل رفض إشارة لأغراض التتبع/الديباغ."""
     if LOG_REJECTS:
         print(f"[strategy][reject] {symbol}: {msg}")
-
-# ملاحظة:
-# أغلب الرفضات تأتي من بوابة السيولة (_qv_gate) واصطفاف VWAP/AVWAP وقياس RVOL في الهدوء.
-# تحسينات Patch A/B/C الموجودة أعلاه تعالج معظم الضجيج بدون المساس بحراس المخاطر.
