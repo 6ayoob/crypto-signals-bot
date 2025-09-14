@@ -576,7 +576,11 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
 def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> pd.Series:
     return df["close"] * df["volume"] * float(contract_size)
 
-def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.15) -> float:
+# ----- Patch A (1/2): خفض نسبة الميديان من 0.15 → 0.12 -----
+def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
+    """
+    رفعنا الافتراضي pct_of_median من 0.15 → 0.12 حتى لا تصير العتبة الديناميكية أكبر من اللازم في الأيام الهادية.
+    """
     try:
         x = qv_hist.dropna().tail(240)
         med = float(x.median()) if len(x) else 0.0
@@ -585,14 +589,30 @@ def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_media
     dyn = max(symbol_min_qv, pct_of_median * med) if med > 0 else symbol_min_qv
     return float(dyn)
 
-def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 12) -> tuple[bool, str]:
+# ----- Patch A (2/2): تسهيل بوابة السيولة + Relax -----
+def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bool, str]:
+    """
+    - قلّلنا نافذة الفحص من 12 → 10 شموع.
+    - خفّضنا العتبة الديناميكية بالـRelax: (L1=-10%, L2=-20%).
+    - خفّفنا شرط أقل-بار من 5% → 3% من العتبة (ومحميّ بسقف سفلي 600$).
+    """
     if len(qv_series) < win:
         return False, "qv_window_short"
     window = qv_series.tail(win)
-    dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series)
+
+    dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
+    lvl = relax_level()
+    if lvl == 1:
+        dyn_thr *= 0.90
+    elif lvl >= 2:
+        dyn_thr *= 0.80
+
     qv_sum = float(window.sum())
     qv_min = float(window.min())
-    minbar_req = 0.05 * dyn_thr
+
+    # 3% من العتبة مع أرضية 600$
+    minbar_req = max(600.0, 0.03 * dyn_thr)
+
     ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
     return ok, f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
 
@@ -695,10 +715,10 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < holdout_eff:
         _log_reject(symbol, f"holdout<{holdout_eff}"); return None
 
-    # سيولة — نافذة قصيرة + عتبة ديناميكية
+    # سيولة — نافذة قصيرة + عتبة ديناميكية (Patch A: win=10)
     contract_size = 1.0
     qv_series = _compute_quote_vol_series(df, contract_size=contract_size)
-    ok_qv, qv_dbg = _qv_gate(qv_series, float(prof["min_quote_vol"]), win=12)
+    ok_qv, qv_dbg = _qv_gate(qv_series, float(prof["min_quote_vol"]), win=10)
     if not ok_qv:
         _log_reject(symbol, f"low_quote_vol ({qv_dbg})"); return None
 
@@ -714,9 +734,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     base_vol = v_med60 if v_med60 > 0 else (v_ma20 if v_ma20 > 0 else 1e-9)
     rvol = float(closed["volume"]) / base_vol
     z20 = float(df["vol_z20"].iloc[-2])
+
+    # ----- Patch B: تساهل بسيط مع Z20 كسبايك -----
     spike_z = 1.2 - min(0.3, (atr_pct / 0.02) * 0.2)
-    vol_spike = z20 >= spike_z
-    if rvol < thr["RVOL_MIN"] and not vol_spike:
+    spike_ok = (z20 >= (spike_z - 0.15))
+    if rvol < thr["RVOL_MIN"] and not spike_ok:
         _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f} and no spike (rv={rvol:.2f}, z={z20:.2f}, spike_th={spike_z:.2f})")
         return None
 
@@ -747,8 +769,15 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
                 if c_ > 0 and e_ > 0 and c_ > e_: above += 1
             breadth_pct = above / max(1, len(majors_state))
             if USE_BREADTH_ADJUST:
-                if breadth_pct >= 0.65: thr["SCORE_MIN"] = max(60, thr["SCORE_MIN"] - 4)
-                elif breadth_pct <= 0.35: thr["SCORE_MIN"] = min(86, thr["SCORE_MIN"] + 4)
+                if breadth_pct >= 0.65:
+                    thr["SCORE_MIN"] = max(60, thr["SCORE_MIN"] - 4)
+                    # ----- Patch C: Boost RVOL_MIN طفيف عند قوة Breadth -----
+                    try:
+                        thr["RVOL_MIN"] = max(0.80, float(thr.get("RVOL_MIN", 1.0)) - 0.05)
+                    except Exception:
+                        pass
+                elif breadth_pct <= 0.35:
+                    thr["SCORE_MIN"] = min(86, thr["SCORE_MIN"] + 4)
     except Exception:
         pass
 
@@ -853,7 +882,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     setup = None; struct_ok = False; reasons: List[str] = []
     brk_far = (price - hhv_prev) / max(atr, 1e-9) > MAX_BRK_DIST_ATR
 
-    if (breakout_ok and retest_ok and not brk_far and (rvol >= thr["RVOL_MIN"] or vol_spike) and brk_in_session):
+    if (breakout_ok and retest_ok and not brk_far and (rvol >= thr["RVOL_MIN"] or spike_ok) and brk_in_session):
         if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
             if (rev_insideb or rev_engulf or candle_quality(closed, rvol)):
                 setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest","SessionOK"]
@@ -1009,7 +1038,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     gap_to_t1 = abs(t_list[0] - price)
     eta_bars = gap_to_t1 / max(median_step, 1e-9)
     # خطّة: لا نطيل المهلة في سوق بطيء — نجعل الحد الأقصى أصغر قليلًا إذا ETA كبير
-    base_max_bars = MAX_BARS_TO_T1_BASE
+    base_max_bars = MAX_BARS_TO_TP1_BASE
     if atr_pct <= 0.008:   base_max_bars = 10
     elif atr_pct >= 0.020: base_max_bars = 6
     if setup in ("BRK","SWEEP"): base_max_bars = max(6, base_max_bars - 2)
