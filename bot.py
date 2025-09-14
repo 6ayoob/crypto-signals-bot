@@ -54,6 +54,17 @@ from config import (
     USDT_TRC20_WALLET
 )
 
+# === Force pricing/durations override (optional, keeps DB keys)
+# يفضّل تعديلها من config.py، لكن هذا يضمن تطبيق الأسعار الآن دون كسر التوافق.
+if True:
+    try:
+        PRICE_2_WEEKS_USD = 15     # 1w ظاهرًا للمستخدم
+        PRICE_4_WEEKS_USD = 40     # 4w
+        SUB_DURATION_2W = timedelta(days=7)    # 1 أسبوع فعليًا
+        SUB_DURATION_4W = timedelta(days=28)   # 4 أسابيع
+    except Exception:
+        pass
+
 # Database
 from database import (
     init_db, get_session, is_active, start_trial, approve_paid,
@@ -107,6 +118,21 @@ FEATURE_TAGLINE = os.getenv("FEATURE_TAGLINE", "3 مستويات أهداف، و
 START_BANNER_EMOJI = os.getenv("START_BANNER_EMOJI", "🚀")
 REF_BONUS_DAYS = int(os.getenv("REF_BONUS_DAYS", "2"))
 SHOW_REF_IN_START = os.getenv("SHOW_REF_IN_START", "1") == "1"
+
+# وضع أدمن مختصر لإخفاء أوامر غير مفيدة
+ADMIN_MINIMAL = os.getenv("ADMIN_MINIMAL", "1") == "1"  # 1=إظهار أوامر أساسية فقط
+
+# ==== Plans normalization (user-facing 1w/4w -> internal 2w/4w) ====
+PLAN_ALIASES = {
+    "1w": "2w", "7d": "2w", "1week": "2w",
+    "4w": "4w", "28d": "4w", "4weeks": "4w",
+}
+def normalize_plan_token(p: str | None) -> str | None:
+    if not p: return None
+    p = p.strip().lower()
+    if p in ("2w", "4w"):
+        return p
+    return PLAN_ALIASES.get(p)
 
 # === New safety gates (tunable) ===
 STRICT_MTF_GATE = os.getenv("STRICT_MTF_GATE", "1") == "1"  # يرفض أي إشارة لا تنال نقاط MTF كاملة
@@ -323,7 +349,10 @@ def support_dm_kb() -> InlineKeyboardMarkup:
 async def welcome_text(user_id: Optional[int] = None) -> str:
     price_line = ""
     try:
-        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        price_line = (
+            f"• 1 أسبوع: <b>{PRICE_2_WEEKS_USD}$</b> | "
+            f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        )
     except Exception:
         pass
 
@@ -598,7 +627,7 @@ async def load_okx_markets_and_filter():
             base_try = f"{sym}:USDT"
             if (src == "SWAP" or src is None) and base_try in markets:
                 return base_try
-            no_colon = sym.replace(":USDT", "")
+            no_colon = sym.replace(":USGT", "").replace(":USDT", "")
             if no_colon in markets:
                 return no_colon
             return None
@@ -754,7 +783,12 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
             await RATE.wait()
             loop = asyncio.get_event_loop()
             ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
-            price = ticker.get("last") or ticker.get("close") or ticker.get("info", {}).get("last")
+            price = (
+                ticker.get("last")
+                or ticker.get("close")
+                or (ticker.get("info", {}) or {}).get("last")
+                or (ticker.get("info", {}) or {}).get("close")
+            )
             return float(price) if price is not None else None
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
             await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0.05, 0.2))
@@ -1168,7 +1202,7 @@ async def notify_trial_expiring_soon_loop():
         await asyncio.sleep(900)
 
 # ---------------------------
-# Reports (updated to new stats keys)
+# Reports
 # ---------------------------
 
 def render_daily_report(stats: dict) -> str:
@@ -1199,7 +1233,7 @@ def _report_card(stats_24: dict, stats_7: dict) -> str:
         part2 = f"\n📅 آخر 7 أيام — إشارات: <b>{n7}</b> | نسبة الربح: <b>{wr7:.1f}%</b> | صافي R: <b>{r7:+.2f}R</b>"
     except Exception:
         part2 = ""
-    # إضافة “منذ آخر إشارة” من strategy_state.json + تقدير مستوى Auto-Relax
+    # “منذ آخر إشارة” + Auto-Relax level
     try:
         st_path = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
         last_ts = (json.loads(Path(st_path).read_text(encoding="utf-8")).get("last_signal_ts") or 0)
@@ -1433,8 +1467,9 @@ async def cb_req_sub(q: CallbackQuery):
     uname = (u.username and f"@{u.username}") or (u.full_name or "")
     user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
 
+    # أزرار الأدمن (نصوص محدثة؛ callback_data تبقى على 2w/4w)
     kb_admin = InlineKeyboardBuilder()
-    kb_admin.button(text="✅ تفعيل 2 أسابيع (2w)", callback_data=f"approve_inline:{uid}:2w")
+    kb_admin.button(text="✅ تفعيل 1 أسبوع (1w)", callback_data=f"approve_inline:{uid}:2w")
     kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
     kb_admin.button(text="🎁 تفعيل يوم مجاني (gift1d)", callback_data=f"approve_inline:{uid}:gift1d")
     kb_admin.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
@@ -1449,7 +1484,10 @@ async def cb_req_sub(q: CallbackQuery):
     )
 
     try:
-        price_line = f"• أسبوعان: <b>{PRICE_2_WEEKS_USD}$</b> | • 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        price_line = (
+            f"• 1 أسبوع: <b>{PRICE_2_WEEKS_USD}$</b> | "
+            f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        )
     except Exception:
         price_line = ""
     wallet_line = ""
@@ -1469,6 +1507,51 @@ async def cb_req_sub(q: CallbackQuery):
         reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None,
     )
     await q.answer()
+
+# === دفع يدوي: /submit_tx <hash> <1w|4w|2w|7d|28d> ===
+
+@dp.message(Command("submit_tx"))
+async def cmd_submit_tx(m: Message, command: CommandObject):
+    """
+    /submit_tx <tx_hash> <1w|4w|2w|7d|28d>
+    يحفظ طلب تفعيل بانتظار موافقة الأدمن (لا يفعّل تلقائيًا).
+    """
+    args = (command.args or "").strip().split()
+    if len(args) < 2:
+        return await m.answer(
+            "الصيغة: <code>/submit_tx &lt;tx_hash&gt; &lt;1w|4w&gt;</code>\n"
+            "مثال: <code>/submit_tx e3f1a... 1w</code>",
+            parse_mode="HTML"
+        )
+
+    tx_hash, plan_in = args[0], args[1]
+    plan = normalize_plan_token(plan_in)
+    if not plan:
+        return await m.answer("خطة غير صحيحة. استخدم 1w أو 4w.", parse_mode="HTML")
+
+    price = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
+    # إشعار الأدمن بطلب التفعيل
+    kb_admin = InlineKeyboardBuilder()
+    uid = m.from_user.id
+    kb_admin.button(text=f"✅ تفعيل { '1 أسبوع' if plan=='2w' else '4 أسابيع' }", callback_data=f"approve_inline:{uid}:{plan}")
+    kb_admin.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
+    kb_admin.button(text="👤 مراسلة المستخدم", url=f"tg://user?id={uid}")
+    kb_admin.adjust(1)
+
+    await send_admins(
+        "🧾 <b>طلب تفعيل (تحويل يدوي)</b>\n"
+        f"المستخدم: @{m.from_user.username or m.from_user.full_name} (ID: <code>{uid}</code>)\n"
+        f"الخطة: <b>{'1w' if plan=='2w' else '4w'}</b> – السعر: <b>{price}$</b>\n"
+        f"الهاش: <code>{_h(tx_hash)}</code>",
+        reply_markup=kb_admin.as_markup()
+    )
+
+    await m.answer(
+        "✅ تم استلام طلبك، سيتم التفعيل بعد مراجعة الأدمن.\n"
+        "إن احتجت مساعدة راسل الأدمن من الزر بالأسفل.",
+        parse_mode="HTML",
+        reply_markup=support_dm_kb() if (SUPPORT_USERNAME or SUPPORT_CHAT_ID) else None
+    )
 
 # === Admin Approvals (inline) ===
 
@@ -1504,7 +1587,7 @@ async def cb_approve_inline(q: CallbackQuery):
                     logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
 
         await q.message.answer(
-            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>.\n"
+            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{'1w' if plan=='2w' else plan}</b>.\n"
             f"صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>"
             f"{_bonus_applied_text(bonus_applied)}",
             parse_mode="HTML",
@@ -1559,13 +1642,25 @@ async def cmd_help(m: Message):
         "🤖 <b>أوامر المستخدم</b>\n"
         "• <code>/start</code> – البداية والقائمة الرئيسية\n"
         "• <code>/trial</code> – تجربة مجانية ليوم\n"
+        "• <code>/pricing</code> – عرض الأسعار الحالية\n"
         "• <code>/status</code> – حالة الاشتراك\n"
         "• <code>/ref</code> – رابط الإحالة وإحصاءاتك\n"
         "• <code>/use_ref CODE</code> – ربط كود إحالة يدويًا\n"
+        "• <code>/submit_tx HASH PLAN</code> – إرسال هاش التحويل (1w/4w)\n"
         "• (زر) 🔑 طلب اشتراك — لإرسال طلب للأدمن\n\n"
         "📞 <b>تواصل خاص مع الأدمن</b>:\n" + _contact_line()
     )
     await m.answer(txt, parse_mode="HTML")
+
+@dp.message(Command("pricing"))
+async def cmd_pricing(m: Message):
+    await m.answer(
+        f"💳 <b>الأسعار</b>\n"
+        f"• 1 أسبوع: <b>{PRICE_2_WEEKS_USD}$</b>\n"
+        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        "للتفعيل: اضغط زر «🔑 طلب اشتراك» من /start أو استخدم /submit_tx بعد التحويل.",
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
@@ -1583,18 +1678,27 @@ async def cmd_status(m: Message):
 async def cmd_admin_help(m: Message):
     if m.from_user.id not in ADMIN_USER_IDS:
         return
-    txt = (
-        "🛠️ <b>أوامر الأدمن</b>\n"
-        "• <code>/admin</code> – لوحة الأزرار\n"
-        "• <code>/approve &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code>\n"
-        "• <code>/activate &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code>\n"
-        "• <code>/broadcast &lt;text&gt;</code> – رسالة جماعية\n"
-        "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
-        "• <code>/gift1d &lt;user_id&gt;</code> – تفعيل يوم مجاني فوري\n"
-        "• <code>/refstats &lt;user_id&gt;</code> – إحصاءات الإحالة للمستخدم\n"
-        "• <code>/debug_sig SYMBOL</code> – فحص فوري لرمز وإظهار سبب عدم الإشارة\n"
-        "• <code>/relax_status</code> – حالة Auto-Relax ومنذ آخر إشارة\n"
-    )
+    if ADMIN_MINIMAL:
+        txt = (
+            "🛠️ <b>أوامر الأدمن (مختصرة)</b>\n"
+            "• <code>/admin</code> – لوحة التفعيل السريعة\n"
+            "• <code>/approve &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [ref]</code>\n"
+            "• <code>/activate &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [ref]</code>\n"
+            "• <code>/force_report</code> – إرسال التقرير اليومي الآن\n"
+        )
+    else:
+        txt = (
+            "🛠️ <b>أوامر الأدمن (كاملة)</b>\n"
+            "• <code>/admin</code> – لوحة الأزرار\n"
+            "• <code>/approve &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code>\n"
+            "• <code>/activate &lt;user_id&gt; &lt;2w|4w|gift1d&gt; [reference]</code>\n"
+            "• <code>/broadcast &lt;text&gt;</code>\n"
+            "• <code>/force_report</code>\n"
+            "• <code>/gift1d &lt;user_id&gt;</code>\n"
+            "• <code>/refstats &lt;user_id&gt;</code>\n"
+            "• <code>/debug_sig SYMBOL</code>\n"
+            "• <code>/relax_status</code>\n"
+        )
     await m.answer(txt, parse_mode="HTML")
 
 @dp.message(Command("admin"))
@@ -1613,6 +1717,9 @@ async def cb_admin_help_btn(q: CallbackQuery):
         return await q.answer()
     await cmd_admin_help(q.message)
     await q.answer()
+
+ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
+
 @dp.callback_query(F.data == "admin_manual")
 async def cb_admin_manual(q: CallbackQuery):
     aid = q.from_user.id
@@ -1621,8 +1728,6 @@ async def cb_admin_manual(q: CallbackQuery):
     ADMIN_FLOW[aid] = {"stage": "await_user"}
     await q.message.answer("أرسل الآن <code>user_id</code> للمستخدم الذي تريد تفعيله:", parse_mode="HTML")
     await q.answer()
-
-ADMIN_FLOW: Dict[int, Dict[str, Any]] = {}
 
 # ⬇️ NEW: إلغاء جلسة الأدمن
 @dp.callback_query(F.data == "admin_cancel")
@@ -1650,7 +1755,7 @@ async def admin_manual_router(m: Message):
             flow["uid"] = uid
             flow["stage"] = "await_plan"
             kb = InlineKeyboardBuilder()
-            kb.button(text="تفعيل 2 أسابيع (2w)", callback_data="admin_plan:2w")
+            kb.button(text="تفعيل 1 أسبوع (1w)", callback_data="admin_plan:2w")
             kb.button(text="تفعيل 4 أسابيع (4w)", callback_data="admin_plan:4w")
             kb.button(text="🎁 تفعيل يوم مجاني (gift1d)", callback_data="admin_plan:gift1d")
             kb.button(text="إلغاء", callback_data="admin_cancel")
@@ -1662,6 +1767,10 @@ async def admin_manual_router(m: Message):
             )
         except Exception:
             await m.answer("الرجاء إرسال رقم user_id صحيح (أرقام فقط).")
+        return
+
+    if stage == "await_plan":
+        # الحماية – يجب اختيار الخطة من الأزرار
         return
 
     if stage == "await_ref":
@@ -1688,7 +1797,7 @@ async def admin_manual_router(m: Message):
             ADMIN_FLOW.pop(aid, None)
             extra = f"{_bonus_applied_text(bonus_applied)}"
             await m.answer(
-                f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>.\n"
+                f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{'1w' if plan=='2w' else plan}</b>.\n"
                 f"صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>{extra}",
                 parse_mode="HTML",
             )
@@ -1696,7 +1805,7 @@ async def admin_manual_router(m: Message):
             try:
                 if invite:
                     title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
-                    msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if bonus_applied else "")
+                    msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if extra else "")
                     await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
                 else:
                     await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
@@ -1758,7 +1867,7 @@ async def cb_admin_skip_ref(q: CallbackQuery):
         ADMIN_FLOW.pop(aid, None)
         extra = f"{_bonus_applied_text(bonus_applied)}"
         await q.message.answer(
-            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{plan}</b>.\n"
+            f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{'1w' if plan=='2w' else plan}</b>.\n"
             f"صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>{extra}",
             parse_mode="HTML",
         )
@@ -1776,6 +1885,7 @@ async def cb_admin_skip_ref(q: CallbackQuery):
         ADMIN_FLOW.pop(aid, None)
         await q.message.answer(f"❌ فشل التفعيل: {e}")
     await q.answer("تم.")
+
 # ---- Admin debug helpers ----
 
 @dp.message(Command("debug_sig"))
@@ -1983,3 +2093,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
