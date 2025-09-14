@@ -579,7 +579,7 @@ def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> p
 # ----- Patch A (1/2): خفض نسبة الميديان من 0.15 → 0.12 -----
 def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
     """
-    رفعنا الافتراضي pct_of_median من 0.15 → 0.12 حتى لا تصير العتبة الديناميكية أكبر من اللازم في الأيام الهادية.
+    خفضنا الافتراضي pct_of_median من 0.15 → 0.12 لتجنب تضخيم العتبة في الأيام الهادئة.
     """
     try:
         x = qv_hist.dropna().tail(240)
@@ -592,9 +592,9 @@ def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_media
 # ----- Patch A (2/2): تسهيل بوابة السيولة + Relax -----
 def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bool, str]:
     """
-    - قلّلنا نافذة الفحص من 12 → 10 شموع.
-    - خفّضنا العتبة الديناميكية بالـRelax: (L1=-10%, L2=-20%).
-    - خفّفنا شرط أقل-بار من 5% → 3% من العتبة (ومحميّ بسقف سفلي 600$).
+    - نافذة فحص 10 شموع بدل 12.
+    - خفض العتبة الديناميكية بالـ Relax: (L1=-10%, L2=-20%).
+    - شرط أقل-بار 3% من العتبة مع أرضية 600$.
     """
     if len(qv_series) < win:
         return False, "qv_window_short"
@@ -610,9 +610,7 @@ def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bo
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    # 3% من العتبة مع أرضية 600$
     minbar_req = max(600.0, 0.03 * dyn_thr)
-
     ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
     return ok, f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
 
@@ -950,7 +948,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     else:                  min_t1_pct = 0.012
     min_t1_pct = max(min_t1_pct, thr.get("MIN_T1_ABOVE_ENTRY", 0.008))
 
-    t1, clamped = _clamp_t1_below_res(price, t_list[0], res_eff, buf_pct=0.0015)
+    t1, _ = _clamp_t1_below_res(price, t_list[0], res_eff, buf_pct=0.0015)
     t_list[0] = t1
     if (t_list[0] - price)/max(price,1e-9) < min_t1_pct:
         _log_reject(symbol, f"t1_entry_gap<{min_t1_pct:.3%}"); return None
@@ -1025,11 +1023,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "time":  MOTIVATION["time"].format(symbol=symbol),
     }
 
-    # عرض للمشترك
-    targets_display = {"mode": disp_mode, "values": list(targets_display_vals)}
-
     # ===== Probabilistic ETA لبلوغ T1 =====
-    # تقدير متوسط الحركة بالبار (سرعة) عبر ميديان |Δclose| لآخر 12 بار
     try:
         deltas = df["close"].diff().abs().tail(12).dropna()
         median_step = float(deltas.median()) if len(deltas) else max(1e-9, price*0.0008)
@@ -1037,12 +1031,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         median_step = max(1e-9, price*0.0008)
     gap_to_t1 = abs(t_list[0] - price)
     eta_bars = gap_to_t1 / max(median_step, 1e-9)
-    # خطّة: لا نطيل المهلة في سوق بطيء — نجعل الحد الأقصى أصغر قليلًا إذا ETA كبير
+
     base_max_bars = MAX_BARS_TO_TP1_BASE
     if atr_pct <= 0.008:   base_max_bars = 10
     elif atr_pct >= 0.020: base_max_bars = 6
     if setup in ("BRK","SWEEP"): base_max_bars = max(6, base_max_bars - 2)
-    # ضبط نهائي: نأخذ الأدنى بين السقف الأساسي و (ETA * 1.5) لضمان حسم أسرع عند البطء
     max_bars_to_tp1 = int(min(base_max_bars, math.ceil(eta_bars * 1.5)))
 
     # Partial ديناميكي
@@ -1137,31 +1130,18 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
         "profile": RISK_MODE,
         "strategy_code": setup,
-        "messages": {
-            "entry": MOTIVATION["entry"].format(symbol=symbol),
-            "tp1":   MOTIVATION["tp1"].format(symbol=symbol),
-            "tp2":   MOTIVATION["tp2"].format(symbol=symbol),
-            "tp3":   MOTIVATION["tp3"].format(symbol=symbol),
-            "tp4":   MOTIVATION["tpX"].format(symbol=symbol),
-            "tp5":   MOTIVATION["tpX"].format(symbol=symbol),
-            "sl":    MOTIVATION["sl"].format(symbol=symbol),
-            "time":  MOTIVATION["time"].format(symbol=symbol),
-        },
-
-        "stop_rule": {
-            "type": "breakeven_after",
-            "at_idx": 0,
-            "meta": {
-                "intended": "htf_close_below",
-                "tf": os.getenv("STOP_RULE_TF", "H4").upper(),
-                "htf_level": round(_protect_sl_with_swing(df, price, atr), 6)
-            }
-        },
+        "messages": messages,
+        "stop_rule": stop_rule,
 
         "timestamp": datetime.utcnow().isoformat()
     }
 
 # ========= لوج رفضات =========
 def _log_reject(symbol: str, msg: str):
+    """سجل رفض إشارة لأغراض التتبع/الديباغ."""
     if LOG_REJECTS:
         print(f"[strategy][reject] {symbol}: {msg}")
+
+# ملاحظة:
+# أغلب الرفضات تأتي من بوابة السيولة (_qv_gate) واصطفاف VWAP/AVWAP وقياس RVOL في الهدوء.
+# تحسينات Patch A/B/C الموجودة أعلاه تعالج معظم الضجيج بدون المساس بحراس المخاطر.
