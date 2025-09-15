@@ -10,7 +10,7 @@ Balanced+ v3.2 — إشارات أدق + ATR متكيّف بالـ quantiles + �
 - خفض RSI_EXHAUSTION إلى 76.0.
 - Patch A: بوابة السيولة أسهل (نافذة 10/شموع + عتبة ديناميكية أخف + حد أدنى للشمعة).
 - Patch B: تسامح خفيف مع Spike (z20) محسوب بالـ ATR.
-- Patch C: تعزيز طفيف لـ RVOL_MIN عند قوة Breadth.
+- Patch C: تعزيز طفيف لـ SCORE_MIN عند قوة Breadth (مع ضبط RVOL أدناه).
 - محوّل انتقائية تلقائي (DSC): يبدّل بين "ناعمة/متوسطة/صارمة" وفق حالة السوق وهدف عدد الإشارات.
 
 ENV (اختياري):
@@ -680,6 +680,8 @@ def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bo
 
     return ok, reason
 
+def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040) -> float:
+    return min(cap, max(base_low, 0.60 * atr_pct))
 
 # ========= MTF =========
 def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
@@ -787,6 +789,15 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
+    # تعديل RVOL حسب breadth/relax (Patch D)
+    if breadth_pct is not None:
+        if breadth_pct >= 0.70:
+            thr["RVOL_MIN"] = max(0.75, float(thr.get("RVOL_MIN", 1.0)) - 0.08)
+        elif breadth_pct <= 0.35:
+            thr["RVOL_MIN"] = min(1.25, float(thr.get("RVOL_MIN", 1.0)) + 0.03)
+    if thr.get("RELAX_LEVEL", 0) >= 1:
+        thr["RVOL_MIN"] = max(0.72, float(thr.get("RVOL_MIN", 1.0)) - 0.03)
+
     # منع التكرار + Holdout
     _LAST_ENTRY_BAR_TS.setdefault("##", 0)
     if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts:
@@ -802,28 +813,28 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if not ok_qv:
         _log_reject(symbol, f"low_quote_vol ({qv_dbg})"); return None
 
-   # نطاق ATR ديناميكي (Patch B + Patch F)
-base_lo, base_hi = thr["ATR_BAND"]
-atr_pct_series = (df["atr"] / df["close"]).dropna()
-lo_dyn, hi_dyn = adapt_atr_band(atr_pct_series, (base_lo, base_hi))
+    # نطاق ATR ديناميكي (Patch B + Patch F)
+    base_lo, base_hi = thr["ATR_BAND"]
+    atr_pct_series = (df["atr"] / df["close"]).dropna()
+    lo_dyn, hi_dyn = adapt_atr_band(atr_pct_series, (base_lo, base_hi))
 
-# Patch F: توسعة طفيفة إذا كانت أُطر MTF موجودة لكن D1 غير مُرضي
-if mtf_has_frames and not d1_ok:
-    lo_dyn *= 0.95   # ↓ 5% للسقف السفلي
-    hi_dyn *= 1.07   # ↑ 7% للسقف العلوي
+    # Patch F: توسعة طفيفة إذا كانت أُطر MTF موجودة لكن D1 غير مُرضي
+    if mtf_has_frames and not d1_ok:
+        lo_dyn *= 0.95   # ↓ 5% للسقف السفلي
+        hi_dyn *= 1.07   # ↑ 7% للسقف العلوي
 
-# Patch B: هامش سماح على الحواف + تنفّس إضافي للـ majors
-eps_abs = 0.00015   # هامش مطلق ~15 bps من ATR%
-eps_rel = 0.04      # هامش نسبي 4%
-lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
-hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
+    # Patch B: هامش سماح على الحواف + تنفّس إضافي للـ majors
+    eps_abs = 0.00015   # هامش مطلق ~15 bps من ATR%
+    eps_rel = 0.04      # هامش نسبي 4%
+    lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
+    hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
 
-# majors (BTC/ETH ونحوها) يحصلون سقف أعلى قليلاً
-if (prof.get("class") or "").lower() == "major":
-    hi_eff *= 1.06
+    # majors (BTC/ETH ونحوها) يحصلون سقف أعلى قليلاً
+    if (prof.get("class") or "").lower() == "major":
+        hi_eff *= 1.06
 
-if not (lo_eff <= atr_pct <= hi_eff):
-    _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
+    if not (lo_eff <= atr_pct <= hi_eff):
+        _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
 
     # RVOL & Spike (Median-60 + Z20 متكيف)
     v_ma20 = float(closed.get("vol_ma20") or 0.0)
@@ -850,22 +861,11 @@ if not (lo_eff <= atr_pct <= hi_eff):
     except Exception:
         oi_sc = None
 
-    # Breadth adjust (Patch C)
-    try:
-        if USE_BREADTH_ADJUST and breadth_pct is not None:
-            if breadth_pct >= 0.65:
-                thr["SCORE_MIN"] = max(60, thr["SCORE_MIN"] - 4)
-                thr["RVOL_MIN"] = max(0.80, float(thr.get("RVOL_MIN", 1.0)) - 0.05)
-            elif breadth_pct <= 0.35:
-                thr["SCORE_MIN"] = min(86, thr["SCORE_MIN"] + 4)
-    except Exception:
-        pass
-
     # حارس سوق
     if not market_guard_ok(prof, feats):
         _log_reject(symbol, "market_guard_block"); return None
 
-    # --- اتجاه ناعم (2 من 3) + VWAP/AVWAP (Confluence 2/3) ---
+    # --- اتجاه ناعم (2 من 3) + VWAP/AVWAP (Confluence) ---
     vwap_now = float(df["vwap"].iloc[-2]) if USE_VWAP else price
     vw_tol = _vwap_tol_pct(atr_pct)
 
@@ -894,11 +894,31 @@ if not (lo_eff <= atr_pct <= hi_eff):
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
     av_ok_count = sum([1 for v in av_list if _above(v)])
     avwap_confluence_ok = (av_ok_count >= 2)
+    # Patch C: ليونة في الرينج — الاكتفاء بـ 1/3 مراسٍ
+    if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
+        avwap_confluence_ok = True
+
     above_vwap = (not USE_VWAP) or (price >= vwap_now * (1 - vw_tol))
     ema_align = two_of_three and above_vwap and avwap_confluence_ok
+    # ليونة إضافية في الرينج إذا اقترب من VWAP وكان فوق EMA21
+    if regime == "range" and not ema_align:
+        if (price > float(closed["ema21"])) and (price >= vwap_now * (1 - vw_tol * 1.3)) and avwap_confluence_ok:
+            ema_align = True
 
+    # شرط الإغلاق فوق الافتتاح مع استثناء pin-hammer أحمر (Patch E)
     if not (price > float(closed["open"])):
-        _log_reject(symbol, "close<=open"); return None
+        allow_red_pin = False
+        try:
+            h,l,o,c = float(closed["high"]), float(closed["low"]), float(closed["open"]), float(closed["close"])
+            tr = max(h-l, 1e-9); body = abs(c-o); lower_wick = min(o,c) - l
+            upper_wick = h - max(o,c)
+            if (body/tr <= 0.25) and (lower_wick/tr >= 0.45) and ((c - l) / tr >= 0.55) and (upper_wick/tr <= 0.20):
+                allow_red_pin = True
+        except Exception:
+            allow_red_pin = False
+        if not allow_red_pin:
+            _log_reject(symbol, "close<=open"); return None
+
     if not ema_align:
         _log_reject(symbol, "ema/vwap/avwap_align_false"); return None
 
@@ -1041,10 +1061,10 @@ if not (lo_eff <= atr_pct <= hi_eff):
     R_val = max(price - sl, 1e-9)
     srdist_R = ((res_eff - price)/R_val) if (res_eff is not None and res_eff > price) else 10.0
 
-    # سكور شامل (+ Confluence AVWAP 2/3)
+    # سكور شامل (+ Confluence AVWAP)
     score, bd = score_signal(
         struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
-        thr["RVOL_MIN"], (lo_dyn, hi_dyn),
+        (thr["RVOL_MIN"]), (lo_dyn, hi_dyn),
         oi_trend=oi_sc, breadth_pct=breadth_pct,
         avwap_confluence=avwap_confluence_ok if USE_ANCHORED_VWAP else None,
         d1_ok=d1_ok
