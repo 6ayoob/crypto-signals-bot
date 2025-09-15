@@ -640,14 +640,19 @@ def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_media
 # ----- Patch A (2/2): تسهيل بوابة السيولة + Relax -----
 def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bool, str]:
     """
-    - نافذة فحص 10 شموع بدل 12.
-    - خفض العتبة الديناميكية بالـ Relax: (L1=-10%, L2=-20%).
-    - شرط أقل-بار 3% من العتبة مع أرضية 600$.
+    بوابة سيولة مرنة:
+    - نافذة 10 شموع.
+    - تخفيض ديناميكي للعتبة مع الـ Relax (L1=-10%, L2=-20%).
+    - minbar = 2.5% من العتبة مع أرضية 500$ (بدلاً من 3% و600$).
+    - سماح إذا كان الإجمالي قويًا: إن كان qv_sum ≥ 1.10 * dyn_thr، نسمح حتى 2 شموع دون الحد
+      بشرط ألا تنزل أي شمعة تحت 60% من minbar_req.
     """
     if len(qv_series) < win:
         return False, "qv_window_short"
+
     window = qv_series.tail(win)
 
+    # عتبة ديناميكية بناءً على الميديان التاريخي + Relax
     dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
     lvl = relax_level()
     if lvl == 1:
@@ -658,12 +663,23 @@ def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bo
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    minbar_req = max(600.0, 0.03 * dyn_thr)
-    ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
-    return ok, f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
+    # متطلبات أقل-بار (أرضية أخف ونسبة أخف)
+    minbar_req = max(500.0, 0.025 * dyn_thr)
 
-def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040) -> float:
-    return min(cap, max(base_low, 0.60 * atr_pct))
+    # منطق السماح المرن عند إجمالي قوي
+    below = int((window < minbar_req).sum())
+    soft_floor = 0.60 * minbar_req
+    too_low = int((window < soft_floor).sum())
+
+    if qv_sum >= 1.10 * dyn_thr and below <= 2 and too_low == 0:
+        ok = True
+        reason = f"sum={qv_sum:.0f}≥{1.10*dyn_thr:.0f} minbar_soft({below}<=2)"
+    else:
+        ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
+        reason = f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
+
+    return ok, reason
+
 
 # ========= MTF =========
 def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
@@ -786,11 +802,28 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if not ok_qv:
         _log_reject(symbol, f"low_quote_vol ({qv_dbg})"); return None
 
-    # نطاق ATR ديناميكي
-    base_lo, base_hi = thr["ATR_BAND"]
-    lo_dyn, hi_dyn = adapt_atr_band((df["atr"] / df["close"]).dropna(), (base_lo, base_hi))
-    if not (lo_dyn <= atr_pct <= hi_dyn):
-        _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_dyn:.4f},{hi_dyn:.4f}]"); return None
+   # نطاق ATR ديناميكي (Patch B + Patch F)
+base_lo, base_hi = thr["ATR_BAND"]
+atr_pct_series = (df["atr"] / df["close"]).dropna()
+lo_dyn, hi_dyn = adapt_atr_band(atr_pct_series, (base_lo, base_hi))
+
+# Patch F: توسعة طفيفة إذا كانت أُطر MTF موجودة لكن D1 غير مُرضي
+if mtf_has_frames and not d1_ok:
+    lo_dyn *= 0.95   # ↓ 5% للسقف السفلي
+    hi_dyn *= 1.07   # ↑ 7% للسقف العلوي
+
+# Patch B: هامش سماح على الحواف + تنفّس إضافي للـ majors
+eps_abs = 0.00015   # هامش مطلق ~15 bps من ATR%
+eps_rel = 0.04      # هامش نسبي 4%
+lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
+hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
+
+# majors (BTC/ETH ونحوها) يحصلون سقف أعلى قليلاً
+if (prof.get("class") or "").lower() == "major":
+    hi_eff *= 1.06
+
+if not (lo_eff <= atr_pct <= hi_eff):
+    _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
 
     # RVOL & Spike (Median-60 + Z20 متكيف)
     v_ma20 = float(closed.get("vol_ma20") or 0.0)
