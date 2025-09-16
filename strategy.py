@@ -2,28 +2,19 @@
 from __future__ import annotations
 """
 strategy.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
-Balanced+ v3.2 — إشارات أدق + ATR متكيّف بالـ quantiles + حارس سوق ذكي
+Balanced+ v3.2a — إشارات أدق + ATR متكيّف بالـ quantiles + حارس سوق ذكي + سموث Relax
 
-تحديث #1 (جاهز للإنتاج)
-- تقليص Auto-Relax إلى مرحلتين (6 و 12 ساعة) + العودة للوضع الطبيعي بعد صفقتين ناجحتين.
-- رفع BREADTH_MIN_RATIO إلى 0.60.
-- خفض RSI_EXHAUSTION إلى 76.0.
-- Patch A: بوابة السيولة أسهل (نافذة 10/شموع + عتبة ديناميكية أخف + حد أدنى للشمعة).
-- Patch B: تسامح خفيف مع Spike (z20) محسوب بالـ ATR.
-- Patch C: تعزيز طفيف لـ SCORE_MIN عند قوة Breadth (مع ضبط RVOL أدناه).
-- محوّل انتقائية تلقائي (DSC): يبدّل بين "ناعمة/متوسطة/صارمة" وفق حالة السوق وهدف عدد الإشارات.
-
-ENV (اختياري):
-  APP_DATA_DIR=/tmp/market-watchdog
-  STRATEGY_STATE_FILE=/tmp/market-watchdog/strategy_state.json
-  SYMBOLS_FILE=symbols_config.json  (أو symbols.csv)
-  RISK_MODE=conservative|balanced|aggressive
-  SELECTIVITY_MODE=auto|soft|balanced|strict
-  TARGET_SIGNALS_PER_DAY=2
-  BRK_HOUR_START=11  BRK_HOUR_END=23
-  MAX_POS_FUNDING_MAJ=0.00025  MAX_POS_FUNDING_ALT=0.00025
-  BREADTH_MIN_RATIO=0.60
-  MIN_BAR_QUOTE_VOL_USD=40000
+التحديثات المضافة:
+- Relax مستمر بعد 6→12 ساعة (RELAX_F∈[0..1]) مع حفظ الحالة والرجوع للوضع الطبيعي بعد صفقتين ناجحتين.
+- تنعيم Breadth (EMA) لتفادي الذبذبات.
+- تصنيف majors يعمل مع رموز تحوي "/" مثل BTC/USDT.
+- RVOL مقابل ميديان تاريخي يستثني الشمعة المقاسة.
+- سماحية VWAP متكيفة مع ATR بسقف أعلى للميجرز.
+- MTF يسمح (MACD>0 أو slope>0) لالتقاط بدايات الاتجاه.
+- Breakout hours فيها تسامح ±1 ساعة.
+- منع ازدواجية البار على نفس الرمز الأساسي (حتى مع suffix).
+- Debug block في نتيجة الإشارة.
+- بوابة سيولة مرنة تدعم low_vol_env في جلسات هادئة جدًا.
 """
 
 from datetime import datetime
@@ -110,9 +101,11 @@ def _load_state():
             s.setdefault("last_signal_ts", 0)
             s.setdefault("signals_day_date", "")
             s.setdefault("signals_today", 0)
+            s.setdefault("breadth_ema", None)
+            s.setdefault("relax_last_update_ts", 0)
             return s
     except Exception:
-        return {"last_signal_ts": 0, "relax_wins": 0, "signals_day_date": "", "signals_today": 0}
+        return {"last_signal_ts": 0, "relax_wins": 0, "signals_day_date": "", "signals_today": 0, "breadth_ema": None, "relax_last_update_ts": 0}
 
 def _save_state(s):
     try:
@@ -143,10 +136,27 @@ def hours_since_last_signal() -> float:
     return (_now() - int(ts)) / 3600.0
 
 def relax_level() -> int:
+    """يحفظ التوافق مع الكود القديم (0/1/2) لكن سنستخدم RELAX_F للقياس الناعم."""
     h = hours_since_last_signal()
     if h >= AUTO_RELAX_AFTER_HRS_2: return 2
     if h >= AUTO_RELAX_AFTER_HRS_1: return 1
     return 0
+
+# ===== Relax المستمر + تنعيم Breadth =====
+def _relax_factor_continuous(h: float, h_soft: float = 6.0, h_max: float = 12.0) -> float:
+    """f∈[0..1]: 0 قبل h_soft، ثم يرتفع خطيًا حتى 1 عند h_max."""
+    if h <= h_soft: return 0.0
+    if h >= h_max: return 1.0
+    return (h - h_soft) / max(h_max - h_soft, 1e-9)
+
+def _breadth_smoothed(b_now: Optional[float]) -> Optional[float]:
+    if b_now is None: return None
+    s = _load_state()
+    b_prev = s.get("breadth_ema", b_now)
+    b_ema = 0.7 * (b_prev if b_prev is not None else b_now) + 0.3 * b_now
+    s["breadth_ema"] = b_ema
+    _save_state(s)
+    return float(b_ema)
 
 # ========= محوّل الانتقائية (DSC) =========
 def _get_selectivity_mode(breadth_pct: Optional[float]) -> str:
@@ -176,21 +186,25 @@ def _apply_selectivity_mode(thr: dict, mode: str) -> dict:
     return out
 
 def apply_relax(base_cfg: dict, breadth_hint: Optional[float] = None) -> dict:
-    """إرخاء تدريجي عند الجفاف + دمج محوّل الانتقائية (DSC)."""
-    lvl = relax_level()
+    """Relax تدريجي مستمر + DSC."""
     out = dict(base_cfg)
-    if lvl >= 1: out["SCORE_MIN"] = max(0, out["SCORE_MIN"] - 4)
-    if lvl >= 2: out["SCORE_MIN"] = max(0, out["SCORE_MIN"] - 4)
-    if lvl >= 1: out["RVOL_MIN"] = max(0.90, out["RVOL_MIN"] - 0.05)
-    if lvl >= 2: out["RVOL_MIN"] = max(0.85, out["RVOL_MIN"] - 0.05)
-    lo, hi = out["ATR_BAND"]
-    if lvl >= 1: lo, hi = lo * 0.9,  hi * 1.1
-    if lvl >= 2: lo, hi = lo * 0.85, hi * 1.15
-    out["ATR_BAND"] = (max(1e-5, lo), max(hi, lo + 5e-5))
-    out["MIN_T1_ABOVE_ENTRY"] = 0.010 if lvl == 0 else (0.008 if lvl == 1 else 0.006)
-    out["HOLDOUT_BARS_EFF"] = max(1, base_cfg.get("HOLDOUT_BARS", 2) - lvl)
-    out["RELAX_LEVEL"] = lvl
-    mode = _get_selectivity_mode(breadth_hint)
+    h = hours_since_last_signal()
+    f = _relax_factor_continuous(h, AUTO_RELAX_AFTER_HRS_1, AUTO_RELAX_AFTER_HRS_2)  # f∈[0..1]
+
+    # تحريك ناعم للقيم
+    out["SCORE_MIN"] = max(0, base_cfg["SCORE_MIN"] - int(round(8 * f)))        # حتى -8
+    out["RVOL_MIN"]  = max(0.85, base_cfg["RVOL_MIN"] - 0.10 * f)               # حتى -0.10
+    lo, hi = base_cfg["ATR_BAND"]
+    out["ATR_BAND"] = (max(1e-5, lo*(1 - 0.15*f)), hi*(1 + 0.20*f))             # توسعة ناعمة
+    out["MIN_T1_ABOVE_ENTRY"] = 0.010 - 0.004 * f                                # 0.010→0.006
+    out["HOLDOUT_BARS_EFF"] = max(1, base_cfg.get("HOLDOUT_BARS", 2) - int(round(1*f)))
+
+    # احفظ معلومات
+    out["RELAX_LEVEL"] = 1 if f > 0 else 0
+    out["RELAX_F"] = f
+
+    # اختيار وضع الانتقائية بعد تنعيم breadth
+    mode = _get_selectivity_mode(_breadth_smoothed(breadth_hint))
     out = _apply_selectivity_mode(out, mode)
     return out
 
@@ -274,8 +288,9 @@ _load_symbols_file()
 
 def get_symbol_profile(symbol: str) -> dict:
     s = (symbol or "").upper()
-    prof = _SYMBOL_PROFILES.get(s, {}).copy()
-    cls = (prof.get("class") or ("major" if s in ("BTCUSDT","BTCUSD","ETHUSDT","ETHUSD") else "alt")).lower()
+    s_flat = "".join(ch for ch in s if ch.isalnum())  # BTC/USDT → BTCUSDT
+    prof = (_SYMBOL_PROFILES.get(s) or _SYMBOL_PROFILES.get(s_flat) or {}).copy()
+    cls = (prof.get("class") or ("major" if s_flat in ("BTCUSDT","BTCUSD","ETHUSDT","ETHUSD") else "alt")).lower()
     is_major = (cls == "major")
     if is_major:
         base = {
@@ -627,7 +642,7 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
 def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> pd.Series:
     return df["close"] * df["volume"] * float(contract_size)
 
-# ----- Patch A (1/2): خفض نسبة الميديان من 0.15 → 0.12 -----
+# ----- Patch A (1/2): خفض نسبة الميديان إلى 0.12 -----
 def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
     try:
         x = qv_hist.dropna().tail(240)
@@ -637,14 +652,14 @@ def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_media
     dyn = max(symbol_min_qv, pct_of_median * med) if med > 0 else symbol_min_qv
     return float(dyn)
 
-# ----- Patch A (2/2): تسهيل بوابة السيولة + Relax -----
-def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bool, str]:
+# ----- Patch A (2/2): بوابة سيولة تدعم low_vol_env -----
+def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10, low_vol_env: bool = False) -> tuple[bool, str]:
     """
     بوابة سيولة مرنة:
     - نافذة 10 شموع.
-    - تخفيض ديناميكي للعتبة مع الـ Relax (L1=-10%, L2=-20%).
-    - minbar = 2.5% من العتبة مع أرضية 500$ (بدلاً من 3% و600$).
-    - سماح إذا كان الإجمالي قويًا: إن كان qv_sum ≥ 1.10 * dyn_thr، نسمح حتى 2 شموع دون الحد
+    - تخفيض ديناميكي للعتبة مع الـ Relax (L1=-10%, L2=-20%) + تخفيف إضافي في low_vol_env (-5%).
+    - minbar = 2.5% من العتبة مع أرضية 500$.
+    - سماح إذا كان الإجمالي قويًا: إن كان qv_sum ≥ 1.10 * dyn_thr، يُسمح حتى 2 شموع دون الحد
       بشرط ألا تنزل أي شمعة تحت 60% من minbar_req.
     """
     if len(qv_series) < win:
@@ -652,21 +667,20 @@ def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bo
 
     window = qv_series.tail(win)
 
-    # عتبة ديناميكية بناءً على الميديان التاريخي + Relax
     dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
     lvl = relax_level()
     if lvl == 1:
         dyn_thr *= 0.90
     elif lvl >= 2:
         dyn_thr *= 0.80
+    if low_vol_env:
+        dyn_thr *= 0.95  # جلسة هادئة جدًا
 
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    # متطلبات أقل-بار (أرضية أخف ونسبة أخف)
     minbar_req = max(500.0, 0.025 * dyn_thr)
 
-    # منطق السماح المرن عند إجمالي قوي
     below = int((window < minbar_req).sum())
     soft_floor = 0.60 * minbar_req
     too_low = int((window < soft_floor).sum())
@@ -680,8 +694,9 @@ def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10) -> tuple[bo
 
     return ok, reason
 
-def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040) -> float:
-    return min(cap, max(base_low, 0.60 * atr_pct))
+def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040, is_major: bool = False) -> float:
+    cap_eff = 0.0050 if is_major else cap
+    return min(cap_eff, max(base_low, 0.60 * atr_pct))
 
 # ========= MTF =========
 def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
@@ -713,7 +728,8 @@ def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool, bool]:
     has = len(frames) > 0
     def _ok(dfh: pd.DataFrame) -> bool:
         c = dfh.iloc[-2]
-        return (float(c["close"]) > float(c["ema50"])) and (float(dfh["ema50"].diff(10).iloc[-2]) > 0) and (float(c["macd_hist"]) > 0)
+        macd_ok = (float(c["macd_hist"]) > 0) or (float(dfh["macd_hist"].diff(3).iloc[-2]) > 0)  # سماح slope>0
+        return (float(c["close"]) > float(c["ema50"])) and (float(dfh["ema50"].diff(10).iloc[-2]) > 0) and macd_ok
 
     h1_ok = _ok(frames["H1"]) if "H1" in frames else False
     h4_ok = _ok(frames["H4"]) if "H4" in frames else False
@@ -728,7 +744,6 @@ def extract_features(ohlcv_htf) -> Dict[str, object]:
         if isinstance(feats, dict):
             out.update(feats)
     return out
-
 # ========= المولّد الرئيسي =========
 def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = None) -> Optional[Dict]:
     if not ohlcv or len(ohlcv) < 80:
@@ -781,7 +796,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     except Exception:
         breadth_pct = None
 
-    # قواعد Relax + DSC
+    # قواعد Relax + DSC (مع تنعيم breadth داخليًا)
     base_cfg = dict(_cfg)
     base_cfg["ATR_BAND"] = (prof["atr_lo"], prof["atr_hi"])
     base_cfg["RVOL_MIN"] = max(base_cfg.get("RVOL_MIN", 1.0), float(prof["rvol_min"]))
@@ -789,61 +804,60 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
-    # تعديل RVOL حسب breadth/relax (Patch D)
+    # تعديل RVOL حسب breadth/relax
     if breadth_pct is not None:
         if breadth_pct >= 0.70:
             thr["RVOL_MIN"] = max(0.75, float(thr.get("RVOL_MIN", 1.0)) - 0.08)
         elif breadth_pct <= 0.35:
             thr["RVOL_MIN"] = min(1.25, float(thr.get("RVOL_MIN", 1.0)) + 0.03)
     if thr.get("RELAX_LEVEL", 0) >= 1:
-        thr["RVOL_MIN"] = max(0.72, float(thr.get("RVOL_MIN", 1.0)) - 0.03)
+        thr["RVOL_MIN"] = max(0.72, float(thr["RVOL_MIN"]) - 0.03)
 
-    # منع التكرار + Holdout
+    # منع التكرار + Holdout (على الرمز الأساسي)
     _LAST_ENTRY_BAR_TS.setdefault("##", 0)
+    base_sym = symbol.split("#")[0]
+    if _LAST_ENTRY_BAR_TS.get(base_sym) == cur_ts:
+        _log_reject(symbol, "duplicate_symbol_bar"); return None
     if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts:
         _log_reject(symbol, "duplicate_bar"); return None
     cur_idx = len(df) - 2
     if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < holdout_eff:
         _log_reject(symbol, f"holdout<{holdout_eff}"); return None
 
-    # سيولة — نافذة قصيرة + عتبة ديناميكية (Patch A: win=10)
+    # سيولة — نافذة قصيرة + عتبة ديناميكية (وتخفيف في جلسة منخفضة التقلب)
     contract_size = 1.0
     qv_series = _compute_quote_vol_series(df, contract_size=contract_size)
-    ok_qv, qv_dbg = _qv_gate(qv_series, float(prof["min_quote_vol"]), win=10)
+    low_vol_env = (atr_pct <= 0.006)
+    ok_qv, qv_dbg = _qv_gate(qv_series, float(prof["min_quote_vol"]), win=10, low_vol_env=low_vol_env)
     if not ok_qv:
         _log_reject(symbol, f"low_quote_vol ({qv_dbg})"); return None
 
-    # نطاق ATR ديناميكي (Patch B + Patch F)
+    # نطاق ATR ديناميكي
     base_lo, base_hi = thr["ATR_BAND"]
     atr_pct_series = (df["atr"] / df["close"]).dropna()
     lo_dyn, hi_dyn = adapt_atr_band(atr_pct_series, (base_lo, base_hi))
 
-    # Patch F: توسعة طفيفة إذا كانت أُطر MTF موجودة لكن D1 غير مُرضي
+    # توسعة طفيفة إذا كانت أُطر MTF موجودة لكن D1 غير مُرضي
     if mtf_has_frames and not d1_ok:
-        lo_dyn *= 0.95   # ↓ 5% للسقف السفلي
-        hi_dyn *= 1.07   # ↑ 7% للسقف العلوي
+        lo_dyn *= 0.95
+        hi_dyn *= 1.07
 
-    # Patch B: هامش سماح على الحواف + تنفّس إضافي للـ majors
-    eps_abs = 0.00015   # هامش مطلق ~15 bps من ATR%
-    eps_rel = 0.04      # هامش نسبي 4%
+    # هامش سماح على الحواف + سقف أعلى للميجرز
+    eps_abs = 0.00015
+    eps_rel = 0.04
     lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
     hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
-
-    # majors (BTC/ETH ونحوها) يحصلون سقف أعلى قليلاً
     if (prof.get("class") or "").lower() == "major":
         hi_eff *= 1.06
 
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
 
-    # RVOL & Spike (Median-60 + Z20 متكيف)
-    v_ma20 = float(closed.get("vol_ma20") or 0.0)
-    v_med60 = float(df["volume"].tail(60).median()) if len(df) >= 60 else v_ma20
-    base_vol = v_med60 if v_med60 > 0 else (v_ma20 if v_ma20 > 0 else 1e-9)
-    rvol = float(closed["volume"]) / base_vol
+    # RVOL & Spike (ميديان 60 تاريخي بدون الشمعة الحالية)
+    v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
+    base_vol = v_med60 if v_med60 > 0 else (float(closed.get("vol_ma20") or 1e-9))
+    rvol = float(closed["volume"]) / max(base_vol, 1e-9)
     z20 = float(df["vol_z20"].iloc[-2])
-
-    # Patch B: تساهل بسيط مع Z20 كسبايك
     spike_z = 1.2 - min(0.3, (atr_pct / 0.02) * 0.2)
     spike_ok = (z20 >= (spike_z - 0.15))
     if rvol < thr["RVOL_MIN"] and not spike_ok:
@@ -867,7 +881,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
     # --- اتجاه ناعم (2 من 3) + VWAP/AVWAP (Confluence) ---
     vwap_now = float(df["vwap"].iloc[-2]) if USE_VWAP else price
-    vw_tol = _vwap_tol_pct(atr_pct)
+    vw_tol = _vwap_tol_pct(atr_pct, is_major=(prof.get("class")=="major"))
 
     ema50_slope_pos = float(df["ema50"].diff(10).iloc[-2]) > 0
     macd_pos = float(df["macd_hist"].iloc[-2]) > 0
@@ -894,18 +908,18 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
     av_ok_count = sum([1 for v in av_list if _above(v)])
     avwap_confluence_ok = (av_ok_count >= 2)
-    # Patch C: ليونة في الرينج — الاكتفاء بـ 1/3 مراسٍ
-    if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
+    # ليونة في الرينج — الاكتفاء بـ 1/3 مراسٍ
+    if detect_regime(df) == "range" and not avwap_confluence_ok and av_ok_count >= 1:
         avwap_confluence_ok = True
 
     above_vwap = (not USE_VWAP) or (price >= vwap_now * (1 - vw_tol))
     ema_align = two_of_three and above_vwap and avwap_confluence_ok
     # ليونة إضافية في الرينج إذا اقترب من VWAP وكان فوق EMA21
-    if regime == "range" and not ema_align:
+    if detect_regime(df) == "range" and not ema_align:
         if (price > float(closed["ema21"])) and (price >= vwap_now * (1 - vw_tol * 1.3)) and avwap_confluence_ok:
             ema_align = True
 
-    # شرط الإغلاق فوق الافتتاح مع استثناء pin-hammer أحمر (Patch E)
+    # شرط الإغلاق فوق الافتتاح مع استثناء pin-hammer أحمر
     if not (price > float(closed["open"])):
         allow_red_pin = False
         try:
@@ -970,13 +984,15 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     trend_guard = (dist50_atr >= ema50_req) and (dist200_atr >= ema200_req)
     mixed_guard = (dist50_atr >= (0.15 if prof["class"]=="major" else 0.20))
 
-    # ساعات BRK
+    # ساعات BRK (+/- 1 ساعة تسامح)
     try:
         ts_sec = cur_ts/1000.0 if cur_ts > 1e12 else cur_ts
         hr_riyadh = (datetime.utcfromtimestamp(ts_sec).hour + 3) % 24
     except Exception:
         hr_riyadh = 12
     brk_in_session = (int(prof["brk_hour_start"]) <= hr_riyadh <= int(prof["brk_hour_end"]))
+    if not brk_in_session and (abs(hr_riyadh - int(prof["brk_hour_start"])) <= 1 or abs(hr_riyadh - int(prof["brk_hour_end"])) <= 1):
+        brk_in_session = True
 
     # اختيار الست-أب
     setup = None; struct_ok = False; reasons: List[str] = []
@@ -1094,8 +1110,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     elif score >= 76:    trail_mult = 1.2
     else:                trail_mult = 1.4
 
-    # حفظ آخر بار
+    # حفظ آخر بار (لكل من الرمز الكامل والأساسي)
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
+    _LAST_ENTRY_BAR_TS[base_sym] = cur_ts
     _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
     # أسباب/Confluence
@@ -1167,6 +1184,16 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
     mark_signal_now()
 
+    # ===== Debug pack =====
+    debug = {
+        "qv_gate": qv_dbg,
+        "atr_band_eff": {"lo": lo_eff, "hi": hi_eff, "atr_pct": atr_pct},
+        "vwap_tol": vw_tol,
+        "mtf": {"has": mtf_has_frames, "pass": mtf_pass, "d1_ok": d1_ok},
+        "relax": {"level": thr["RELAX_LEVEL"], "f": round(thr.get("RELAX_F", 0.0), 3)},
+        "breadth_hint": breadth_pct,
+    }
+
     return {
         "symbol": symbol,
         "side": "buy",
@@ -1220,6 +1247,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
                 "MAX_POS_FUNDING_EFF": prof["max_pos_funding"],
                 "GUARD_REFS": prof.get("guard_refs"),
                 "SELECTIVITY_MODE": thr.get("SELECTIVITY_MODE"),
+                "RELAX_F": thr.get("RELAX_F", 0.0),
             },
         },
 
@@ -1236,6 +1264,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "messages": messages,
         "stop_rule": stop_rule,
 
+        "debug": debug,
         "timestamp": datetime.utcnow().isoformat()
     }
 
