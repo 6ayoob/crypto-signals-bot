@@ -214,7 +214,6 @@ GIFT_ONE_DAY_HOURS = int(os.getenv("GIFT_ONE_DAY_HOURS", "24"))
 
 # Bot username cache
 _BOT_USERNAME: Optional[str] = os.getenv("BOT_USERNAME_OVERRIDE") or None
-
 # ===== Helpers =====
 
 def _h(s: str) -> str:
@@ -725,7 +724,6 @@ async def refresh_symbols_periodically():
         except Exception as e:
             logger.exception(f"[symbols] refresh failed: {e}")
         await asyncio.sleep(SYMBOLS_REFRESH_HOURS * 3600)
-
 # ---------------------------
 # Data fetchers
 # ---------------------------
@@ -1138,7 +1136,6 @@ async def monitor_open_trades():
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
-
 # ---------------------------
 # Membership housekeeping
 # ---------------------------
@@ -2093,4 +2090,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
