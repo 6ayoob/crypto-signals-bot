@@ -612,35 +612,37 @@ def on_trade_closed_update_risk(t: Trade, result: str, exit_price: float) -> flo
 # ---------------------------
 
 async def load_okx_markets_and_filter():
-    """يبني AVAILABLE_SYMBOLS من SYMBOLS مع تكييف :USDT لعقود السواب."""
+    """يبني AVAILABLE_SYMBOLS من SYMBOLS مع تكييف :USDT لعقود السواب، باستخدام لودر آمن."""
     global AVAILABLE_SYMBOLS
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, exchange.load_markets)
-        markets = set(exchange.markets.keys())
 
-        def adapt(sym: str, src: str | None = None) -> Optional[str]:
-            # src يمكن أن تكون "SPOT" أو "SWAP" من SYMBOLS_META لو توفرت
-            if sym in markets:
-                return sym
-            base_try = f"{sym}:USDT"
-            if (src == "SWAP" or src is None) and base_try in markets:
-                return base_try
-            no_colon = sym.replace(":USGT", "").replace(":USDT", "")
-            if no_colon in markets:
-                return no_colon
-            return None
+        # جرّب اللودر الآمن أولاً
+        markets = await loop.run_in_executor(None, safe_load_okx_markets, exchange, logger)
+        if not markets:
+            # fallback: حاول load_markets التقليدي (قد ينجح أحيانًا)
+            await loop.run_in_executor(None, exchange.load_markets)
+            markets = set(exchange.markets.keys())
 
         syms = list(SYMBOLS)
         meta = getattr(symbols_mod, "SYMBOLS_META", {}) or {}
+
         filtered, skipped = [], []
         for s in syms:
-            src = (meta.get(s) or {}).get("source")
-            m = adapt(s, src)
-            if m:
-                filtered.append(m)
+            src = (meta.get(s) or {}).get("source")  # "SPOT" أو "SWAP" إن وُجد
+            if src == "SPOT":
+                # فضّل السبوت كما هو، وإلا حاول بدون :USDT
+                m = s if s in markets else s.replace(":USDT", "")
+                if m and m in markets:
+                    filtered.append(m)
+                else:
+                    # محاولة أخيرة: السواب
+                    m2 = prefer_swap_symbol(s, markets)
+                    (filtered if m2 else skipped).append(m2 or s)
             else:
-                skipped.append(s)
+                # افتراض SWAP/غير محدد → فضّل السواب USDT ثم البدائل
+                m = prefer_swap_symbol(s, markets)
+                (filtered if m else skipped).append(m or s)
 
         async with AVAILABLE_SYMBOLS_LOCK:
             AVAILABLE_SYMBOLS = filtered
@@ -654,7 +656,8 @@ async def load_okx_markets_and_filter():
 
 async def rebuild_available_symbols(new_symbols: List[str] | Tuple[List[str], Dict[str, dict]]):
     """
-    يقبل list أو (list, meta). يكيّف الترميز لعقود السواب (:USDT) قبل الفلترة.
+    يقبل list أو (list, meta). يكيّف الترميز لعقود السواب (:USDT) قبل الفلترة،
+    ويستخدم لودر أسواق آمن يحمي من عناصر OKX المعطوبة.
     """
     global AVAILABLE_SYMBOLS
     try:
@@ -664,66 +667,62 @@ async def rebuild_available_symbols(new_symbols: List[str] | Tuple[List[str], Di
         else:
             raw_list = _ensure_symbols_list(new_symbols)
 
-        # حماية: لو القائمة الواردة فارغة — لا نلمس الحالية
         if not raw_list:
             logger.warning("rebuild_available_symbols: incoming list is EMPTY — skipped (keeping previous).")
             return
 
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, exchange.load_markets)
-        markets = set(exchange.markets.keys())
-
-        def adapt(sym: str) -> Optional[str]:
-            if sym in markets:
-                return sym
-            src = (meta.get(sym) or {}).get("source")
-            cand = f"{sym}:USDT"
-            if (src == "SWAP" or src is None) and cand in markets:
-                return cand
-            no_colon = sym.replace(":USDT", "")
-            if no_colon in markets:
-                return no_colon
-            return None
+        markets = await loop.run_in_executor(None, safe_load_okx_markets, exchange, logger)
+        if not markets:
+            await loop.run_in_executor(None, exchange.load_markets)
+            markets = set(exchange.markets.keys())
 
         filtered, skipped = [], []
         for s in raw_list:
-            a = adapt(s)
-            (filtered if a else skipped).append(a or s)
+            src = (meta.get(s) or {}).get("source")
+            if src == "SPOT":
+                m = s if s in markets else s.replace(":USDT", "")
+                if m and m in markets:
+                    filtered.append(m)
+                else:
+                    m2 = prefer_swap_symbol(s, markets)
+                    (filtered if m2 else skipped).append(m2 or s)
+            else:
+                m = prefer_swap_symbol(s, markets)
+                (filtered if m else skipped).append(m or s)
 
-        # حماية: لو الناتج الفِلْتَري فارغ — لا نلمس الحالية
         if not filtered:
             logger.warning("rebuild_available_symbols: FILTERED result is EMPTY — skipped (keeping previous).")
             return
 
         async with AVAILABLE_SYMBOLS_LOCK:
             AVAILABLE_SYMBOLS = filtered
-        logger.info(f"✅ symbols reloaded: {len(filtered)} symbols. Skipped {len(skipped)}.")
+        logger.info(f"✅ symbols reloaded: {len(filtered)} symbols. Skipped {len(skipped)}. First 10: {filtered[:10]}")
     except Exception as e:
         logger.exception(f"❌ rebuild_available_symbols error: {e}")
+
 
 async def refresh_symbols_periodically():
     """
     يعيد توليد الرموز من symbols.py كل SYMBOLS_REFRESH_HOURS ثم يعيد بناء AVAILABLE_SYMBOLS.
     يستفيد من (list, meta) العائدة من _prepare_symbols().
     """
-    # تأخير أولي لتجنّب الكتابة فوق قائمة الإقلاع الصحيحة لو أول تحديث رجع فارغ
     init_delay = int(os.getenv("SYMBOLS_INIT_DELAY_SEC", "60"))
     if init_delay > 0:
         await asyncio.sleep(init_delay)
 
     while True:
         try:
-            # _prepare_symbols في symbols.py تُرجع (list, meta)
             fresh_list, fresh_meta = symbols_mod._prepare_symbols()
             if not fresh_list:
                 logger.warning("[symbols] refresh returned EMPTY — keeping previous AVAILABLE_SYMBOLS.")
             else:
                 await rebuild_available_symbols((fresh_list, fresh_meta))
-                sample = ", ".join(fresh_list[:10])
-                logger.info(f"[symbols] refreshed → {len(fresh_list)} | first 10: {sample}")
+                logger.info(f"[symbols] refreshed → {len(fresh_list)} | first 10: {', '.join(fresh_list[:10])}")
         except Exception as e:
             logger.exception(f"[symbols] refresh failed: {e}")
         await asyncio.sleep(SYMBOLS_REFRESH_HOURS * 3600)
+
 # ---------------------------
 # Data fetchers
 # ---------------------------
