@@ -2,35 +2,22 @@
 from __future__ import annotations
 """
 strategy.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
-Balanced+ v3.2a — إشارات أدق + ATR متكيّف بالـ quantiles + حارس سوق ذكي + سموث Relax
-
-التحديثات المضافة:
-- Relax مستمر بعد 6→12 ساعة (RELAX_F∈[0..1]) مع حفظ الحالة والرجوع للوضع الطبيعي بعد صفقتين ناجحتين.
-- تنعيم Breadth (EMA) لتفادي الذبذبات.
-- تصنيف majors يعمل مع رموز تحوي "/" مثل BTC/USDT.
-- RVOL مقابل ميديان تاريخي يستثني الشمعة المقاسة.
-- سماحية VWAP متكيفة مع ATR بسقف أعلى للميجرز.
-- MTF يسمح (MACD>0 أو slope>0) لالتقاط بدايات الاتجاه.
-- Breakout hours فيها تسامح ±1 ساعة.
-- منع ازدواجية البار على نفس الرمز الأساسي (حتى مع suffix).
-- Debug block في نتيجة الإشارة.
-- بوابة سيولة مرنة تدعم low_vol_env في جلسات هادئة جدًا.
+Balanced+ v3.3 — نسخة محدثة مع تحسينات عملية
 """
 
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from statistics import median
 import os, json, math, time, csv
 import pandas as pd
 import numpy as np
 
-# ========= مسارات قابلة للكتابة =========
+# ========= مسارات =========
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = os.getenv("STRATEGY_STATE_FILE", str(APP_DATA_DIR / "strategy_state.json"))
 
-# ========= أساسيات =========
+# ========= إعدادات عامة =========
 VOL_MA = 20
 ATR_PERIOD = 14
 EMA_FAST, EMA_SLOW, EMA_TREND, EMA_LONG = 9, 21, 50, 200
@@ -43,7 +30,6 @@ RISK_PROFILES = {
 }
 _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 
-# محوّل الانتقائية (DSC)
 SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "auto").lower()  # soft|balanced|strict|auto
 TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "2"))
 
@@ -54,7 +40,6 @@ USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 3
 MAX_BRK_DIST_ATR, BREAKOUT_BUFFER = 0.90, 0.0015
 RSI_EXHAUSTION, DIST_EMA50_EXHAUST_ATR = 76.0, 2.8
 
-# أهداف / دخول
 TRAIL_AFTER_TP2 = True
 USE_MAX_BARS_TO_TP1, MAX_BARS_TO_TP1_BASE = True, 8
 ENTRY_ZONE_WIDTH_R, ENTRY_MIN_PCT, ENTRY_MAX_R = 0.25, 0.005, 0.60
@@ -64,18 +49,15 @@ TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)
 ATR_MULT_RANGE = (1.5, 2.5, 3.5, 4.5, 6.0)
 ATR_MULT_VBR   = (0.0, 0.6, 1.2, 1.8, 2.4)
 
-# S/R & Fib
 USE_SR, SR_WINDOW = True, 40
 RES_BLOCK_NEAR, SUP_BLOCK_NEAR = 0.004, 0.003
 USE_FIB, SWING_LOOKBACK, FIB_TOL = True, 60, 0.004
 
-# حالة و Relax
 LOG_REJECTS = os.getenv("STRATEGY_LOG_REJECTS", "1").strip().lower() in ("1","true","yes","on")
 AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "6"))
 AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "12"))
 BREADTH_MIN_RATIO = float(os.getenv("BREADTH_MIN_RATIO", "0.60"))
 
-# رسائل
 MOTIVATION = {
     "entry": "🔥 دخول {symbol}! خطة أهداف على R — فلنلتزم 👊",
     "tp1":   "🎯 T1 تحقق على {symbol}! انقل SL للتعادل — استمر ✨",
@@ -86,12 +68,11 @@ MOTIVATION = {
     "time":  "⌛ خروج زمني على {symbol} — الحركة لم تتفعّل سريعًا، خرجنا بخفّة 🔎",
 }
 
-# تتبعات
 _LAST_ENTRY_BAR_TS: Dict[str, int] = {}
 _LAST_SIGNAL_BAR_IDX: Dict[str, int] = {}
-
-# ========== أدوات عامة ==========
-def _now() -> int: return int(time.time())
+# ========= أدوات الحالة (State) =========
+def _now() -> int:
+    return int(time.time())
 
 def _load_state():
     try:
@@ -105,9 +86,13 @@ def _load_state():
             s.setdefault("relax_last_update_ts", 0)
             return s
     except Exception:
-        return {"last_signal_ts": 0, "relax_wins": 0, "signals_day_date": "", "signals_today": 0, "breadth_ema": None, "relax_last_update_ts": 0}
+        return {
+            "last_signal_ts": 0, "relax_wins": 0,
+            "signals_day_date": "", "signals_today": 0,
+            "breadth_ema": None, "relax_last_update_ts": 0
+        }
 
-def _save_state(s):
+def _save_state(s: dict):
     try:
         Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
         with open(STATE_FILE, "w") as f:
@@ -136,7 +121,7 @@ def hours_since_last_signal() -> float:
     return (_now() - int(ts)) / 3600.0
 
 def relax_level() -> int:
-    """يحفظ التوافق مع الكود القديم (0/1/2) لكن سنستخدم RELAX_F للقياس الناعم."""
+    """Keep legacy (0/1/2) while we also use continuous factor."""
     h = hours_since_last_signal()
     if h >= AUTO_RELAX_AFTER_HRS_2: return 2
     if h >= AUTO_RELAX_AFTER_HRS_1: return 1
@@ -191,7 +176,6 @@ def apply_relax(base_cfg: dict, breadth_hint: Optional[float] = None) -> dict:
     h = hours_since_last_signal()
     f = _relax_factor_continuous(h, AUTO_RELAX_AFTER_HRS_1, AUTO_RELAX_AFTER_HRS_2)  # f∈[0..1]
 
-    # تحريك ناعم للقيم
     out["SCORE_MIN"] = max(0, base_cfg["SCORE_MIN"] - int(round(8 * f)))        # حتى -8
     out["RVOL_MIN"]  = max(0.85, base_cfg["RVOL_MIN"] - 0.10 * f)               # حتى -0.10
     lo, hi = base_cfg["ATR_BAND"]
@@ -199,11 +183,9 @@ def apply_relax(base_cfg: dict, breadth_hint: Optional[float] = None) -> dict:
     out["MIN_T1_ABOVE_ENTRY"] = 0.010 - 0.004 * f                                # 0.010→0.006
     out["HOLDOUT_BARS_EFF"] = max(1, base_cfg.get("HOLDOUT_BARS", 2) - int(round(1*f)))
 
-    # احفظ معلومات
     out["RELAX_LEVEL"] = 1 if f > 0 else 0
     out["RELAX_F"] = f
 
-    # اختيار وضع الانتقائية بعد تنعيم breadth
     mode = _get_selectivity_mode(_breadth_smoothed(breadth_hint))
     out = _apply_selectivity_mode(out, mode)
     return out
@@ -319,13 +301,14 @@ def get_symbol_profile(symbol: str) -> dict:
         except Exception: pass
     return base
 
-# ========= مؤشرات =========
+# ========= مؤشرات فنية =========
 def _trim(df: pd.DataFrame, n: int = 240) -> pd.DataFrame:
     return df.tail(n).copy()
 
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
+def ema(series: pd.Series, period: int):
+    return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series, period=14):
+def rsi(series: pd.Series, period=14):
     d = series.diff()
     gain = d.where(d > 0, 0.0); loss = -d.where(d < 0, 0.0)
     ag = gain.ewm(alpha=1/period, adjust=False).mean()
@@ -333,7 +316,7 @@ def rsi(series, period=14):
     rs = ag / al
     return 100 - (100 / (1 + rs))
 
-def macd_cols(df, fast=12, slow=26, signal=9):
+def macd_cols(df: pd.DataFrame, fast=12, slow=26, signal=9):
     df["ema_fast"] = ema(df["close"], fast)
     df["ema_slow"] = ema(df["close"], slow)
     df["macd"] = df["ema_fast"] - df["ema_slow"]
@@ -341,7 +324,7 @@ def macd_cols(df, fast=12, slow=26, signal=9):
     df["macd_hist"] = df["macd"] - df["macd_signal"]
     return df
 
-def atr_series(df, period=14):
+def atr_series(df: pd.DataFrame, period=ATR_PERIOD):
     c = df["close"].shift(1)
     tr = pd.concat([(df["high"]-df["low"]).abs(), (df["high"]-c).abs(), (df["low"]-c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
@@ -361,7 +344,7 @@ def is_nrN(series_high: pd.Series, series_low: pd.Series, N: int = 7) -> pd.Seri
     rng = (series_high - series_low).abs()
     return rng == rng.rolling(N).min()
 
-def add_indicators(df):
+def add_indicators(df: pd.DataFrame):
     df["ema9"]   = ema(df["close"], EMA_FAST)
     df["ema21"]  = ema(df["close"], EMA_SLOW)
     df["ema50"]  = ema(df["close"], EMA_TREND)
@@ -377,14 +360,14 @@ def add_indicators(df):
     return df
 
 # ========= S/R & FIB =========
-def get_sr_on_closed(df, window=40) -> Tuple[Optional[float], Optional[float]]:
+def get_sr_on_closed(df: pd.DataFrame, window=SR_WINDOW) -> Tuple[Optional[float], Optional[float]]:
     if len(df) < window + 3: return None, None
     hi = float(df.iloc[-(window+1):-1]["high"].max())
     lo = float(df.iloc[-(window+1):-1]["low"].min())
     if not math.isfinite(hi) or not math.isfinite(lo): return None, None
     return float(lo), float(hi)
 
-def recent_swing(df, lookback=60) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]:
+def recent_swing(df: pd.DataFrame, lookback=SWING_LOOKBACK) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]:
     if len(df) < lookback + 5: return None, None, None, None
     seg = df.iloc[-(lookback+1):-1]
     hhv = seg["high"].max(); llv = seg["low"].min()
@@ -438,40 +421,104 @@ def avwap_from_index(df: pd.DataFrame, idx: int) -> Optional[float]:
     v = numer / denom
     return float(v.iloc[-2]) if len(v) >= 2 and math.isfinite(v.iloc[-2]) else None
 
+# ========= Helpers =========
+def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> pd.Series:
+    return df["close"] * df["volume"] * float(contract_size)
+
+def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
+    """Median-based dynamic threshold with floor at symbol_min_qv."""
+    try:
+        x = qv_hist.dropna().tail(240)
+        med = float(x.median()) if len(x) else 0.0
+    except Exception:
+        med = 0.0
+    dyn = max(symbol_min_qv, pct_of_median * med) if med > 0 else symbol_min_qv
+    return float(dyn)
+
+def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040, is_major: bool = False) -> float:
+    cap_eff = 0.0050 if is_major else cap
+    return min(cap_eff, max(base_low, 0.60 * atr_pct))
+
+# ===== بوابة السيولة المرنة (ديناميكية) =====
+def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10, low_vol_env: bool = False, is_major: bool = False, hr_riyadh: int | None = None) -> tuple[bool, str]:
+    """
+    - نافذة ديناميكية حسب الساعة (ليل الرياض 1..8 ⇒ نافذة أطول).
+    - تخفيض ديناميكي للعتبة مع Relax (L1=-10%, L2=-20%) + تخفيف إضافي في low_vol_env (-5%).
+    - للآلتكوينز فقط: خفض ليلي إضافي -10% بين 01:00 و08:00.
+    - minbar = 2.0% من العتبة مع أرضية 700$.
+    - سماح إذا كان الإجمالي قويًا: إن كان qv_sum ≥ 1.10 * dyn_thr، يُسمح حتى 2 شموع دون الحد
+      بشرط ألا تنزل أي شمعة تحت 60% من minbar_req.
+    """
+    if len(qv_series) < win:
+        return False, "qv_window_short"
+
+    # نافذة ديناميكية خارج ساعات الذروة
+    if hr_riyadh is not None:
+        if 1 <= hr_riyadh <= 8:   # جلسة ليلية
+            win = max(win, 12)
+        elif 9 <= hr_riyadh <= 12:
+            win = max(win, 11)
+
+    window = qv_series.tail(win)
+
+    dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
+    lvl = relax_level()
+    if lvl == 1: dyn_thr *= 0.90
+    elif lvl >= 2: dyn_thr *= 0.80
+    if low_vol_env: dyn_thr *= 0.95
+
+    # تخفيض ليلي إضافي للـalts فقط
+    if (not is_major) and hr_riyadh is not None and 1 <= hr_riyadh <= 8:
+        dyn_thr *= 0.90
+
+    qv_sum = float(window.sum())
+    qv_min = float(window.min())
+
+    minbar_req = max(700.0, 0.020 * dyn_thr)  # كان 0.025 وأرضية 500
+    below = int((window < minbar_req).sum())
+    soft_floor = 0.60 * minbar_req
+    too_low = int((window < soft_floor).sum())
+
+    if qv_sum >= 1.10 * dyn_thr and below <= 2 and too_low == 0:
+        return True, f"sum={qv_sum:.0f}≥{1.10*dyn_thr:.0f} minbar_soft({below}<=2)"
+
+    ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
+    return ok, f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
 # ========= نظام السوق =========
-def detect_regime(df) -> str:
+def detect_regime(df: pd.DataFrame) -> str:
     c = df["close"]; e50 = df["ema50"]
     up = (c.iloc[-1] > e50.iloc[-1]) and (e50.diff(10).iloc[-1] > 0)
-    if up: return "trend"
+    if up:
+        return "trend"
     seg = df.iloc[-80:]
     width = (seg["high"].max() - seg["low"].min()) / max(seg["close"].iloc[-1], 1e-9)
     atrp = float(seg["atr"].iloc[-2]) / max(seg["close"].iloc[-2], 1e-9)
     return "range" if width <= 6 * atrp else "mixed"
 
 # ========= برايس أكشن =========
-def candle_quality(row, rvol_hint: float | None = None) -> bool:
+def candle_quality(row: pd.Series, rvol_hint: float | None = None) -> bool:
     o = float(row["open"]); c = float(row["close"]); h = float(row["high"]); l = float(row["low"])
     tr = max(h - l, 1e-9); body = abs(c - o); upper_wick = h - max(c, o)
     body_pct = body / tr; upwick_pct = upper_wick / tr
     min_body = 0.55 if (rvol_hint is None or rvol_hint < 1.3) else 0.45
     return (c > o) and (body_pct >= min_body) and (upwick_pct <= 0.35)
 
-def is_bull_engulf(prev, cur) -> bool:
+def is_bull_engulf(prev: pd.Series, cur: pd.Series) -> bool:
     return (float(cur["close"]) > float(cur["open"]) and
             float(prev["close"]) < float(prev["open"]) and
             (float(cur["close"]) - float(cur["open"])) > (abs(float(prev["close"]) - float(prev["open"])) * 0.9) and
             float(cur["close"]) >= float(prev["open"]))
 
-def is_hammer(cur) -> bool:
+def is_hammer(cur: pd.Series) -> bool:
     h = float(cur["high"]); l = float(cur["low"]); o = float(cur["open"]); c = float(cur["close"])
     tr = max(h - l, 1e-9); body = abs(c - o); lower_wick = min(o, c) - l
     return (c > o) and (lower_wick / tr >= 0.5) and (body / tr <= 0.35) and ((h - max(o, c)) / tr <= 0.15)
 
-def is_inside_break(pprev, prev, cur) -> bool:
+def is_inside_break(pprev: pd.Series, prev: pd.Series, cur: pd.Series) -> bool:
     cond_inside = (float(prev["high"]) <= float(pprev["high"]) and float(prev["low"]) >= float(pprev["low"]))
     return cond_inside and (float(cur["high"]) > float(prev["high"])) and (float(cur["close"]) > float(prev["high"]))
 
-def swept_liquidity(prev, cur) -> bool:
+def swept_liquidity(prev: pd.Series, cur: pd.Series) -> bool:
     return (float(cur["low"]) < float(prev["low"]) and (float(cur["close"]) > float(prev["close"])) )
 
 def near_level(price: float, level: Optional[float], tol: float) -> bool:
@@ -505,30 +552,7 @@ def adapt_atr_band(atr_pct_series: pd.Series, base_band: Tuple[float, float]) ->
     hi = q_hi * (1 + expand)
     return (max(1e-5, lo), max(hi, lo + 5e-5))
 
-# ========= بناء الأهداف/الوقف =========
-def _build_targets_r(entry: float, sl: float, tp_r: Tuple[float, ...]) -> List[float]:
-    R = max(entry - sl, 1e-9)
-    return [entry + r*R for r in tp_r]
-
-def _build_targets_pct_from_atr(price: float, atr: float, multipliers: Tuple[float, ...]) -> Tuple[List[float], Tuple[float,...]]:
-    pcts = [max(atr / max(price, 1e-9) * m, 0.002) for m in multipliers]
-    return [price * (1 + p) for p in pcts], tuple(pcts)
-
-def _clamp_t1_below_res(entry: float, t1: float, res: Optional[float], buf_pct: float = 0.0015) -> Tuple[float, bool]:
-    if res is None: return t1, False
-    if res * (1 - buf_pct) < t1: return float(res * (1 - buf_pct)), True
-    return t1, False
-
-def _protect_sl_with_swing(df, entry_price: float, atr: float) -> float:
-    base_sl = entry_price - max(atr * 0.9, entry_price * 0.002)
-    try:
-        swing_low = float(df.iloc[:-1]["low"].rolling(6, min_periods=3).min().iloc[-1])
-        if swing_low < entry_price: return min(base_sl, swing_low)
-    except Exception:
-        pass
-    return base_sl
-
-# ========= سكور =========
+# ========= SCore مع ضبط عقوبة MTF ديناميكي =========
 def score_signal(
     struct_ok: bool,
     rvol: float,
@@ -543,7 +567,16 @@ def score_signal(
     breadth_pct: Optional[float] = None,
     avwap_confluence: Optional[bool] = None,
     d1_ok: bool = True,
+    mtf_detail: Optional[dict] = None
 ) -> Tuple[int, Dict[str, float]]:
+    """
+    يضيف خصمًا متدرّجًا للـ MTF:
+    - لا أطر: -6
+    - H1 فقط: -6
+    - H4 فقط: -8
+    - H1+H4 pass دون D1: 0 (لا عقوبة)
+    - D1 موجود لكنه سلبي: -8
+    """
     w = {"struct": 27, "rvol": 13, "atr": 13, "ema": 13, "mtf": 13, "srdist": 8, "oi": 6, "breadth": 4, "avwap": 3}
     sc = 0.0; bd: Dict[str, float] = {}
 
@@ -562,12 +595,36 @@ def score_signal(
 
     bd["ema"] = w["ema"] if ema_align else 0; sc += bd["ema"]
 
-    if mtf_has_frames:
-        bd["mtf"] = w["mtf"] if mtf_pass else 0; sc += bd["mtf"]
-        if not mtf_pass: sc -= 15; bd["mtf_penalty"] = -15
-    else:
-        bd["mtf"] = 0; bd["mtf_penalty"] = -15; sc -= 15
+    # عقوبة MTF متدرجة
+    mtf_pen = 0
+    if not mtf_has_frames:
+        mtf_pen = -6
+    elif mtf_has_frames and not mtf_pass:
+        if mtf_detail:
+            h1_ok = bool(mtf_detail.get("h1"))
+            h4_ok = bool(mtf_detail.get("h4"))
+            # كلاهما ok لكن D1 فقط سيئ
+            if h1_ok and h4_ok and not d1_ok:
+                mtf_pen = -8
+            elif h1_ok and not h4_ok:
+                mtf_pen = -6
+            elif h4_ok and not h1_ok:
+                mtf_pen = -8
+            else:
+                mtf_pen = -8
+        else:
+            mtf_pen = -8
 
+    if mtf_has_frames:
+        bd["mtf"] = w["mtf"] if mtf_pass else 0
+        sc += bd["mtf"]
+    else:
+        bd["mtf"] = 0
+
+    sc += mtf_pen
+    bd["mtf_penalty"] = mtf_pen
+
+    # عقوبة خفيفة إذا D1 سلبي رغم H1/H4 جيدين
     if mtf_has_frames and mtf_pass and not d1_ok:
         sc -= 8; bd["mtf_d1_pen"] = -8
 
@@ -588,15 +645,25 @@ def score_signal(
     return int(round(sc)), bd
 
 # ========= Quality Control =========
-def bar_is_outlier(row, atr: float) -> bool:
+def bar_is_outlier(row: pd.Series, atr: float) -> bool:
     rng = float(row["high"]) - float(row["low"])
     if atr <= 0: return False
     return (rng > 6.0 * atr) or (float(row["volume"]) <= 0)
 
-# ========= حارس سوق ذكي (2 من 3) =========
+# ========= حارس سوق ذكي (2 من 3) مع تنعيم Breadth =========
 def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
     refs = symbol_profile.get("guard_refs") or []
     breadth_ok = True
+
+    # استخدم breadth_ema المخزنة كتصويت إيجابي إذا قوية
+    try:
+        s = _load_state()
+        b_ema = s.get("breadth_ema")
+        if b_ema is not None and float(b_ema) >= 0.65:
+            breadth_ok = True
+    except Exception:
+        pass
+
     ms = feats.get("market_state")
     if isinstance(ms, dict) and refs:
         good = 0
@@ -606,8 +673,9 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
                 c, e = float(st.get("close", 0)), float(st.get("ema200", 0))
                 rsi_h1 = float(st.get("rsi_h1", 50))
                 if c > e and rsi_h1 >= 48: good += 1
-            except Exception: pass
-        breadth_ok = (good >= max(1, int(len(refs)*0.5)))
+            except Exception:
+                pass
+        breadth_ok = breadth_ok and (good >= max(1, int(len(refs)*0.5)))
     else:
         maj = feats.get("majors_state", [])
         if isinstance(maj, list) and maj:
@@ -616,9 +684,11 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
                 try:
                     c_, e_ = float(x.get("close", 0)), float(x.get("ema200", 0))
                     if c_ > e_: above += 1
-                except Exception: pass
-            breadth_ok = (above / max(1, len(maj))) >= BREADTH_MIN_RATIO
+                except Exception:
+                    pass
+            breadth_ok = breadth_ok and ((above / max(1, len(maj))) >= BREADTH_MIN_RATIO)
 
+    # تمويل
     try:
         fr = feats.get("funding_rate")
         max_fr = float(symbol_profile.get("max_pos_funding", 0.00025))
@@ -626,6 +696,7 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
     except Exception:
         funding_ok = True
 
+    # اتجاه OI
     oi_ok = True
     try:
         oi_hist = feats.get("oi_hist")
@@ -635,68 +706,9 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
             oi_ok = oi_sc >= float(symbol_profile.get("oi_down_thr", 0.0))
     except Exception:
         pass
+
     votes = sum([bool(breadth_ok), bool(funding_ok), bool(oi_ok)])
     return votes >= 2
-
-# ========= Helpers إضافية =========
-def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> pd.Series:
-    return df["close"] * df["volume"] * float(contract_size)
-
-# ----- Patch A (1/2): خفض نسبة الميديان إلى 0.12 -----
-def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
-    try:
-        x = qv_hist.dropna().tail(240)
-        med = float(x.median()) if len(x) else 0.0
-    except Exception:
-        med = 0.0
-    dyn = max(symbol_min_qv, pct_of_median * med) if med > 0 else symbol_min_qv
-    return float(dyn)
-
-# ----- Patch A (2/2): بوابة سيولة تدعم low_vol_env -----
-def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10, low_vol_env: bool = False) -> tuple[bool, str]:
-    """
-    بوابة سيولة مرنة:
-    - نافذة 10 شموع.
-    - تخفيض ديناميكي للعتبة مع الـ Relax (L1=-10%, L2=-20%) + تخفيف إضافي في low_vol_env (-5%).
-    - minbar = 2.5% من العتبة مع أرضية 500$.
-    - سماح إذا كان الإجمالي قويًا: إن كان qv_sum ≥ 1.10 * dyn_thr، يُسمح حتى 2 شموع دون الحد
-      بشرط ألا تنزل أي شمعة تحت 60% من minbar_req.
-    """
-    if len(qv_series) < win:
-        return False, "qv_window_short"
-
-    window = qv_series.tail(win)
-
-    dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
-    lvl = relax_level()
-    if lvl == 1:
-        dyn_thr *= 0.90
-    elif lvl >= 2:
-        dyn_thr *= 0.80
-    if low_vol_env:
-        dyn_thr *= 0.95  # جلسة هادئة جدًا
-
-    qv_sum = float(window.sum())
-    qv_min = float(window.min())
-
-    minbar_req = max(500.0, 0.025 * dyn_thr)
-
-    below = int((window < minbar_req).sum())
-    soft_floor = 0.60 * minbar_req
-    too_low = int((window < soft_floor).sum())
-
-    if qv_sum >= 1.10 * dyn_thr and below <= 2 and too_low == 0:
-        ok = True
-        reason = f"sum={qv_sum:.0f}≥{1.10*dyn_thr:.0f} minbar_soft({below}<=2)"
-    else:
-        ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
-        reason = f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
-
-    return ok, reason
-
-def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040, is_major: bool = False) -> float:
-    cap_eff = 0.0050 if is_major else cap
-    return min(cap_eff, max(base_low, 0.60 * atr_pct))
 
 # ========= MTF =========
 def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
@@ -710,7 +722,10 @@ def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool, bool]:
+def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool, bool, dict]:
+    """
+    يعيد: has_frames, pass_h1h4, d1_ok, detail{h1,h4,d1}
+    """
     frames: Dict[str, pd.DataFrame] = {}
     def _mk(data):
         d = _df_from_ohlcv(data)
@@ -728,15 +743,17 @@ def pass_mtf_filter_any(ohlcv_htf) -> Tuple[bool, bool, bool]:
     has = len(frames) > 0
     def _ok(dfh: pd.DataFrame) -> bool:
         c = dfh.iloc[-2]
-        macd_ok = (float(c["macd_hist"]) > 0) or (float(dfh["macd_hist"].diff(3).iloc[-2]) > 0)  # سماح slope>0
+        macd_ok = (float(c["macd_hist"]) > 0) or (float(dfh["macd_hist"].diff(3).iloc[-2]) > 0)
         return (float(c["close"]) > float(c["ema50"])) and (float(dfh["ema50"].diff(10).iloc[-2]) > 0) and macd_ok
 
     h1_ok = _ok(frames["H1"]) if "H1" in frames else False
     h4_ok = _ok(frames["H4"]) if "H4" in frames else False
     d1_ok = _ok(frames["D1"]) if "D1" in frames else True
-    pass_h1h4 = (h1_ok and h4_ok) if ("H1" in frames and "H4" in frames) else (h1_ok or h4_ok)
-    return has, pass_h1h4, d1_ok
 
+    pass_h1h4 = (h1_ok and h4_ok) if ("H1" in frames and "H4" in frames) else (h1_ok or h4_ok)
+    return has, pass_h1h4, d1_ok, {"h1": h1_ok, "h4": h4_ok, "d1": d1_ok}
+
+# ========= استخراج ميزات خارجية (اختياري) =========
 def extract_features(ohlcv_htf) -> Dict[str, object]:
     out: Dict[str, object] = {}
     if isinstance(ohlcv_htf, dict):
@@ -744,7 +761,8 @@ def extract_features(ohlcv_htf) -> Dict[str, object]:
         if isinstance(feats, dict):
             out.update(feats)
     return out
-# ========= المولّد الرئيسي =========
+
+# ========= المولّد الرئيسي (الجزء الأول) =========
 def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = None) -> Optional[Dict]:
     if not ohlcv or len(ohlcv) < 80:
         _log_reject(symbol, "insufficient_bars"); return None
@@ -777,13 +795,13 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if atr_pct > 0.020 and macd_slope_3 < 0:
         _log_reject(symbol, "parabolic_macd_cooling"); return None
 
-    # بروفايل + ميزات خارجية أولية (للـ breadth)
+    # بروفايل + ميزات + نظام
     prof = get_symbol_profile(symbol)
     regime = detect_regime(df)
-    mtf_has_frames, mtf_pass, d1_ok = pass_mtf_filter_any(ohlcv_htf)
+    mtf_has_frames, mtf_pass, d1_ok, mtf_detail = pass_mtf_filter_any(ohlcv_htf)
     feats = extract_features(ohlcv_htf)
 
-    # Breadth hint
+    # Breadth hint من majors_state
     breadth_pct = None
     majors_state = feats.get("majors_state", [])
     try:
@@ -796,15 +814,16 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     except Exception:
         breadth_pct = None
 
-    # قواعد Relax + DSC (مع تنعيم breadth داخليًا)
+    # قواعد Relax + DSC
     base_cfg = dict(_cfg)
     base_cfg["ATR_BAND"] = (prof["atr_lo"], prof["atr_hi"])
     base_cfg["RVOL_MIN"] = max(base_cfg.get("RVOL_MIN", 1.0), float(prof["rvol_min"]))
     thr = apply_relax(base_cfg, breadth_hint=breadth_pct)
+
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
-    # تعديل RVOL حسب breadth/relax
+    # ضبط RVOL_MIN وفق breadth/relax + أرضية عالمية لاحقًا
     if breadth_pct is not None:
         if breadth_pct >= 0.70:
             thr["RVOL_MIN"] = max(0.75, float(thr.get("RVOL_MIN", 1.0)) - 0.08)
@@ -813,14 +832,16 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if thr.get("RELAX_LEVEL", 0) >= 1:
         thr["RVOL_MIN"] = max(0.72, float(thr["RVOL_MIN"]) - 0.03)
 
-    # منع التكرار + Holdout (على الرمز الأساسي)
-    _LAST_ENTRY_BAR_TS.setdefault("##", 0)
+    # منع التكرار + Holdout (أساسي/كامل) + تخفيف للميجرز
     base_sym = symbol.split("#")[0]
     if _LAST_ENTRY_BAR_TS.get(base_sym) == cur_ts:
         _log_reject(symbol, "duplicate_symbol_bar"); return None
     if _LAST_ENTRY_BAR_TS.get(symbol) == cur_ts:
         _log_reject(symbol, "duplicate_bar"); return None
     cur_idx = len(df) - 2
+    is_major = (prof.get("class") == "major")
+    if is_major:
+        holdout_eff = max(1, int(holdout_eff) - 1)
     if cur_idx - _LAST_SIGNAL_BAR_IDX.get(symbol, -10_000) < holdout_eff:
         _log_reject(symbol, f"holdout<{holdout_eff}"); return None
 
@@ -828,7 +849,18 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     contract_size = 1.0
     qv_series = _compute_quote_vol_series(df, contract_size=contract_size)
     low_vol_env = (atr_pct <= 0.006)
-    ok_qv, qv_dbg = _qv_gate(qv_series, float(prof["min_quote_vol"]), win=10, low_vol_env=low_vol_env)
+
+    # ساعة الرياض
+    try:
+        ts_sec = (cur_ts/1000.0) if cur_ts > 1e12 else float(cur_ts)
+        hr_riyadh = (datetime.utcfromtimestamp(ts_sec).hour + 3) % 24
+    except Exception:
+        hr_riyadh = 12
+
+    ok_qv, qv_dbg = _qv_gate(
+        qv_series, float(prof["min_quote_vol"]),
+        win=10, low_vol_env=low_vol_env, is_major=is_major, hr_riyadh=hr_riyadh
+    )
     if not ok_qv:
         _log_reject(symbol, f"low_quote_vol ({qv_dbg})"); return None
 
@@ -842,38 +874,44 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         lo_dyn *= 0.95
         hi_dyn *= 1.07
 
-    # هامش سماح على الحواف + سقف أعلى للميجرز
+    # هامش سماح + تحيز للنظام + سقف للميجرز
     eps_abs = 0.00015
     eps_rel = 0.04
     lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
     hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
-    if (prof.get("class") or "").lower() == "major":
+    if is_major:
         hi_eff *= 1.06
+    # تحيز حسب النظام
+    if regime == "trend":
+        hi_eff *= (1.06 if is_major else 1.03)
+    elif regime == "range":
+        lo_eff *= 0.95
 
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
 
-    # RVOL & Spike (ميديان 60 تاريخي بدون الشمعة الحالية)
+    # RVOL & Spike + تسارع حجم
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
     base_vol = v_med60 if v_med60 > 0 else (float(closed.get("vol_ma20") or 1e-9))
     rvol = float(closed["volume"]) / max(base_vol, 1e-9)
     z20 = float(df["vol_z20"].iloc[-2])
     spike_z = 1.2 - min(0.3, (atr_pct / 0.02) * 0.2)
-    spike_ok = (z20 >= (spike_z - 0.15))
-    if rvol < thr["RVOL_MIN"] and not spike_ok:
-        _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f} and no spike (rv={rvol:.2f}, z={z20:.2f}, spike_th={spike_z:.2f})")
-        return None
 
-    # OI trend (للسكور فقط)
-    oi_sc = None
-    try:
-        if USE_OI_TREND:
-            oi_hist = feats.get("oi_hist")
-            if isinstance(oi_hist, (list, tuple)) and len(oi_hist) >= int(prof["oi_window"]):
-                s = pd.Series(oi_hist[-int(prof["oi_window"]):], dtype="float64")
-                oi_sc = float((s.iloc[-1] - s.iloc[0]) / max(s.iloc[0], 1e-9))
-    except Exception:
-        oi_sc = None
+    vol_ema5  = df["volume"].ewm(span=5, adjust=False).mean().iloc[-2]
+    vol_ema20 = df["volume"].ewm(span=20, adjust=False).mean().iloc[-2]
+    accel_vol = (vol_ema5 > vol_ema20*1.05)
+    spike_ok = (z20 >= (spike_z - 0.15))
+
+    # أرضية RVOL_MIN حسب الفئة
+    if is_major:
+        thr["RVOL_MIN"] = max(0.85, float(thr["RVOL_MIN"]))
+    else:
+        thr["RVOL_MIN"] = max(0.72, float(thr["RVOL_MIN"]))
+
+    if rvol < thr["RVOL_MIN"] and not spike_ok:
+        if not (accel_vol and z20 >= (spike_z - 0.25)):
+            _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f} and no spike/accel (rv={rvol:.2f}, z={z20:.2f})")
+            return None
 
     # حارس سوق
     if not market_guard_ok(prof, feats):
@@ -881,7 +919,7 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
 
     # --- اتجاه ناعم (2 من 3) + VWAP/AVWAP (Confluence) ---
     vwap_now = float(df["vwap"].iloc[-2]) if USE_VWAP else price
-    vw_tol = _vwap_tol_pct(atr_pct, is_major=(prof.get("class")=="major"))
+    vw_tol = _vwap_tol_pct(atr_pct, is_major=is_major)
 
     ema50_slope_pos = float(df["ema50"].diff(10).iloc[-2]) > 0
     macd_pos = float(df["macd_hist"].iloc[-2]) > 0
@@ -909,14 +947,17 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     av_ok_count = sum([1 for v in av_list if _above(v)])
     avwap_confluence_ok = (av_ok_count >= 2)
     # ليونة في الرينج — الاكتفاء بـ 1/3 مراسٍ
-    if detect_regime(df) == "range" and not avwap_confluence_ok and av_ok_count >= 1:
+    if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
         avwap_confluence_ok = True
 
     above_vwap = (not USE_VWAP) or (price >= vwap_now * (1 - vw_tol))
     ema_align = two_of_three and above_vwap and avwap_confluence_ok
+
     # ليونة إضافية في الرينج إذا اقترب من VWAP وكان فوق EMA21
-    if detect_regime(df) == "range" and not ema_align:
-        if (price > float(closed["ema21"])) and (price >= vwap_now * (1 - vw_tol * 1.3)) and avwap_confluence_ok:
+    if regime == "range" and not ema_align:
+        near_vwap = (price >= vwap_now * (1 - vw_tol * 1.35))
+        two_of_three_soft = sum([price > float(closed["ema21"]), macd_pos, near_vwap]) >= 2
+        if (two_of_three_soft and (av_ok_count >= 1 or bool(df["nr7"].iloc[-2] or df["nr4"].iloc[-2]))):
             ema_align = True
 
     # شرط الإغلاق فوق الافتتاح مع استثناء pin-hammer أحمر
@@ -982,14 +1023,9 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     dist50_atr = (price - ema50) / max(atr, 1e-9)
     dist200_atr = (price - ema200) / max(atr, 1e-9)
     trend_guard = (dist50_atr >= ema50_req) and (dist200_atr >= ema200_req)
-    mixed_guard = (dist50_atr >= (0.15 if prof["class"]=="major" else 0.20))
+    mixed_guard = (dist50_atr >= (0.15 if is_major else 0.20))
 
     # ساعات BRK (+/- 1 ساعة تسامح)
-    try:
-        ts_sec = cur_ts/1000.0 if cur_ts > 1e12 else cur_ts
-        hr_riyadh = (datetime.utcfromtimestamp(ts_sec).hour + 3) % 24
-    except Exception:
-        hr_riyadh = 12
     brk_in_session = (int(prof["brk_hour_start"]) <= hr_riyadh <= int(prof["brk_hour_end"]))
     if not brk_in_session and (abs(hr_riyadh - int(prof["brk_hour_start"])) <= 1 or abs(hr_riyadh - int(prof["brk_hour_end"])) <= 1):
         brk_in_session = True
@@ -1031,10 +1067,36 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if (setup in ("BRK","PULL") and rsi_now >= RSI_EXHAUSTION and dist_ema50_atr >= DIST_EMA50_EXHAUST_ATR):
         _log_reject(symbol, f"exhaustion_guard rsi={rsi_now:.1f}, distATR={dist_ema50_atr:.2f}"); return None
 
+    # شرط Near-Resistance خاص بـ BRK: نحتاج srdist_R مناسب
+    # (سيُحسب srdist_R بعد بناء SL/targets؛ نؤجّل الرفض لما بعد الحساب.)
     # SL وأهداف
+    def _protect_sl_with_swing(df_, entry_price: float, atr_: float) -> float:
+        base_sl = entry_price - max(atr_ * 0.9, entry_price * 0.002)
+        try:
+            swing_low = float(df_.iloc[:-1]["low"].rolling(6, min_periods=3).min().iloc[-1])
+            if swing_low < entry_price:
+                return min(base_sl, swing_low)
+        except Exception:
+            pass
+        return base_sl
+
     sl = _protect_sl_with_swing(df, price, atr)
     if (price - sl) < max(price * 1e-6, 1e-9):
         _log_reject(symbol, "R_too_small"); return None
+
+    # أهداف متعددة
+    TARGETS_MODE_BY_SETUP = {"BRK": "r", "PULL": "r", "RANGE": "pct", "SWEEP": "pct", "VBR":"pct"}
+    TARGETS_R5   = (1.0, 1.8, 3.0, 4.5, 6.0)
+    ATR_MULT_RANGE = (1.5, 2.5, 3.5, 4.5, 6.0)
+    ATR_MULT_VBR   = (0.0, 0.6, 1.2, 1.8, 2.4)
+
+    def _build_targets_r(entry: float, sl_: float, tp_r: Tuple[float, ...]) -> List[float]:
+        R_ = max(entry - sl_, 1e-9)
+        return [entry + r*R_ for r in tp_r]
+
+    def _build_targets_pct_from_atr(price_: float, atr_: float, multipliers: Tuple[float, ...]) -> Tuple[List[float], Tuple[float,...]]:
+        pcts = [max(atr_ / max(price_, 1e-9) * m, 0.002) for m in multipliers]
+        return [price_ * (1 + p) for p in pcts], tuple(pcts)
 
     targets_display_vals = None
     disp_mode = "r"
@@ -1064,7 +1126,12 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if atr_pct <= 0.008:   min_t1_pct = 0.008
     elif atr_pct <= 0.020: min_t1_pct = 0.010
     else:                  min_t1_pct = 0.012
-    min_t1_pct = max(min_t1_pct, thr.get("MIN_T1_ABOVE_ENTRY", 0.008))
+    min_t1_pct = max(min_t1_pct, MIN_T1_ABOVE_ENTRY)
+
+    def _clamp_t1_below_res(entry: float, t1: float, res_: Optional[float], buf_pct: float = 0.0015) -> Tuple[float, bool]:
+        if res_ is None: return t1, False
+        if res_ * (1 - buf_pct) < t1: return float(res_ * (1 - buf_pct)), True
+        return t1, False
 
     t1, _ = _clamp_t1_below_res(price, t_list[0], res_eff, buf_pct=0.0015)
     t_list[0] = t1
@@ -1073,22 +1140,28 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     if not (sl < price < t_list[0] <= t_list[-1]):
         _log_reject(symbol, "bounds_invalid(sl<price<t1<=tN)"); return None
 
-    # مسافة المقاومة بـ R
+    # مسافة المقاومة بـ R (نستخدمها أيضًا لشرط BRK/near_res)
     R_val = max(price - sl, 1e-9)
     srdist_R = ((res_eff - price)/R_val) if (res_eff is not None and res_eff > price) else 10.0
 
+    # شرط Near-Resistance خاص بـ BRK
+    if setup == "BRK" and near_res and srdist_R < 0.7:
+        _log_reject(symbol, f"near_resistance_R={srdist_R:.2f}<0.70"); return None
+
     # سكور شامل (+ Confluence AVWAP)
     score, bd = score_signal(
-        struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
-        (thr["RVOL_MIN"]), (lo_dyn, hi_dyn),
-        oi_trend=oi_sc, breadth_pct=breadth_pct,
+        struct_ok, rvol, atr_pct, True, mtf_pass, srdist_R, mtf_has_frames,
+        thr["RVOL_MIN"], (lo_dyn, hi_dyn),
+        oi_trend=None if feats is None else None if feats.get("oi_hist") is None else bd.get("oi", None),
+        breadth_pct=breadth_pct,
         avwap_confluence=avwap_confluence_ok if USE_ANCHORED_VWAP else None,
-        d1_ok=d1_ok
+        d1_ok=d1_ok,
+        mtf_detail=mtf_detail
     )
     if score < thr["SCORE_MIN"]:
         _log_reject(symbol, f"score<{thr['SCORE_MIN']} (got {score})"); return None
 
-    # منطقة دخول
+    # منطقة دخول ديناميكية
     if score >= 88 or rvol >= 1.50:
         width_r = 0.14 * R_val
     elif score >= 84 or rvol >= 1.40:
@@ -1103,6 +1176,11 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     entry_low  = max(sl + 1e-6, price - width_r)
     entry_high = price
     entries = [round(entry_low, 6), round(entry_high, 6)] if entry_low < entry_high else None
+    entry_out = round(sum(entries)/len(entries), 6) if entries else round(price, 6)
+
+    tp1 = t_list[0]; tp2 = t_list[1] if len(t_list) > 1 else t_list[0]
+    tp3 = t_list[2] if len(t_list) > 2 else None
+    tp_final = t_list[-1]
 
     # Trailing متكيّف بالسكور (3 مستويات)
     if score >= 88:      trail_mult = 0.9
@@ -1110,25 +1188,45 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
     elif score >= 76:    trail_mult = 1.2
     else:                trail_mult = 1.4
 
-    # حفظ آخر بار (لكل من الرمز الكامل والأساسي)
+    # تحديث بصمة البار
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
     _LAST_ENTRY_BAR_TS[base_sym] = cur_ts
     _LAST_SIGNAL_BAR_IDX[symbol] = cur_idx
 
-    # أسباب/Confluence
-    reasons_full: List[str] = []
-    if price > float(closed["ema50"]): reasons_full.append("Price>EMA50")
-    if float(closed["ema9"]) > float(closed["ema21"]): reasons_full.append("EMA9>EMA21")
-    if is_hammer(closed): reasons_full.append("Hammer")
-    if is_bull_engulf(prev, closed): reasons_full.append("Bull Engulf")
-    if is_inside_break(df.iloc[-5] if len(df)>=5 else prev2, prev, closed): reasons_full.append("InsideBreak")
-    if near_res: reasons_full.append("NearRes")
-    if near_sup: reasons_full.append("NearSup")
-    if USE_VWAP and (price >= vwap_now * (1 - vw_tol)): reasons_full.append("VWAP OK")
-    if USE_ANCHORED_VWAP and avwap_confluence_ok: reasons_full.append(f"AVWAP Confluence {av_ok_count}/3")
-    if setup == "VBR": reasons_full.append("VBR")
-    reasons_full.append(f"RVOL≥{round(thr['RVOL_MIN'],2)}")
-    confluence = (reasons + reasons_full)[:6]
+    # ETA للوصول إلى T1
+    try:
+        deltas = df["close"].diff().abs().tail(12).dropna()
+        median_step = float(deltas.median()) if len(deltas) else max(1e-9, price*0.0008)
+    except Exception:
+        median_step = max(1e-9, price*0.0008)
+    gap_to_t1 = abs(t1 - price)
+    eta_bars = gap_to_t1 / max(median_step, 1e-9)
+
+    base_max_bars = MAX_BARS_TO_TP1_BASE
+    if atr_pct <= 0.008:   base_max_bars = 10
+    elif atr_pct >= 0.020: base_max_bars = 6
+    if setup in ("BRK","SWEEP"): base_max_bars = max(6, base_max_bars - 2)
+    max_bars_to_tp1 = int(min(base_max_bars, math.ceil(eta_bars * 1.5))) if USE_MAX_BARS_TO_TP1 else None
+
+    # Partial ديناميكي
+    def _partials_for(score_: int, n_: int) -> List[float]:
+        if score_ >= 88: base_ = [0.28, 0.24, 0.20, 0.16, 0.12]
+        elif score_ >= 84: base_ = [0.30, 0.25, 0.20, 0.15, 0.10]
+        elif score_ >= 76: base_ = [0.35, 0.25, 0.20, 0.12, 0.08]
+        else: base_ = [0.40, 0.25, 0.18, 0.10, 0.07]
+        return base_[:n_]
+    partials = _partials_for(score, len(t_list))
+
+    # قاعدة وقف
+    stop_rule = {
+        "type": "breakeven_after",
+        "at_idx": 0,
+        "meta": {
+            "intended": "htf_close_below",
+            "tf": os.getenv("STOP_RULE_TF", "H4").upper(),
+            "htf_level": round(sl, 6)
+        }
+    }
 
     # رسائل
     messages = {
@@ -1142,57 +1240,20 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "time":  MOTIVATION["time"].format(symbol=symbol),
     }
 
-    # ===== Probabilistic ETA لبلوغ T1 =====
-    try:
-        deltas = df["close"].diff().abs().tail(12).dropna()
-        median_step = float(deltas.median()) if len(deltas) else max(1e-9, price*0.0008)
-    except Exception:
-        median_step = max(1e-9, price*0.0008)
-    gap_to_t1 = abs(t_list[0] - price)
-    eta_bars = gap_to_t1 / max(median_step, 1e-9)
-
-    base_max_bars = MAX_BARS_TO_TP1_BASE
-    if atr_pct <= 0.008:   base_max_bars = 10
-    elif atr_pct >= 0.020: base_max_bars = 6
-    if setup in ("BRK","SWEEP"): base_max_bars = max(6, base_max_bars - 2)
-    max_bars_to_tp1 = int(min(base_max_bars, math.ceil(eta_bars * 1.5)))
-
-    # Partial ديناميكي
-    def _partials_for(score: int, n: int) -> List[float]:
-        if score >= 88: base = [0.28, 0.24, 0.20, 0.16, 0.12]
-        elif score >= 84: base = [0.30, 0.25, 0.20, 0.15, 0.10]
-        elif score >= 76: base = [0.35, 0.25, 0.20, 0.12, 0.08]
-        else: base = [0.40, 0.25, 0.18, 0.10, 0.07]
-        return base[:n]
-    partials = _partials_for(score, len(t_list))
-
-    # قاعدة وقف
-    stop_rule = {
-        "type": "breakeven_after",
-        "at_idx": 0,
-        "meta": {
-            "intended": "htf_close_below",
-            "tf": os.getenv("STOP_RULE_TF", "H4").upper(),
-            "htf_level": round(_protect_sl_with_swing(df, price, atr), 6)
-        }
-    }
-
-    tp1 = t_list[0]; tp2 = t_list[1] if len(t_list) > 1 else t_list[0]
-    tp3 = t_list[2] if len(t_list) > 2 else None
-    tp_final = t_list[-1]
-    entry_out = round(sum(entries)/len(entries), 6) if entries else round(price, 6)
-
-    mark_signal_now()
-
-    # ===== Debug pack =====
+    # Debug pack موسّع
     debug = {
         "qv_gate": qv_dbg,
         "atr_band_eff": {"lo": lo_eff, "hi": hi_eff, "atr_pct": atr_pct},
+        "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},
         "vwap_tol": vw_tol,
-        "mtf": {"has": mtf_has_frames, "pass": mtf_pass, "d1_ok": d1_ok},
-        "relax": {"level": thr["RELAX_LEVEL"], "f": round(thr.get("RELAX_F", 0.0), 3)},
+        "mtf": {"has": mtf_has_frames, "pass": mtf_pass, "d1_ok": d1_ok, "detail": mtf_detail},
+        "relax": {"level": thr.get("RELAX_LEVEL", 0), "f": round(thr.get("RELAX_F", 0.0), 3)},
         "breadth_hint": breadth_pct,
+        "hr_riyadh": hr_riyadh
     }
+
+    # وسم إحصائي للإشارة
+    mark_signal_now()
 
     return {
         "symbol": symbol,
@@ -1210,8 +1271,8 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "r":     round(entry_out - sl, 6),
         "score": int(score),
         "regime": regime,
-        "reasons": reasons_full,
-        "confluence": confluence,
+        "reasons": [],  # يمكن ملؤها بتجميع مبسط إذا رغبت
+        "confluence": [],
 
         "features": {
             "rsi": float(closed["rsi"]),
@@ -1223,38 +1284,29 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
             "ema50": float(closed["ema50"]),
             "ema200": float(closed["ema200"]),
             "vwap": float(vwap_now) if USE_VWAP else None,
-            "avwap": float(avwap_swing_low if avwap_swing_low is not None else (avwap_swing_high if avwap_swing_high is not None else avwap_day)) if USE_ANCHORED_VWAP else None,
             "sup": float(sup) if sup is not None else None,
             "res": float(res_eff) if res_eff is not None else None,
             "setup": setup,
             "targets_display": {"mode": disp_mode, "values": list(targets_display_vals)},
             "score_breakdown": bd,
-            "atr_band_dyn": {"lo": lo_dyn, "hi": hi_dyn},
-            "relax_level": thr["RELAX_LEVEL"],
+            "relax_level": thr.get("RELAX_LEVEL", 0),
             "avwap_confluence_count": av_ok_count,
-            "avwap_list": [avwap_swing_low, avwap_swing_high, avwap_day],
             "thresholds": {
                 "SCORE_MIN": thr["SCORE_MIN"],
                 "RVOL_MIN": thr["RVOL_MIN"],
                 "ATR_BAND": (lo_dyn, hi_dyn),
                 "MIN_T1_ABOVE_ENTRY": min_t1_pct,
                 "HOLDOUT_BARS_EFF": holdout_eff,
-                "EMA50_req_R": prof["ema50_req_R"],
-                "EMA200_req_R": prof["ema200_req_R"],
-                "VBR_MIN_DEV_ATR": prof["vbr_min_dev_atr"],
-                "BRK_HOURS_RIYADH": (int(prof["brk_hour_start"]), int(prof["brk_hour_end"])),
-                "MIN_QUOTE_VOL_EFF": prof["min_quote_vol"],
-                "MAX_POS_FUNDING_EFF": prof["max_pos_funding"],
-                "GUARD_REFS": prof.get("guard_refs"),
-                "SELECTIVITY_MODE": thr.get("SELECTIVITY_MODE"),
-                "RELAX_F": thr.get("RELAX_F", 0.0),
+                "EMA50_req_R": float(get_symbol_profile(symbol).get("ema50_req_R", 0.25)),
+                "EMA200_req_R": float(get_symbol_profile(symbol).get("ema200_req_R", 0.35)),
+                "VBR_MIN_DEV_ATR": float(get_symbol_profile(symbol).get("vbr_min_dev_atr", 0.6)),
             },
         },
 
         "partials": partials,
         "trail_after_tp2": TRAIL_AFTER_TP2,
         "trail_atr_mult": trail_mult if TRAIL_AFTER_TP2 else None,
-        "max_bars_to_tp1": max_bars_to_tp1 if USE_MAX_BARS_TO_TP1 else None,
+        "max_bars_to_tp1": max_bars_to_tp1,
 
         "cooldown_after_sl_min": 15,
         "cooldown_after_tp_min": 5,
@@ -1263,7 +1315,6 @@ def check_signal(symbol: str, ohlcv: List[list], ohlcv_htf: Optional[object] = N
         "strategy_code": setup,
         "messages": messages,
         "stop_rule": stop_rule,
-
         "debug": debug,
         "timestamp": datetime.utcnow().isoformat()
     }
