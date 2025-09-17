@@ -106,6 +106,57 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("bot")
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
+# ===== OKX market helpers (safe loader & symbol adapter) =====
+OKX_MARKET_TYPES = [t.strip() for t in os.getenv("OKX_MARKET_TYPES", "spot,swap").split(",") if t.strip()]
+
+def safe_load_okx_markets(exchange, logger=None):
+    """
+    يجلب الأسواق نوعًا بنوع مع فلترة المعطوبين (base/quote/symbol).
+    يحقن النتائج في exchange.markets و exchange.markets_by_id.
+    يعيد set بالـ symbols الصحيحة.
+    """
+    all_markets = []
+    total_bad = 0
+    for t in OKX_MARKET_TYPES:
+        try:
+            raw = exchange.fetch_markets_by_type(t, {})
+        except Exception as e:
+            if logger: logger.warning(f"[okx] skip type {t}: {e}")
+            continue
+        good = [m for m in raw if m.get("base") and m.get("quote") and m.get("symbol")]
+        bad  = len(raw) - len(good)
+        total_bad += bad
+        if bad and logger:
+            logger.info(f"[okx] filtered {bad} malformed {t} markets")
+        all_markets.extend(good)
+
+    exchange.markets = exchange.index_by(all_markets, "symbol") if all_markets else {}
+    exchange.markets_by_id = exchange.index_by(all_markets, "id") if all_markets else {}
+    if logger:
+        logger.info(f"[okx] loaded {len(all_markets)} markets (filtered={total_bad}) from types={OKX_MARKET_TYPES}")
+    return set(exchange.markets.keys())
+
+def prefer_swap_symbol(sym: str, markets: set) -> str | None:
+    """
+    يفضّل عقد السواب USDT لو موجود، ثم السبوت.
+    جرّب بالترتيب: exact → :USDT → بدون :USDT → إضافة :USDT عند الحاجة.
+    """
+    if sym in markets:
+        return sym
+
+    cand_swap = f"{sym}:USDT" if ":USDT" not in sym else sym
+    if cand_swap in markets:
+        return cand_swap
+
+    no_colon = sym.replace(":USDT", "").replace(":USGT", "")
+    if no_colon in markets:
+        return no_colon
+    cand_swap2 = f"{no_colon}:USDT"
+    if cand_swap2 in markets:
+        return cand_swap2
+
+    return None
+
 # ---------------------------
 # Globals & Config
 # ---------------------------
@@ -727,18 +778,49 @@ async def refresh_symbols_periodically():
 # Data fetchers
 # ---------------------------
 
+def _maybe_adapt_symbol_for_fetch(sym: str) -> str:
+    """
+    يكيّف الرمز للجلب: يفضّل السواب :USDT إن وُجد، وإلا يحاول البدائل.
+    يعتمد على exchange.markets، ويعيد sym الأصلي إن تعذّر التكييف.
+    """
+    try:
+        markets = set(exchange.markets.keys()) if getattr(exchange, "markets", None) else set()
+        if not markets:
+            # حمّل الأسواق بطريقة آمنة أولاً
+            loop = asyncio.get_event_loop()
+            markets = asyncio.get_event_loop().run_until_complete(
+                loop.run_in_executor(None, safe_load_okx_markets, exchange, logger)
+            )
+            if not markets:
+                loop.run_in_executor(None, exchange.load_markets)
+                markets = set(exchange.markets.keys()) if getattr(exchange, "markets", None) else set()
+        if markets:
+            alt = prefer_swap_symbol(sym, markets)
+            return alt or sym
+    except Exception:
+        pass
+    return sym
+
 async def fetch_ohlcv(symbol: str, timeframe=TIMEFRAME, limit=300) -> list:
+    sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
     for attempt in range(4):
         try:
             await RATE.wait()
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
-                None, lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                None, lambda: exchange.fetch_ohlcv(sym_eff, timeframe=timeframe, limit=limit)
             )
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
             await asyncio.sleep(0.6 * (attempt + 1) + random.uniform(0.1, 0.4))
+        except ccxt.BadSymbol as e:
+            if sym_eff != symbol:
+                logger.info(f"FETCH_OHLCV retry with original symbol after adapt fail: {sym_eff} -> {symbol}")
+                sym_eff = symbol  # جرّب الأصل كفرصة أخيرة
+                continue
+            logger.warning(f"❌ FETCH_OHLCV BadSymbol [{symbol}]: {e}")
+            return []
         except Exception as e:
-            logger.warning(f"❌ FETCH_OHLCV ERROR [{symbol}]: {e}")
+            logger.warning(f"❌ FETCH_OHLCV ERROR [{sym_eff}]: {e}")
             return []
     return []
 
@@ -747,14 +829,25 @@ HTF_MAP = {"H1": ("1h", 220), "H4": ("4h", 220), "D1": ("1d", 220)}
 
 async def fetch_ohlcv_htf(symbol: str) -> dict:
     """Fetches H1/H4/D1 OHLCV; parallelism optional to reduce connection pool pressure."""
+    sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
+
     async def _one(tf_ccxt: str, limit: int) -> list:
+        se = sym_eff
         for attempt in range(3):
             try:
                 await RATE.wait()
                 loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, lambda: exchange.fetch_ohlcv(symbol, timeframe=tf_ccxt, limit=limit))
+                return await loop.run_in_executor(
+                    None, lambda: exchange.fetch_ohlcv(se, timeframe=tf_ccxt, limit=limit)
+                )
             except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
                 await asyncio.sleep(0.5 * (attempt + 1))
+            except ccxt.BadSymbol:
+                # حاول الرمز الأصلي كفرصة أخيرة
+                if se != symbol:
+                    se = symbol
+                    continue
+                return []
             except Exception:
                 return []
         return []
@@ -775,11 +868,12 @@ async def fetch_ohlcv_htf(symbol: str) -> dict:
     return {k: v for k, v in out.items() if v}
 
 async def fetch_ticker_price(symbol: str) -> Optional[float]:
+    sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
     for attempt in range(3):
         try:
             await RATE.wait()
             loop = asyncio.get_event_loop()
-            ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+            ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym_eff))
             price = (
                 ticker.get("last")
                 or ticker.get("close")
@@ -789,23 +883,46 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
             return float(price) if price is not None else None
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
             await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0.05, 0.2))
+        except ccxt.BadSymbol:
+            if sym_eff != symbol:
+                logger.info(f"FETCH_TICKER retry with original symbol after adapt fail: {sym_eff} -> {symbol}")
+                sym_eff = symbol
+                continue
+            logger.warning(f"❌ FETCH_TICKER BadSymbol [{symbol}]")
+            return None
         except Exception as e:
-            logger.warning(f"❌ FETCH_TICKER ERROR [{symbol}]: {e}")
+            logger.warning(f"❌ FETCH_TICKER ERROR [{sym_eff}]: {e}")
             return None
     return None
 
 async def fetch_spread_pct(symbol: str) -> Optional[float]:
     """Return (ask-bid)/mid if both bid/ask available; None otherwise."""
+    sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
     try:
         await RATE.wait()
         loop = asyncio.get_event_loop()
-        ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+        ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym_eff))
         bid = ticker.get("bid")
         ask = ticker.get("ask")
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             return None
         mid = (bid + ask) / 2.0
         return (ask - bid) / max(mid, 1e-9)
+    except ccxt.BadSymbol:
+        if sym_eff != symbol:
+            # محاولة أخيرة على الأصل
+            try:
+                await RATE.wait()
+                loop = asyncio.get_event_loop()
+                ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
+                bid = ticker.get("bid"); ask = ticker.get("ask")
+                if bid is None or ask is None or bid <= 0 or ask <= 0:
+                    return None
+                mid = (bid + ask) / 2.0
+                return (ask - bid) / max(mid, 1e-9)
+            except Exception:
+                return None
+        return None
     except Exception:
         return None
 
@@ -815,7 +932,7 @@ async def fetch_spread_pct(symbol: str) -> Optional[float]:
 
 def _norm_sym_for_dedupe(sym: Optional[str]) -> str:
     s = (sym or "").upper()
-    return s.replace(":USDT", "/USDT")
+    return s.replace(":USDT", "/USDT").replace("USDT:", "USDT/")  # تطبيع أوسع
 
 def _should_skip_duplicate(sig: dict) -> bool:
     sym = _norm_sym_for_dedupe(sig.get("symbol"))
@@ -902,13 +1019,28 @@ async def scan_and_dispatch():
                         logger.info(f"🔁 SKIP {sig['symbol']}: already open")
                         continue
 
-                    audit_id = _make_audit_id(sig["symbol"], sig.get("entry", sig.get("entries", [0])[0]), sig.get("score", 0))
+                    # audit id + fallback-safe entry
+                    entry_for_id = sig.get("entry")
+                    if entry_for_id is None:
+                        try:
+                            entry_for_id = (sig.get("entries") or [None])[0]
+                        except Exception:
+                            entry_for_id = None
+
+                    audit_id = _make_audit_id(sig["symbol"], entry_for_id or 0.0, sig.get("score", 0))
 
                     try:
                         trade_id = add_trade_sig(s, sig, audit_id=audit_id, qty=None)
                     except Exception as e:
                         logger.exception(f"⚠️ add_trade_sig failed, fallback: {e}")
-                        trade_id = add_trade(s, sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"])
+                        # fallback: احفظ صفقة أساسية بأقل الحقول
+                        trade_id = add_trade(
+                            s,
+                            sig["symbol"], sig.get("side", "buy"),
+                            entry_for_id or 0.0,
+                            sig.get("sl", 0.0),
+                            sig.get("tp1", 0.0), sig.get("tp2", 0.0)
+                        )
 
                     AUDIT_IDS[trade_id] = audit_id
 
@@ -959,18 +1091,22 @@ async def loop_signals():
 def _tp_key(idx: int) -> str:
     return f"tp{idx+1}"
 
-def _stop_triggered_by_rule(t: Trade, price: float, last_hit_idx: int) -> bool:
-    """Implements a simple, robust rule set:
-       - fixed: use DB stop (default)
-       - breakeven_after (or move_to_entry_on_tp1): move stop to entry after hitting tp[idx]
-    """
+def _parse_stop_rule_json(raw: Optional[str]) -> Optional[dict]:
     try:
-        sr = json.loads(t.stop_rule_json) if getattr(t, "stop_rule_json", None) else None
+        return json.loads(raw) if raw else None
     except Exception:
-        sr = None
+        return None
+
+def _stop_triggered_by_rule(t: Trade, price: float, last_hit_idx: int) -> bool:
+    """
+    قواعد بسيطة وقوية:
+    - fixed (الافتراضي): يستخدم SL من الـ DB.
+    - breakeven_after / move_to_entry_on_tp1: انقل الوقف لنقطة الدخول بعد تحقق هدف at_idx.
+    """
+    sr = _parse_stop_rule_json(getattr(t, "stop_rule_json", None))
     side = (t.side or "buy").lower()
 
-    # base stop = raw sl
+    # الأساس = SL من الـ DB
     effective_sl = float(t.sl)
 
     if sr and isinstance(sr, dict):
@@ -980,7 +1116,7 @@ def _stop_triggered_by_rule(t: Trade, price: float, last_hit_idx: int) -> bool:
             if last_hit_idx >= at_idx:
                 effective_sl = float(t.entry)
 
-    # trigger condition by side
+    # شرط التفعيل حسب الاتجاه
     if side == "sell":
         return price >= effective_sl
     return price <= effective_sl
@@ -988,16 +1124,116 @@ def _stop_triggered_by_rule(t: Trade, price: float, last_hit_idx: int) -> bool:
 def timeframe_to_seconds(tf: str) -> int:
     tf = (tf or "5m").lower().strip()
     if tf.endswith("ms"): return 0
-    if tf.endswith("s"): return int(tf[:-1])
-    if tf.endswith("m"): return int(tf[:-1]) * 60
-    if tf.endswith("h"): return int(tf[:-1]) * 3600
-    if tf.endswith("d"): return int(tf[:-1]) * 86400
-    if tf.endswith("w"): return int(tf[:-1]) * 7 * 86400
+    if tf.endswith("s"):  return int(tf[:-1])
+    if tf.endswith("m"):  return int(tf[:-1]) * 60
+    if tf.endswith("h"):  return int(tf[:-1]) * 3600
+    if tf.endswith("d"):  return int(tf[:-1]) * 86400
+    if tf.endswith("w"):  return int(tf[:-1]) * 7 * 86400
     return 300
+
+def _get_bars_budget_for_trade(t: Trade) -> Optional[int]:
+    """
+    يحدد سقف الشموع لبلوغ TP1:
+    - يفضّل t.max_bars_to_tp1 إن كان موجوداً.
+    - وإلا يحاول extra_json.max_bars_to_tp1.
+    - وإلا يعتمد الافتراضي مع تسريع خفيف لـ BRK/SWEEP.
+    """
+    try:
+        if hasattr(t, "max_bars_to_tp1") and t.max_bars_to_tp1:
+            return int(t.max_bars_to_tp1)
+    except Exception:
+        pass
+    try:
+        extra = json.loads(getattr(t, "extra_json", "") or "{}")
+        if extra.get("max_bars_to_tp1") is not None:
+            return int(extra["max_bars_to_tp1"])
+    except Exception:
+        pass
+    # افتراضي
+    try:
+        if getattr(t, "strategy_code", None) in ("BRK", "SWEEP"):
+            return max(6, TIME_EXIT_DEFAULT_BARS - 2)
+    except Exception:
+        pass
+    return TIME_EXIT_DEFAULT_BARS
+
+async def _calc_trailing_stop_if_any(t: Trade, last_hit_idx: int) -> Optional[float]:
+    """
+    يُعيد مستوى وقف متحرّك (Trailing) اختياري بعد TP2:
+    - يعتمد على ATR الحالي ومضاعف trail_atr_mult (من الحقول أو extra_json).
+    - للإتجاه buy: SL_trail = max(SL_current, price - ATR*mult) (لا نُنزل الوقف).
+    - للإتجاه sell: SL_trail = min(SL_current, price + ATR*mult) (لا نُرفع الوقف).
+    - لا يكتب في DB؛ يُستخدم كشرط خروج فقط.
+    """
+    try:
+        # مفعّل فقط بعد تحقق TP2 أو أكثر
+        if last_hit_idx < 1:
+            return None
+
+        trail_enabled = False
+        trail_mult = None
+
+        # حاول من خصائص الصفقة مباشرة
+        if hasattr(t, "trail_after_tp2") and getattr(t, "trail_after_tp2"):
+            trail_enabled = True
+            trail_mult = float(getattr(t, "trail_atr_mult", 1.0) or 1.0)
+
+        # fallback: من extra_json
+        if not trail_enabled:
+            try:
+                extra = json.loads(getattr(t, "extra_json", "") or "{}")
+                if extra.get("trail_after_tp2"):
+                    trail_enabled = True
+                    trail_mult = float(extra.get("trail_atr_mult", 1.0))
+            except Exception:
+                pass
+
+        if not trail_enabled or trail_mult is None:
+            return None
+
+        # احسب ATR سريع من آخر 120 شمعة TF الحالي
+        ohlcv = await fetch_ohlcv(t.symbol, timeframe=TIMEFRAME, limit=160)
+        if not ohlcv or len(ohlcv) < 20:
+            return None
+
+        # ATR EWM(14) المختصر
+        import math
+        import pandas as pd
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+        c_prev = df["close"].shift(1)
+        tr = pd.concat([
+            (df["high"] - df["low"]).abs(),
+            (df["high"] - c_prev).abs(),
+            (df["low"]  - c_prev).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+        if not math.isfinite(atr) or atr <= 0:
+            return None
+
+        price = await fetch_ticker_price(t.symbol)
+        if price is None:
+            return None
+        price = float(price)
+        cur_sl = float(t.sl)
+        side = (t.side or "buy").lower()
+
+        if side == "buy":
+            proposed = price - atr * float(trail_mult)
+            # لا نُنزل الوقف تحت الوقف الحالي
+            sl_trail = max(cur_sl, proposed)
+        else:
+            proposed = price + atr * float(trail_mult)
+            # لا نُرفع الوقف فوق الوقف الحالي
+            sl_trail = min(cur_sl, proposed)
+
+        return float(sl_trail)
+    except Exception:
+        return None
 
 async def monitor_open_trades():
     from types import SimpleNamespace
     tf_sec = timeframe_to_seconds(TIMEFRAME)
+
     while True:
         try:
             with get_session() as s:
@@ -1006,14 +1242,20 @@ async def monitor_open_trades():
                     price = await fetch_ticker_price(t.symbol)
                     if price is None:
                         continue
+                    price = float(price)
 
                     side = (t.side or "buy").lower()
                     tgts = trade_targets_list(t)  # ordered list
+                    if not tgts:
+                        # حماية نادرة: لا أهداف — لا نفعل شيئًا
+                        continue
+
                     last_idx = int(getattr(t, "last_hit_idx", 0) or 0)
 
-                    # ---- Check stop (raw or rule-based)
+                    # ---- قواعد الوقف (ثابت/تعادل) + Trailing (اختياري بعد TP2)
+                    # 1) وقف القاعدة/التعادل
                     if _stop_triggered_by_rule(t, price, last_idx):
-                        result, exit_px = "sl", float(t.entry) if price == t.entry else float(t.sl)
+                        result, exit_px = "sl", price  # استخدم السعر الحالي
                         r_multiple = on_trade_closed_update_risk(t, result, exit_px)
                         try:
                             close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
@@ -1024,58 +1266,62 @@ async def monitor_open_trades():
                         extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get("sl")
                         if extra:
                             msg += "\n\n" + extra
-
                         await notify_subscribers(msg)
                         await asyncio.sleep(0.05)
                         continue
 
-                    # ---- Determine highest target hit
+                    # 2) وقف متحرّك بعد TP2 (لا يكتب للـ DB؛ شرط خروج فقط)
+                    sl_trail = await _calc_trailing_stop_if_any(t, last_idx)
+                    if sl_trail is not None:
+                        if (side == "buy" and price <= sl_trail) or (side == "sell" and price >= sl_trail):
+                            result, exit_px = "sl", price
+                            r_multiple = on_trade_closed_update_risk(t, result, exit_px)
+                            try:
+                                close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
+                            except Exception as e:
+                                logger.warning(f"⚠️ close_trade warn (trail): {e}")
+                            t.result = result
+                            msg = format_close_text(t, r_multiple)
+                            extra_msg = (MESSAGES_CACHE.get(t.id, {}) or {}).get("tp2")  # غالبًا بعد TP2
+                            if extra_msg:
+                                msg += "\n\n" + extra_msg
+                            await notify_subscribers(msg)
+                            await asyncio.sleep(0.05)
+                            continue
+
+                    # ---- حساب أعلى هدف تم بلوغه حتى الآن
                     new_hit_idx = -1
                     if side == "sell":
                         for idx, tgt in enumerate(tgts):
-                            if price <= float(tgt):
-                                new_hit_idx = max(new_hit_idx, idx)
+                            try:
+                                if price <= float(tgt):
+                                    new_hit_idx = max(new_hit_idx, idx)
+                            except Exception:
+                                continue
                     else:
                         for idx, tgt in enumerate(tgts):
-                            if price >= float(tgt):
-                                new_hit_idx = max(new_hit_idx, idx)
+                            try:
+                                if price >= float(tgt):
+                                    new_hit_idx = max(new_hit_idx, idx)
+                            except Exception:
+                                continue
 
-                    # Time-based exit BEFORE closing on last target
+                    # ---- خروج زمني قبل بلوغ آخر هدف
                     if TIME_EXIT_ENABLED:
                         try:
                             created_at: Optional[datetime] = getattr(t, "created_at", None)
                             if created_at is None and hasattr(t, "opened_at"):
                                 created_at = getattr(t, "opened_at")  # fallback
                             if created_at and isinstance(created_at, datetime):
-                                # Only if TP1 not hit yet
+                                # اجعلها aware بـ UTC
+                                if created_at.tzinfo is None:
+                                    created_at = created_at.replace(tzinfo=timezone.utc)
                                 eff_last = int(getattr(t, "last_hit_idx", -1) or -1)
                                 if eff_last < 0:
-                                    # determine bars budget
-                                    bars_budget = None
-                                    # prefer per-trade saved value if exists
-                                    if hasattr(t, "max_bars_to_tp1") and t.max_bars_to_tp1:
-                                        bars_budget = int(t.max_bars_to_tp1)
-                                    else:
-                                        # strategy might store in extra JSON; try parse
-                                        try:
-                                            extra = json.loads(getattr(t, "extra_json", "") or "{}")
-                                            bars_budget = int(extra.get("max_bars_to_tp1")) if extra.get("max_bars_to_tp1") is not None else None
-                                        except Exception:
-                                            bars_budget = None
-                                    if bars_budget is None:
-                                        # default; try speed-up if strategy_code is BRK/SWEEP
-                                        bars_budget = TIME_EXIT_DEFAULT_BARS
-                                        try:
-                                            if getattr(t, "strategy_code", None) in ("BRK", "SWEEP"):
-                                                bars_budget = max(6, TIME_EXIT_DEFAULT_BARS - 2)
-                                        except Exception:
-                                            pass
-                                    # evaluate elapsed
-                                    elapsed = (datetime.now(timezone.utc) - created_at.replace(tzinfo=timezone.utc)).total_seconds()
+                                    bars_budget = _get_bars_budget_for_trade(t)
+                                    elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
                                     if elapsed >= bars_budget * tf_sec + TIME_EXIT_GRACE_SEC:
-                                        # close by time
-                                        result = "time"
-                                        exit_px = float(price)
+                                        result, exit_px = "time", price
                                         r_multiple = on_trade_closed_update_risk(t, result, exit_px)
                                         try:
                                             close_trade(s, t.id, result, exit_price=exit_px, r_multiple=r_multiple)
@@ -1092,11 +1338,11 @@ async def monitor_open_trades():
                         except Exception as e:
                             logger.debug(f"time-exit check warn: {e}")
 
-                    # No targets reached
+                    # ---- لا أهداف مُحقَّقة
                     if new_hit_idx < 0:
                         continue
 
-                    # Close if last target reached
+                    # ---- إغلاق عند بلوغ الهدف الأخير
                     if new_hit_idx >= len(tgts) - 1:
                         res_key = _tp_key(len(tgts) - 1)
                         exit_px = float(tgts[-1])
@@ -1106,7 +1352,7 @@ async def monitor_open_trades():
                         except Exception as e:
                             logger.warning(f"⚠️ close_trade warn: {e}")
 
-                        t.result = res_key  # for message rendering
+                        t.result = res_key  # للعرض
                         msg = format_close_text(t, r_multiple)
                         extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(res_key)
                         if extra:
@@ -1115,7 +1361,7 @@ async def monitor_open_trades():
                         await asyncio.sleep(0.05)
                         continue
 
-                    # Intermediate TP reached (progress)
+                    # ---- هدف وسيط مُحقَّق (تقدّم)
                     if new_hit_idx > last_idx:
                         update_last_hit_idx(s, t.id, new_hit_idx)
                         tmp = SimpleNamespace(
@@ -1126,7 +1372,6 @@ async def monitor_open_trades():
                         extra = (MESSAGES_CACHE.get(t.id, {}) or {}).get(_tp_key(new_hit_idx))
                         if extra:
                             msg += "\n\n" + extra
-                        # helpful hint at TP1
                         if new_hit_idx == 0:
                             msg += "\n\n🔒 اقتراح: انقل وقفك لنقطة الدخول لحماية الربح."
                         await notify_subscribers(msg)
@@ -1135,6 +1380,7 @@ async def monitor_open_trades():
         except Exception as e:
             logger.exception(f"MONITOR ERROR: {e}")
         await asyncio.sleep(MONITOR_INTERVAL_SEC)
+
 # ---------------------------
 # Membership housekeeping
 # ---------------------------
@@ -1201,14 +1447,30 @@ async def notify_trial_expiring_soon_loop():
 # Reports
 # ---------------------------
 
+def _safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
 def render_daily_report(stats: dict) -> str:
-    # stats keys from database._period_stats: signals, open, tp1, tp2, tp_total, sl, win_rate, r_sum
-    signals = stats.get("signals", 0)
-    open_now = stats.get("open", 0)
-    wins = stats.get("tp_total", (stats.get("tp1", 0) + stats.get("tp2", 0)))
-    losses = stats.get("sl", 0)
-    win_rate = float(stats.get("win_rate", 0.0))
-    r_sum = stats.get("r_sum", 0.0)
+    """
+    stats: ناتج database._period_stats
+    keys المتوقعة: signals, open, tp1, tp2, tp_total, sl, win_rate, r_sum
+    """
+    signals  = _safe_int(stats.get("signals", 0))
+    open_now = _safe_int(stats.get("open", 0))
+    # لو tp_total غير موجود نحسبه من tp1+tp2
+    wins     = _safe_int(stats.get("tp_total", stats.get("tp1", 0))) + _safe_int(stats.get("tp2", 0))
+    losses   = _safe_int(stats.get("sl", 0))
+    win_rate = max(0.0, min(100.0, _safe_float(stats.get("win_rate", 0.0))))
+    r_sum    = _safe_float(stats.get("r_sum", 0.0))
 
     msg = (
         "📊 <b>التقرير اليومي — لقطة أداء</b>\n"
@@ -1222,45 +1484,52 @@ def render_daily_report(stats: dict) -> str:
 
 def _report_card(stats_24: dict, stats_7: dict) -> str:
     part1 = render_daily_report(stats_24)
+
+    # ملخص 7 أيام
     try:
-        wr7 = float(stats_7.get("win_rate", 0.0))
-        n7 = int(stats_7.get("signals", 0))
-        r7 = float(stats_7.get("r_sum", 0.0))
+        wr7 = max(0.0, min(100.0, _safe_float(stats_7.get("win_rate", 0.0))))
+        n7  = _safe_int(stats_7.get("signals", 0))
+        r7  = _safe_float(stats_7.get("r_sum", 0.0))
         part2 = f"\n📅 آخر 7 أيام — إشارات: <b>{n7}</b> | نسبة الربح: <b>{wr7:.1f}%</b> | صافي R: <b>{r7:+.2f}R</b>"
     except Exception:
         part2 = ""
-    # “منذ آخر إشارة” + Auto-Relax level
+
+    # “منذ آخر إشارة” + مستوى Auto-Relax (من strategy_state.json)
     try:
         st_path = os.getenv("STRATEGY_STATE_FILE", "strategy_state.json")
-        last_ts = (json.loads(Path(st_path).read_text(encoding="utf-8")).get("last_signal_ts") or 0)
-        if last_ts:
-            hours = max(0, (time.time() - float(last_ts)) / 3600.0)
-            h1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
-            h2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
-            lvl = 2 if hours >= h2 else (1 if hours >= h1 else 0)
-            part2 += f"\n⏳ منذ آخر إشارة: <b>{hours:.1f} ساعة</b> | Auto-Relax: <b>L{lvl}</b>"
+        if Path(st_path).exists():
+            st = json.loads(Path(st_path).read_text(encoding="utf-8") or "{}")
+            last_ts = _safe_float(st.get("last_signal_ts", 0))
+            if last_ts > 0:
+                hours = max(0.0, (time.time() - last_ts) / 3600.0)
+                h1 = _safe_int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "6"), 6)
+                h2 = _safe_int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "12"), 12)
+                lvl = 2 if hours >= h2 else (1 if hours >= h1 else 0)
+                part2 += f"\n⏳ منذ آخر إشارة: <b>{hours:.1f} ساعة</b> | Auto-Relax: <b>L{lvl}</b>"
     except Exception:
         pass
+
     return part1 + part2
 
 async def daily_report_once():
     with get_session() as s:
-        stats_24 = get_stats_24h(s)
-        stats_7d = get_stats_7d(s)
-        await send_channel(_report_card(stats_24, stats_7d))
+        stats_24 = get_stats_24h(s) or {}
+        stats_7d = get_stats_7d(s) or {}
+        txt = _report_card(stats_24, stats_7d)
+        await send_channel(txt)
         logger.info("Daily report sent.")
 
 async def daily_report_loop():
     tz = pytz.timezone(TIMEZONE)
     while True:
-        now = datetime.now(tz)
-        target = now.replace(hour=DAILY_REPORT_HOUR_LOCAL, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target = target + timedelta(days=1)
-        delay = (target - now).total_seconds()
-        logger.info(f"Next daily report at {target.isoformat()} ({TIMEZONE})")
-        await asyncio.sleep(delay)
         try:
+            now = datetime.now(tz)
+            target = now.replace(hour=DAILY_REPORT_HOUR_LOCAL, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target = target + timedelta(days=1)
+            delay = max(1.0, (target - now).total_seconds())
+            logger.info(f"Next daily report at {target.isoformat()} ({TIMEZONE})")
+            await asyncio.sleep(delay)
             await daily_report_once()
         except Exception as e:
             logger.exception(f"DAILY_REPORT ERROR: {e} — retrying in 60s")
@@ -1276,14 +1545,17 @@ async def daily_report_loop():
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    # Try to link referral from deep link
+    # ربط الإحالة من ديب لينك (إن وُجد)
     payload_code = _parse_start_payload(m.text)
     if REFERRAL_ENABLED and payload_code:
         try:
             with get_session() as s:
                 linked, reason = link_referred_by(s, m.from_user.id, payload_code)
             if linked:
-                await m.answer("🤝 تم تسجيل كود الإحالة بنجاح. عند أول تفعيل مدفوع ستحصل على هدية الأيام تلقائيًا 🎁", parse_mode="HTML")
+                await m.answer(
+                    "🤝 تم تسجيل كود الإحالة بنجاح. عند أول تفعيل مدفوع ستحصل على هدية الأيام تلقائيًا 🎁",
+                    parse_mode="HTML"
+                )
             else:
                 await m.answer(f"ℹ️ لم يتم ربط الإحالة: {reason}", parse_mode="HTML")
         except Exception as e:
@@ -1322,7 +1594,6 @@ async def cb_show_ref(q: CallbackQuery):
             "2) أرسله لصديقك وسجِّل عبره\n"
             "3) بعد الدفع، تصلك الهدية تلقائيًا\n"
         )
-
         await q.message.answer(referral_msg, parse_mode="HTML", reply_markup=kb.as_markup())
     except Exception as e:
         logger.warning(f"show_ref_link error: {e}")
@@ -1341,10 +1612,10 @@ async def cmd_ref(m: Message):
     txt = (
         "🎁 <b>برنامج الإحالة</b>\n"
         f"• رابطك: <code>{link or '—'}</code>\n"
-        f"• مدعوون: <b>{stats.get('referred_count',0)}</b>\n"
-        f"• اشتركات مدفوعة عبرك: <b>{stats.get('paid_count',0)}</b>\n"
-        f"• أيام هدية: <b>{stats.get('total_bonus_days',0)}</b>\n"
-        "ارسل لأصدقائك هذا الرابط. عند أول اشتراك مدفوع لصديقك تحصلون على الهدية حسب سياسة البونص."
+        f"• مدعوون: <b>{_safe_int(stats.get('referred_count',0))}</b>\n"
+        f"• اشتراكات مدفوعة عبرك: <b>{_safe_int(stats.get('paid_count',0))}</b>\n"
+        f"• أيام هدية: <b>{_safe_int(stats.get('total_bonus_days',0))}</b>\n"
+        "أرسل هذا الرابط لصديقك. عند أول اشتراك مدفوع تُحتسب الهدية تلقائيًا."
     )
     await m.answer(txt, parse_mode="HTML")
 
@@ -1418,7 +1689,7 @@ async def get_channel_invite_link() -> Optional[str]:
         return CHANNEL_INVITE_LINK
     try:
         inv = await bot.create_chat_invite_link(TELEGRAM_CHANNEL_ID, creates_join_request=False)
-        return inv.invite_link
+        return getattr(inv, "invite_link", None)
     except Exception as e:
         logger.warning(f"INVITE_LINK create failed: {e}")
         return None
@@ -1435,7 +1706,7 @@ async def get_trial_invite_link(user_id: int) -> Optional[str]:
             member_limit=1,
             creates_join_request=False,
         )
-        return inv.invite_link
+        return getattr(inv, "invite_link", None)
     except Exception as e:
         logger.warning(f"INVITE_LINK(TRIAL) create failed: {e}")
         return None
@@ -1449,7 +1720,7 @@ async def get_paid_invite_link(user_id: int) -> Optional[str]:
             name=f"paid_{user_id}",
             creates_join_request=False,
         )
-        return inv.invite_link
+        return getattr(inv, "invite_link", None)
     except Exception as e:
         logger.warning(f"INVITE_LINK(PAID) create failed: {e}")
         return None
@@ -1463,7 +1734,7 @@ async def cb_req_sub(q: CallbackQuery):
     uname = (u.username and f"@{u.username}") or (u.full_name or "")
     user_line = f"{_h(uname)} (ID: <code>{uid}</code>)"
 
-    # أزرار الأدمن (نصوص محدثة؛ callback_data تبقى على 2w/4w)
+    # أزرار الأدمن (النص محدث؛ callback_data تبقى كما هي 2w/4w/gift1d)
     kb_admin = InlineKeyboardBuilder()
     kb_admin.button(text="✅ تفعيل 1 أسبوع (1w)", callback_data=f"approve_inline:{uid}:2w")
     kb_admin.button(text="✅ تفعيل 4 أسابيع (4w)", callback_data=f"approve_inline:{uid}:4w")
@@ -1479,6 +1750,7 @@ async def cb_req_sub(q: CallbackQuery):
         reply_markup=kb_admin.as_markup(),
     )
 
+    # رسالة للمستخدم
     try:
         price_line = (
             f"• 1 أسبوع: <b>{PRICE_2_WEEKS_USD}$</b> | "
@@ -1492,6 +1764,7 @@ async def cb_req_sub(q: CallbackQuery):
             wallet_line = "💳 محفظة USDT (TRC20):\n" + f"<code>{_h(USDT_TRC20_WALLET)}</code>\n\n"
     except Exception:
         pass
+
     await q.message.answer(
         "📩 تم إرسال طلبك للأدمن.\n"
         "يرجى التحويل ثم مراسلة الأدمن لتأكيد التفعيل.\n\n"
@@ -1505,6 +1778,14 @@ async def cb_req_sub(q: CallbackQuery):
     await q.answer()
 
 # === دفع يدوي: /submit_tx <hash> <1w|4w|2w|7d|28d> ===
+
+def _looks_like_tx_hash(s: str) -> bool:
+    s = (s or "").strip()
+    if len(s) < 8:
+        return False
+    # سماح بأحرف/أرقام ومع بعض الرموز الشائعة
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-_./")
+    return all(ch in allowed for ch in s)
 
 @dp.message(Command("submit_tx"))
 async def cmd_submit_tx(m: Message, command: CommandObject):
@@ -1521,22 +1802,33 @@ async def cmd_submit_tx(m: Message, command: CommandObject):
         )
 
     tx_hash, plan_in = args[0], args[1]
+    if not _looks_like_tx_hash(tx_hash):
+        return await m.answer("⚠️ هاش التحويل غير واضح. أرسِل الهاش الكامل كما يظهر لك.", parse_mode="HTML")
+
     plan = normalize_plan_token(plan_in)
     if not plan:
         return await m.answer("خطة غير صحيحة. استخدم 1w أو 4w.", parse_mode="HTML")
 
-    price = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
+    try:
+        price = PRICE_2_WEEKS_USD if plan == "2w" else PRICE_4_WEEKS_USD
+    except Exception:
+        price = "-"
+
     # إشعار الأدمن بطلب التفعيل
     kb_admin = InlineKeyboardBuilder()
     uid = m.from_user.id
-    kb_admin.button(text=f"✅ تفعيل { '1 أسبوع' if plan=='2w' else '4 أسابيع' }", callback_data=f"approve_inline:{uid}:{plan}")
+    kb_admin.button(
+        text=f"✅ تفعيل { '1 أسبوع' if plan=='2w' else '4 أسابيع' }",
+        callback_data=f"approve_inline:{uid}:{plan}"
+    )
     kb_admin.button(text="❌ رفض", callback_data=f"reject_inline:{uid}")
     kb_admin.button(text="👤 مراسلة المستخدم", url=f"tg://user?id={uid}")
     kb_admin.adjust(1)
 
+    uname = (m.from_user.username and f"@{m.from_user.username}") or (m.from_user.full_name or "")
     await send_admins(
         "🧾 <b>طلب تفعيل (تحويل يدوي)</b>\n"
-        f"المستخدم: @{m.from_user.username or m.from_user.full_name} (ID: <code>{uid}</code>)\n"
+        f"المستخدم: {_h(uname)} (ID: <code>{uid}</code>)\n"
         f"الخطة: <b>{'1w' if plan=='2w' else '4w'}</b> – السعر: <b>{price}$</b>\n"
         f"الهاش: <code>{_h(tx_hash)}</code>",
         reply_markup=kb_admin.as_markup()
@@ -1551,20 +1843,23 @@ async def cmd_submit_tx(m: Message, command: CommandObject):
 
 # === Admin Approvals (inline) ===
 
-def _bonus_applied_text(applied) -> str:
-    return "\n🎁 <i>تم إضافة هدية الإحالة (+{} يوم) تلقائيًا.</i>".format(REF_BONUS_DAYS) if applied else ""
+def _bonus_applied_text(applied: bool) -> str:
+    return f"\n🎁 <i>تم إضافة هدية الإحالة (+{REF_BONUS_DAYS} يوم) تلقائيًا.</i>" if applied else ""
 
 @dp.callback_query(F.data.startswith("approve_inline:"))
 async def cb_approve_inline(q: CallbackQuery):
     if q.from_user.id not in ADMIN_USER_IDS:
         return await q.answer("غير مُصرّح.", show_alert=True)
     try:
-        _, uid_str, plan = q.data.split(":")
+        parts = q.data.split(":")
+        if len(parts) != 3:
+            return await q.answer("صيغة غير صحيحة.", show_alert=True)
+        _, uid_str, plan = parts
         uid = int(uid_str)
         if plan not in ("2w", "4w", "gift1d"):
             return await q.answer("خطة غير صالحة.", show_alert=True)
 
-        # duration
+        # تحديد المدة
         if plan == "2w":
             dur = SUB_DURATION_2W
         elif plan == "4w":
@@ -1572,28 +1867,35 @@ async def cb_approve_inline(q: CallbackQuery):
         else:
             dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
 
+        # تنفيذ التفعيل
         with get_session() as s:
             end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
             bonus_applied = False
-            if REFERRAL_ENABLED and plan in ("2w","4w"):
+            if REFERRAL_ENABLED and plan in ("2w", "4w"):
                 try:
                     res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
                     bonus_applied = bool(res)
                 except Exception as e:
                     logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
 
+        # إشعار لوحة الأدمن
+        end_txt = (
+            end_at.strftime('%Y-%m-%d %H:%M UTC') if isinstance(end_at, datetime)
+            else str(end_at)
+        )
         await q.message.answer(
             f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{'1w' if plan=='2w' else plan}</b>.\n"
-            f"صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>"
+            f"صالح حتى: <code>{end_txt}</code>"
             f"{_bonus_applied_text(bonus_applied)}",
             parse_mode="HTML",
         )
 
-        # Send invite
+        # إرسال الدعوة للمستخدم
         invite = await get_paid_invite_link(uid)
         try:
             if invite:
-                title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
+                title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" \
+                        else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
                 msg = title
                 if bonus_applied:
                     msg += f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)."
@@ -1616,8 +1918,12 @@ async def cb_reject_inline(q: CallbackQuery):
     if q.from_user.id not in ADMIN_USER_IDS:
         return await q.answer("غير مُصرّح.", show_alert=True)
     try:
-        _, uid_str = q.data.split(":")
+        parts = q.data.split(":")
+        if len(parts) != 2:
+            return await q.answer("صيغة غير صحيحة.", show_alert=True)
+        _, uid_str = parts
         uid = int(uid_str)
+
         await q.message.answer(f"❌ تم رفض طلب الاشتراك للمستخدم <code>{uid}</code>.", parse_mode="HTML")
         try:
             await bot.send_message(uid, "ℹ️ تم رفض طلب الاشتراك. تواصل مع الأدمن للتفاصيل.", parse_mode="HTML")
@@ -1650,10 +1956,15 @@ async def cmd_help(m: Message):
 
 @dp.message(Command("pricing"))
 async def cmd_pricing(m: Message):
+    try:
+        p1 = PRICE_2_WEEKS_USD
+        p4 = PRICE_4_WEEKS_USD
+    except Exception:
+        p1 = p4 = "—"
     await m.answer(
         f"💳 <b>الأسعار</b>\n"
-        f"• 1 أسبوع: <b>{PRICE_2_WEEKS_USD}$</b>\n"
-        f"• 4 أسابيع: <b>{PRICE_4_WEEKS_USD}$</b>\n"
+        f"• 1 أسبوع: <b>{p1}$</b>\n"
+        f"• 4 أسابيع: <b>{p4}$</b>\n"
         "للتفعيل: اضغط زر «🔑 طلب اشتراك» من /start أو استخدم /submit_tx بعد التحويل.",
         parse_mode="HTML"
     )
@@ -1662,9 +1973,13 @@ async def cmd_pricing(m: Message):
 async def cmd_status(m: Message):
     with get_session() as s:
         ok = is_active(s, m.from_user.id)
-    txt_ok = "✅ <b>اشتراكك نشط.</b>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
+    txt_ok = "✅ <ب>اشتراكك نشط.</ب>\n🚀 ابق منضبطًا—النتيجة مجموع خطوات صحيحة."
     txt_no = "❌ <b>لا تملك اشتراكًا نشطًا.</b>\n✨ اطلب التفعيل وسيقوم الأدمن بإتمامه."
-    await m.answer(txt_ok if ok else txt_no, parse_mode="HTML")
+    # إصلاح الوسم الغليظ إن تعرّض لخطأ (fallback)
+    try:
+        await m.answer(txt_ok if ok else txt_no, parse_mode="HTML")
+    except Exception:
+        await m.answer("✅ اشتراكك نشط." if ok else "❌ لا تملك اشتراكًا نشطًا.")
 
 # ---------------------------
 # Admin commands + Debug helpers
@@ -1747,7 +2062,9 @@ async def admin_manual_router(m: Message):
 
     if stage == "await_user":
         try:
-            uid = int(m.text.strip())
+            uid = int((m.text or "").strip())
+            if uid <= 0:
+                raise ValueError("bad uid")
             flow["uid"] = uid
             flow["stage"] = "await_plan"
             kb = InlineKeyboardBuilder()
@@ -1770,41 +2087,53 @@ async def admin_manual_router(m: Message):
         return
 
     if stage == "await_ref":
-        ref = m.text.strip()
+        ref = (m.text or "").strip()
         if ref.lower() in ("/skip", "skip", "تخطي", "تخطى"):
             ref = None
-        uid = flow.get("uid"); plan = flow.get("plan")
+
+        uid = flow.get("uid")
+        plan = flow.get("plan")
         if plan == "2w":
             dur = SUB_DURATION_2W
         elif plan == "4w":
             dur = SUB_DURATION_4W
         else:
             dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
+
         try:
             with get_session() as s:
                 end_at = approve_paid(s, uid, plan, dur, tx_hash=ref)
                 bonus_applied = False
-                if REFERRAL_ENABLED and plan in ("2w","4w"):
+                if REFERRAL_ENABLED and plan in ("2w", "4w"):
                     try:
                         res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
                         bonus_applied = bool(res)
                     except Exception as e:
                         logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
+
             ADMIN_FLOW.pop(aid, None)
-            extra = f"{_bonus_applied_text(bonus_applied)}"
+            extra = _bonus_applied_text(bonus_applied)
+            end_txt = end_at.strftime('%Y-%m-%d %H:%M UTC') if isinstance(end_at, datetime) else str(end_at)
+
             await m.answer(
                 f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{'1w' if plan=='2w' else plan}</b>.\n"
-                f"صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>{extra}",
+                f"صالح حتى: <code>{end_txt}</code>{extra}",
                 parse_mode="HTML",
             )
+
+            # إرسال الدعوة
             invite = await get_paid_invite_link(uid)
             try:
                 if invite:
                     title = "🎁 تم تفعيل يوم مجاني إضافي! ادخل القناة:" if plan == "gift1d" else "✅ تم تفعيل اشتراكك. اضغط للدخول إلى القناة:"
-                    msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if extra else "")
+                    msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if bonus_applied else "")
                     await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
                 else:
-                    await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
+                    await bot.send_message(
+                        uid,
+                        "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.",
+                        parse_mode="HTML",
+                    )
             except Exception as e:
                 logger.warning(f"USER DM ERROR: {e}")
         except Exception as e:
@@ -1820,17 +2149,22 @@ async def cb_admin_plan(q: CallbackQuery):
     flow = ADMIN_FLOW.get(aid)
     if not flow or flow.get("stage") != "await_plan":
         return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
+
     plan = q.data.split(":", 1)[1]
     if plan not in ("2w", "4w", "gift1d"):
         return await q.answer("خطة غير صالحة.", show_alert=True)
+
     flow["plan"] = plan
     flow["stage"] = "await_ref"
+
     kb = InlineKeyboardBuilder()
     kb.button(text="تخطي المرجع", callback_data="admin_skip_ref")
     kb.button(text="إلغاء", callback_data="admin_cancel")
     kb.adjust(1)
+
     await q.message.answer(
-        "أرسل رقم مرجع (اختياري) لإرفاقه بالإيصال.\nأو اضغط «تخطي المرجع».",
+        "أرسل رقم مرجع (اختياري) لإرفاقه بالإيصال.\n"
+        "أو اضغط «تخطي المرجع».",
         reply_markup=kb.as_markup(),
     )
     await q.answer()
@@ -1843,30 +2177,38 @@ async def cb_admin_skip_ref(q: CallbackQuery):
     flow = ADMIN_FLOW.get(aid)
     if not flow or flow.get("stage") != "await_ref":
         return await q.answer("انتهت الجلسة أو غير صالحة.", show_alert=True)
-    uid = flow.get("uid"); plan = flow.get("plan")
+
+    uid = flow.get("uid")
+    plan = flow.get("plan")
     if plan == "2w":
         dur = SUB_DURATION_2W
     elif plan == "4w":
         dur = SUB_DURATION_4W
     else:
         dur = timedelta(hours=GIFT_ONE_DAY_HOURS)
+
     try:
         with get_session() as s:
             end_at = approve_paid(s, uid, plan, dur, tx_hash=None)
             bonus_applied = False
-            if REFERRAL_ENABLED and plan in ("2w","4w"):
+            if REFERRAL_ENABLED and plan in ("2w", "4w"):
                 try:
                     res = apply_referral_bonus_if_eligible(s, uid, bonus_days=REF_BONUS_DAYS)
                     bonus_applied = bool(res)
                 except Exception as e:
                     logger.warning(f"apply_referral_bonus_if_eligible error: {e}")
+
         ADMIN_FLOW.pop(aid, None)
-        extra = f"{_bonus_applied_text(bonus_applied)}"
+        extra = _bonus_applied_text(bonus_applied)
+        end_txt = end_at.strftime('%Y-%m-%d %H:%M UTC') if isinstance(end_at, datetime) else str(end_at)
+
         await q.message.answer(
             f"✅ تم التفعيل للمستخدم <code>{uid}</code> بخطة <b>{'1w' if plan=='2w' else plan}</b>.\n"
-            f"صالح حتى: <code>{end_at.strftime('%Y-%m-%d %H:%M UTC')}</code>{extra}",
+            f"صالح حتى: <code>{end_txt}</code>{extra}",
             parse_mode="HTML",
         )
+
+        # إرسال الدعوة
         invite = await get_paid_invite_link(uid)
         try:
             if invite:
@@ -1874,7 +2216,11 @@ async def cb_admin_skip_ref(q: CallbackQuery):
                 msg = title + (f"\n\n🎉 تمت إضافة مكافأة إحالة (+{REF_BONUS_DAYS} يوم)." if bonus_applied else "")
                 await bot.send_message(uid, msg, reply_markup=invite_kb(invite))
             else:
-                await bot.send_message(uid, "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.", parse_mode="HTML")
+                await bot.send_message(
+                    uid,
+                    "✅ تم التفعيل. لم أستطع توليد رابط الدعوة تلقائيًا — راسل الأدمن للحصول على الرابط.",
+                    parse_mode="HTML",
+                )
         except Exception as e:
             logger.warning(f"USER DM ERROR: {e}")
     except Exception as e:
@@ -1900,10 +2246,10 @@ async def cmd_debug_sig(m: Message, command: CommandObject):
         sig = check_signal(sym, data, htf if htf else None)
         if sig:
             txt = format_signal_text_basic(sig)
-            return await m.answer("✅ إشارة متاحة:\n\n"+txt, parse_mode="HTML", disable_web_page_preview=True)
+            return await m.answer("✅ إشارة متاحة:\n\n" + txt, parse_mode="HTML", disable_web_page_preview=True)
         # لا توجد إشارة: اعرض مقاييس مفيدة
         import pandas as pd
-        df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
+        df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
         close = float(df.iloc[-2]["close"]); vol = float(df.iloc[-2]["volume"])
         vma20 = float(df["volume"].rolling(20, min_periods=1).mean().iloc[-2])
         rvol = (vol / vma20) if vma20 > 0 else 0.0
@@ -1927,7 +2273,7 @@ async def cmd_relax(m: Message):
         last_ts = (json.loads(Path(st_path).read_text(encoding="utf-8")).get("last_signal_ts") or 0)
         h1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "24"))
         h2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "48"))
-        hours = 1e9 if not last_ts else max(0, (time.time() - float(last_ts))/3600.0)
+        hours = 1e9 if not last_ts else max(0, (time.time() - float(last_ts)) / 3600.0)
         lvl = 2 if hours >= h2 else (1 if hours >= h1 else 0)
         await m.answer(f"Auto-Relax: L{lvl} | منذ آخر إشارة: {hours:.1f} ساعة")
     except Exception as e:
@@ -2041,14 +2387,16 @@ async def main():
                 await asyncio.sleep(max(10, LEADER_TTL // 2))
         hb_task = asyncio.create_task(_leader_heartbeat_task(LEADER_LOCK_NAME, holder))
 
+    # ✅ تحميل أسواق OKX عبر اللودر الآمن ثم تهيئة AVAILABLE_SYMBOLS
     await load_okx_markets_and_filter()
 
-    # بناء أولي بالقائمة الحالية من symbols.py (مع الميتا)
+    # بناء أولي بالقائمة الحالية من symbols.py (مع الميتا) — يستخدم تكييف السواب داخليًا
     try:
         await rebuild_available_symbols((SYMBOLS, getattr(symbols_mod, "SYMBOLS_META", {}) or {}))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"init rebuild_available_symbols warn: {e}")
 
+    # حذف أي Webhook سابق قبل polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook deleted; starting polling.")
@@ -2057,6 +2405,7 @@ async def main():
 
     await check_channel_and_admin_dm()
 
+    # مهام الخلفية
     t1 = asyncio.create_task(resilient_polling())
     t2 = asyncio.create_task(loop_signals())
     t3 = asyncio.create_task(daily_report_loop())
