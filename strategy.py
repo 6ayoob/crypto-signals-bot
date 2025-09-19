@@ -1065,36 +1065,48 @@ def check_signal(
     trend_guard = (dist50_atr >= ema50_req) and (dist200_atr >= ema200_req)
     mixed_guard = (dist50_atr >= (0.15 if is_major else 0.20))
 
-    # ساعات BRK (+/- 1 ساعة تسامح)
+        # ساعات BRK (+/- 1 ساعة تسامح)
     brk_in_session = (int(prof["brk_hour_start"]) <= hr_riyadh <= int(prof["brk_hour_end"]))
-    if not brk_in_session and (abs(hr_riyadh - int(prof["brk_hour_start"])) <= 1 or abs(hr_riyadh - int(prof["brk_hour_end"])) <= 1):
+    if not brk_in_session and (
+        abs(hr_riyadh - int(prof["brk_hour_start"])) <= 1
+        or abs(hr_riyadh - int(prof["brk_hour_end"])) <= 1
+    ):
         brk_in_session = True
 
     # اختيار الست-أب
-    setup = None; struct_ok = False; reasons: list[str] = []
+    setup = None
+    struct_ok = False
+    reasons: list[str] = []
     brk_far = (price - hhv_prev) / max(atr, 1e-9) > MAX_BRK_DIST_ATR
 
-    if (breakout_ok and retest_ok and not brk_far and (rvol >= thr["RVOL_MIN"] or spike_ok) and brk_in_session):
+    if (
+        breakout_ok
+        and retest_ok
+        and not brk_far
+        and (rvol >= thr["RVOL_MIN"] or spike_ok)
+        and brk_in_session
+    ):
         if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
             if (rev_insideb or rev_engulf or candle_quality(closed, rvol)):
-                setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest","SessionOK"]
+                setup = "BRK"; struct_ok = True; reasons += ["Breakout+Retest", "SessionOK"]
 
     if (setup is None) and ((regime == "trend") or (regime != "trend" and mixed_guard)):
-# قرب من EMA21 أو تلاقي فيبو حقيقي (0.382/0.618) بناءً على آخر سوينغ
-fib_ok = False
-if USE_FIB:
-    sw = recent_swing(df, SWING_LOOKBACK)
-    if sw and sw[0] is not None and sw[1] is not None:
-        fib_ok = near_any_fib(price, sw[0], sw[1], FIB_TOL)[0]
+        # قرب من EMA21 أو تلاقي فيبو حقيقي (0.382/0.618) بناءً على آخر سوينغ
+        fib_ok = False
+        if USE_FIB:
+            sw = recent_swing(df, SWING_LOOKBACK)
+            if sw and sw[0] is not None and sw[1] is not None:
+                fib_ok = near_any_fib(price, sw[0], sw[1], FIB_TOL)[0]
 
-pull_near = (
-    abs(price - float(closed["ema21"])) / max(price, 1e-9) <= 0.005
-    or fib_ok
-)
+        pull_near = (
+            abs(price - float(closed["ema21"])) / max(price, 1e-9) <= 0.005
+            or fib_ok
+        )
         if pull_near and (rev_hammer or rev_engulf or rev_insideb):
             if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
                 if (price >= vwap_now * (1 - vw_tol)) and avwap_confluence_ok:
                     setup = "PULL"; struct_ok = True; reasons += ["Pullback Reclaim"]
+
 
     if (setup is None) and range_env and near_sup and (rev_hammer or candle_quality(closed, rvol)) and nr_recent:
         setup = "RANGE"; struct_ok = True; reasons += ["Range Rotation (NR)"]
