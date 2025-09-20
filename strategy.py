@@ -28,17 +28,33 @@ RISK_PROFILES = {
     "balanced":     {"SCORE_MIN": 72, "ATR_BAND": (0.0015, 0.020), "RVOL_MIN": 1.00, "TP_R": (1.0, 2.0, 3.5), "HOLDOUT_BARS": 2, "MTF_STRICT": True},
     "aggressive":   {"SCORE_MIN": 68, "ATR_BAND": (0.0012, 0.030), "RVOL_MIN": 0.95, "TP_R": (1.2, 2.4, 4.0), "HOLDOUT_BARS": 1, "MTF_STRICT": False},
 }
+
+# --- بروفايل خفيف "sniper" لاقتناص فرص جيدة مع محافظة على جودة الفلاتر ---
+RISK_PROFILES["sniper"] = {
+    "SCORE_MIN": 69,                 # أقل بقليل من balanced (72) لتمرير إشارات جيدة
+    "ATR_BAND": (0.0014, 0.0230),    # توسعة طفيفة لنطاق ATR
+    "RVOL_MIN": 0.95,                # قبول بعض الحالات قبل انفجار الحجم الكامل
+    "TP_R": (1.0, 2.0, 3.5),
+    "HOLDOUT_BARS": 2,
+    "MTF_STRICT": True,              # نحافظ على صرامة الفريمات لضمان جودة الإشارات
+}
+
 _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 
-SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "auto").lower()  # soft|balanced|strict|auto
-TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "2"))
+# اختر selectivity الافتراضي هنا "soft" ليُسهل مرور فرص جيدة عند عدم وجود ENV
+SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "soft").lower()  # soft|balanced|strict|auto
+
+# زيادة خفيفة في هدف الإشارات اليومي ليجعل DSC أرحم قليلاً
+TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "3"))
 
 USE_VWAP, USE_ANCHORED_VWAP = True, True
-VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.002, 0.008
+# زيادة طفيفة في سماحية VWAP
+VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.003, 0.010
+
 USE_FUNDING_GUARD, USE_OI_TREND, USE_BREADTH_ADJUST = True, True, True
-USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 3
+USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 4           # من 3 → 4
 MAX_BRK_DIST_ATR, BREAKOUT_BUFFER = 0.90, 0.0015
-RSI_EXHAUSTION, DIST_EMA50_EXHAUST_ATR = 76.0, 2.8
+RSI_EXHAUSTION, DIST_EMA50_EXHAUST_ATR = 80.0, 2.8    # RSI من 76 → 80
 
 TRAIL_AFTER_TP2 = True
 USE_MAX_BARS_TO_TP1, MAX_BARS_TO_TP1_BASE = True, 8
@@ -54,8 +70,10 @@ RES_BLOCK_NEAR, SUP_BLOCK_NEAR = 0.004, 0.003
 USE_FIB, SWING_LOOKBACK, FIB_TOL = True, 60, 0.004
 
 LOG_REJECTS = os.getenv("STRATEGY_LOG_REJECTS", "1").strip().lower() in ("1","true","yes","on")
-AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "6"))
-AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "12"))
+
+# تفعيل Relax أسرع قليلًا — يبدأ عند 5h ويصل أقصى تخفيف عند 10h
+AUTO_RELAX_AFTER_HRS_1 = int(os.getenv("AUTO_RELAX_AFTER_HRS_1", "5"))
+AUTO_RELAX_AFTER_HRS_2 = int(os.getenv("AUTO_RELAX_AFTER_HRS_2", "10"))
 BREADTH_MIN_RATIO = float(os.getenv("BREADTH_MIN_RATIO", "0.60"))
 
 MOTIVATION = {
@@ -70,6 +88,7 @@ MOTIVATION = {
 
 _LAST_ENTRY_BAR_TS: Dict[str, int] = {}
 _LAST_SIGNAL_BAR_IDX: Dict[str, int] = {}
+
 
 # ========= أدوات الحالة (State) =========
 def _now() -> int:
