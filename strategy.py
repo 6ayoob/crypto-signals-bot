@@ -494,7 +494,7 @@ def _qv_gate(
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    minbar_req = max(700.0, 0.020 * dyn_thr)  # كان 0.025 وأرضية 500 → تم ضبطه 700
+    minbar_req = max(700.0, 0.015 * dyn_thr)  # كان 0.025 وأرضية 500 → تم ضبطه 700
     below = int((window < minbar_req).sum())
     soft_floor = 0.60 * minbar_req
     too_low = int((window < soft_floor).sum())
