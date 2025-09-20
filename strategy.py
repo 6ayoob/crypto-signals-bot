@@ -499,7 +499,7 @@ def _qv_gate(
     soft_floor = 0.60 * minbar_req
     too_low = int((window < soft_floor).sum())
 
-    if qv_sum >= 1.10 * dyn_thr and below <= 2 and too_low == 0:
+    if qv_sum >= 1.05 * dyn_thr and below <= 2 and too_low == 0:
         return True, f"sum={qv_sum:.0f}≥{1.10*dyn_thr:.0f} minbar_soft({below}<=2)"
 
     ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
