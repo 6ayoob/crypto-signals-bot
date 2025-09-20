@@ -777,6 +777,28 @@ async def refresh_symbols_periodically():
 # ---------------------------
 # Data fetchers
 # ---------------------------
+def _okx_ticker_params(sym_eff: str) -> dict:
+    """
+    يحدّد instType المناسب لـ OKX (SWAP أو SPOT) إن أمكن من exchange.markets.
+    """
+    try:
+        m = None
+        if getattr(exchange, "markets", None):
+            m = exchange.markets.get(sym_eff)
+            if m is None:
+                # أحيانًا sym_eff يكون id (مثل IMX-USDT-SWAP)
+                mid = getattr(exchange, "markets_by_id", {}).get(sym_eff)
+                if mid:
+                    m = mid
+        if m:
+            if m.get("contract") or (m.get("type") == "swap"):
+                return {"instType": "SWAP"}
+            if m.get("spot") or (m.get("type") == "spot"):
+                return {"instType": "SPOT"}
+    except Exception:
+        pass
+    # افتراضي آمن: جرّب SWAP أولًا (أغلب رموزنا سواب)، وسنُسقط إلى SPOT بالفولباك داخل المستدعي.
+    return {"instType": "SWAP"}
 
 def _maybe_adapt_symbol_for_fetch(sym: str) -> str:
     """
