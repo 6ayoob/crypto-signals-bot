@@ -886,13 +886,12 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
     يجلب السعر الأخير مع تمرير instType لـ OKX + فولباكات:
     - fetch_ticker(sym, {"instType": guess}) ثم العكس ثم بدون بارامترات
     - إن فشل التيكر نأخذ mid من دفتر الأوامر
-    - لوج أدق: نوع الخطأ و repr(e)
+    - لوج أدق لسبب الفشل
     """
     def _guess_inst_type(sym: str) -> str:
         return "SWAP" if ":USDT" in (sym or "") else "SPOT"
 
     async def _fetch_ticker_any(sym: str) -> Optional[dict]:
-        # 1) النوع المتوقَّع
         try:
             await RATE.wait()
             loop = asyncio.get_event_loop()
@@ -901,7 +900,6 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
             )
         except Exception:
             pass
-        # 2) عكس النوع
         try:
             await RATE.wait()
             loop = asyncio.get_event_loop()
@@ -909,7 +907,6 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
             return await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym, params={"instType": alt}))
         except Exception:
             pass
-        # 3) بدون بارامترات
         try:
             await RATE.wait()
             loop = asyncio.get_event_loop()
@@ -945,7 +942,6 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
 
     for attempt in range(3):
         try:
-            # 1) التيكر (بكل الفولباكات)
             ticker = await _fetch_ticker_any(sym_eff)
             if ticker:
                 price = (
@@ -957,17 +953,14 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
                 if price is not None:
                     return float(price)
 
-            # 2) fallback: mid من دفتر الأوامر
             mid = await _fetch_book_mid(sym_eff)
             if mid is not None:
                 return float(mid)
 
-            # 3) محاولة أخيرة بالرمز الأصلي غير المكيَّف
             if sym_eff != symbol:
                 sym_eff = symbol
                 continue
 
-            # لا شيء متاح
             return None
 
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
@@ -982,12 +975,10 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
             logger.warning(f"❌ FETCH_TICKER BadSymbol [{symbol}]: {repr(e)}")
             return None
         except Exception as e:
-            # لوج أدق: النوع + repr + args
             logger.warning(f"❌ FETCH_TICKER ERROR [{sym_eff}] type={type(e).__name__} repr={repr(e)} args={getattr(e,'args',None)}")
             return None
 
     return None
-
 
 async def fetch_spread_pct(symbol: str) -> Optional[float]:
     """
