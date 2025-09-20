@@ -437,7 +437,7 @@ def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> p
     """قيمة الشمعة الدولارية = السعر * الحجم * معامل العقد (للـ perp=1 عادة)."""
     return df["close"] * df["volume"] * float(contract_size)
 
-def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.12) -> float:
+def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_median: float = 0.10) -> float:
     """Threshold ديناميكي يعتمد على Median آخر ~240 شمعة مع أرضية ثابتة لكل رمز."""
     try:
         x = qv_hist.dropna().tail(240)
