@@ -890,12 +890,40 @@ async def fetch_ohlcv_htf(symbol: str) -> dict:
     return {k: v for k, v in out.items() if v}
 
 async def fetch_ticker_price(symbol: str) -> Optional[float]:
+    """
+    يجلب آخر سعر بدقّة أعلى على OKX:
+    - يحاول تمرير instType المناسب (SWAP للرموز التي تحتوي ':USDT'، وإلا SPOT).
+    - في حال الفشل، يبدّل بين SWAP/SPOT ثم يجرب بدون params كفولباك نهائي.
+    - يحتفظ بنفس منطق إعادة المحاولة وBadSymbol كما في الأصل.
+    """
+    def _guess_inst_type(sym: str) -> str:
+        # عقود OKX عادةً ترميزها: "BTC/USDT:USDT" → SWAP
+        # بينما السبوت: "BTC/USDT" → SPOT
+        return "SWAP" if ":USDT" in (sym or "") else "SPOT"
+
     sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
+
     for attempt in range(3):
         try:
             await RATE.wait()
             loop = asyncio.get_event_loop()
-            ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym_eff))
+
+            params = {"instType": _guess_inst_type(sym_eff)}
+
+            def _do_fetch_ticker(sym: str, p: dict):
+                try:
+                    return exchange.fetch_ticker(sym, params=p)
+                except Exception:
+                    # فولباك 1: قلب النوع SPOT↔SWAP
+                    try:
+                        alt = {"instType": "SPOT"} if p.get("instType") == "SWAP" else {"instType": "SWAP"}
+                        return exchange.fetch_ticker(sym, params=alt)
+                    except Exception:
+                        # فولباك 2: بدون أي params
+                        return exchange.fetch_ticker(sym)
+
+            ticker = await loop.run_in_executor(None, lambda: _do_fetch_ticker(sym_eff, params))
+
             price = (
                 ticker.get("last")
                 or ticker.get("close")
@@ -903,8 +931,10 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
                 or (ticker.get("info", {}) or {}).get("close")
             )
             return float(price) if price is not None else None
+
         except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
             await asyncio.sleep(0.5 * (attempt + 1) + random.uniform(0.05, 0.2))
+
         except ccxt.BadSymbol:
             if sym_eff != symbol:
                 logger.info(f"FETCH_TICKER retry with original symbol after adapt fail: {sym_eff} -> {symbol}")
@@ -912,36 +942,111 @@ async def fetch_ticker_price(symbol: str) -> Optional[float]:
                 continue
             logger.warning(f"❌ FETCH_TICKER BadSymbol [{symbol}]")
             return None
+
         except Exception as e:
             logger.warning(f"❌ FETCH_TICKER ERROR [{sym_eff}]: {e}")
             return None
+
     return None
 
+
 async def fetch_spread_pct(symbol: str) -> Optional[float]:
-    """Return (ask-bid)/mid if both bid/ask available; None otherwise."""
-    sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
-    try:
-        await RATE.wait()
-        loop = asyncio.get_event_loop()
-        ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym_eff))
-        bid = ticker.get("bid")
-        ask = ticker.get("ask")
-        if bid is None or ask is None or bid <= 0 or ask <= 0:
+    """
+    يعيد (ask - bid) / mid إن توفّر bid/ask.
+    تحسينات:
+    - يمرّر instType إلى OKX: SWAP للرموز التي تحتوي ':USDT' وإلا SPOT.
+    - فولباك ذكي: جرّب عكس النوع (SPOT↔SWAP) ثم بدون بارامترات.
+    - إن لم تتوفر bid/ask من ticker، نحاول order_book (أفضل عرض/طلب).
+    """
+    def _guess_inst_type(sym: str) -> str:
+        return "SWAP" if ":USDT" in (sym or "") else "SPOT"
+
+    async def _fetch_ticker_any(sym: str) -> Optional[dict]:
+        # 1) بالـ instType المتوقّع
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, lambda: exchange.fetch_ticker(sym, params={"instType": _guess_inst_type(sym)})
+            )
+        except Exception:
+            pass
+        # 2) عكس النوع
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            alt = "SPOT" if _guess_inst_type(sym) == "SWAP" else "SWAP"
+            return await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym, params={"instType": alt}))
+        except Exception:
+            pass
+        # 3) بدون أي بارامترات
+        try:
+            await RATE.wait()
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: exchange.fetch_ticker(sym))
+        except Exception:
             return None
-        mid = (bid + ask) / 2.0
-        return (ask - bid) / max(mid, 1e-9)
-    except ccxt.BadSymbol:
-        if sym_eff != symbol:
-            # محاولة أخيرة على الأصل
+
+    async def _fetch_book_any(sym: str) -> Optional[tuple[float, float]]:
+        # نحاول بعمق صغير لتقليل الضغط
+        for params in (
+            {"instType": _guess_inst_type(sym)},
+            {"instType": "SPOT" if _guess_inst_type(sym) == "SWAP" else "SWAP"},
+            None,
+        ):
             try:
                 await RATE.wait()
                 loop = asyncio.get_event_loop()
-                ticker = await loop.run_in_executor(None, lambda: exchange.fetch_ticker(symbol))
-                bid = ticker.get("bid"); ask = ticker.get("ask")
+                if params is not None:
+                    book = await loop.run_in_executor(None, lambda: exchange.fetch_order_book(sym, limit=5, params=params))
+                else:
+                    book = await loop.run_in_executor(None, lambda: exchange.fetch_order_book(sym, limit=5))
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+                best_bid = float(bids[0][0]) if bids and bids[0] and bids[0][0] is not None else None
+                best_ask = float(asks[0][0]) if asks and asks[0] and asks[0][0] is not None else None
+                if best_bid and best_ask and best_bid > 0 and best_ask > 0:
+                    return best_bid, best_ask
+            except Exception:
+                continue
+        return None
+
+    sym_eff = _maybe_adapt_symbol_for_fetch(symbol)
+
+    try:
+        # 1) جرّب التيكر مع الفولباكات
+        ticker = await _fetch_ticker_any(sym_eff)
+        bid = (ticker or {}).get("bid")
+        ask = (ticker or {}).get("ask")
+
+        # 2) إن كان التيكر غير كافٍ، استخدم دفتر الأوامر
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            book_pair = await _fetch_book_any(sym_eff)
+            if not book_pair:
+                return None
+            bid, ask = book_pair
+
+        mid = (float(ask) + float(bid)) / 2.0
+        if mid <= 0:
+            return None
+        return (float(ask) - float(bid)) / max(mid, 1e-9)
+
+    except ccxt.BadSymbol:
+        # محاولة أخيرة بالرمز الأصلي غير المكيّف
+        if sym_eff != symbol:
+            try:
+                ticker = await _fetch_ticker_any(symbol)
+                bid = (ticker or {}).get("bid")
+                ask = (ticker or {}).get("ask")
                 if bid is None or ask is None or bid <= 0 or ask <= 0:
+                    book_pair = await _fetch_book_any(symbol)
+                    if not book_pair:
+                        return None
+                    bid, ask = book_pair
+                mid = (float(ask) + float(bid)) / 2.0
+                if mid <= 0:
                     return None
-                mid = (bid + ask) / 2.0
-                return (ask - bid) / max(mid, 1e-9)
+                return (float(ask) - float(bid)) / max(mid, 1e-9)
             except Exception:
                 return None
         return None
