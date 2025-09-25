@@ -525,22 +525,28 @@ def _qv_gate(
     if len(qv_series) < win:
         return False, "qv_window_short"
 
-    # نافذة ديناميكية حسب الساعة
+    # نافذة ديناميكية حسب الساعة (توسيع بسيط لليل)
     if hr_riyadh is not None:
         if 1 <= hr_riyadh <= 8:
             win = max(win, 12)
         elif 9 <= hr_riyadh <= 12:
             win = max(win, 11)
 
-      window = qv_series.tail(win)
+    window = qv_series.tail(win)
 
+    # عتبة ديناميكية من الوسيط (median) + ملف البروڤايل
     dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
-    lvl = relax_level()
-    if lvl == 1: dyn_thr *= 0.92
-    elif lvl >= 2: dyn_thr *= 0.84
 
-    # تليين اضافي للألتات ليلًا + عند صمت>24h
+    # مستويات التخفيف حسب مدة الصمت
+    lvl = relax_level()
+    if lvl == 1:
+        dyn_thr *= 0.92
+    elif lvl >= 2:
+        dyn_thr *= 0.84
+
     hours_silence = hours_since_last_signal()
+
+    # تليين إضافي للألتات ليلًا + مع الصمت
     if (not is_major) and hr_riyadh is not None and 1 <= hr_riyadh <= 8:
         dyn_thr *= 0.90
     if hours_silence >= 24:
@@ -548,19 +554,24 @@ def _qv_gate(
     if hours_silence >= 36:
         dyn_thr *= 0.88
 
+    # جمع النافذة وأصغر عمود
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    # متطلبات minbar أخف قليلًا مع التخفيف
+    # حد أدنى للشمعة الواحدة (minbar) مع تليين بالـ relax
     minbar_req = max(600.0, 0.012 * dyn_thr)
-    if lvl >= 1:  minbar_req *= 0.92
-    if lvl >= 2:  minbar_req *= 0.86
+    if lvl >= 1:
+        minbar_req *= 0.92
+    if lvl >= 2:
+        minbar_req *= 0.86
+    if low_vol_env:
+        minbar_req *= 0.96  # قليل فقط
 
     below = int((window < minbar_req).sum())
     soft_floor = 0.60 * minbar_req
     too_low = int((window < soft_floor).sum())
 
-    # قبول سريع إذا المجموع جيد وعدد القضبان الضعيفة قليل
+    # قبول سريع إذا المجموع جيّد والشموع الضعيفة قليلة
     if qv_sum >= 1.04 * dyn_thr and below <= 2 and too_low == 0:
         return True, f"sum={qv_sum:.0f}≥{1.04*dyn_thr:.0f} minbar_ok"
 
