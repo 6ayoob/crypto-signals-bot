@@ -528,7 +528,7 @@ def _qv_gate(
     if len(qv_series) < win:
         return False, "qv_window_short"
 
-    # نافذة ديناميكية حسب الساعة (توسيع بسيط لليل)
+    # نافذة ديناميكية حسب الساعة
     if hr_riyadh is not None:
         if 1 <= hr_riyadh <= 8:
             win = max(win, 12)
@@ -537,10 +537,10 @@ def _qv_gate(
 
     window = qv_series.tail(win)
 
-    # عتبة ديناميكية من الوسيط (median) + ملف البروڤايل
+    # عتبة ديناميكية
     dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
 
-    # مستويات التخفيف حسب مدة الصمت
+    # Auto-Relax الأساسي
     lvl = relax_level()
     if lvl == 1:
         dyn_thr *= 0.92
@@ -549,33 +549,32 @@ def _qv_gate(
 
     hours_silence = hours_since_last_signal()
 
-    # تليين إضافي للألتات ليلًا + مع الصمت
+    # تليين إضافي: ألتات ليلًا + صمت
     if (not is_major) and hr_riyadh is not None and 1 <= hr_riyadh <= 8:
         dyn_thr *= 0.90
-        if hours_silence >= SILENCE_SOFTEN_HOURS:
+    if hours_silence >= SILENCE_SOFTEN_HOURS:
         dyn_thr *= 0.92
-    if hours_silence >= SILENCE_SOFTEN_HOURS + 6:  # مثلاً مرحلة ثانية بعد 6 ساعات إضافية
+    if hours_silence >= SILENCE_SOFTEN_HOURS + 6:
         dyn_thr *= 0.88
 
-
-    # جمع النافذة وأصغر عمود
+    # مجموع النافذة وأصغر عمود
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    # حد أدنى للشمعة الواحدة (minbar) مع تليين بالـ relax
+    # حد أدنى للشمعة الواحدة (minbar) مع تليين
     minbar_req = max(600.0, 0.012 * dyn_thr)
     if lvl >= 1:
         minbar_req *= 0.92
     if lvl >= 2:
         minbar_req *= 0.86
     if low_vol_env:
-        minbar_req *= 0.96  # قليل فقط
+        minbar_req *= 0.96
 
     below = int((window < minbar_req).sum())
     soft_floor = 0.60 * minbar_req
     too_low = int((window < soft_floor).sum())
 
-    # قبول سريع إذا المجموع جيّد والشموع الضعيفة قليلة
+    # قبول سريع إذا المجموع جيد والشموع الضعيفة قليلة
     if qv_sum >= 1.04 * dyn_thr and below <= 2 and too_low == 0:
         return True, f"sum={qv_sum:.0f}≥{1.04*dyn_thr:.0f} minbar_ok"
 
