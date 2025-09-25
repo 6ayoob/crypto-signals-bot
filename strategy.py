@@ -1080,7 +1080,7 @@ def check_signal(
         lo_dyn *= 0.95; hi_dyn *= 1.07
 
         # --- ATR acceptance band (softened) ---
-      # حد أدنى T1 + قصّ تحت المقاومة
+    # حد أدنى T1 + قصّ تحت المقاومة
     if atr_pct <= 0.008:
         min_t1_pct = 0.0075
     elif atr_pct <= 0.020:
@@ -1089,23 +1089,24 @@ def check_signal(
         min_t1_pct = 0.0115
 
     min_t1_pct = max(min_t1_pct, MIN_T1_ABOVE_ENTRY)
-
-    # اسمح بخفض بسيط إذا الصمت > 36 ساعة
-if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
+    if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
         min_t1_pct *= 0.95
 
+    # قصّ T1 تحت المقاومة (إن وُجدت)
     t1, _ = _clamp_t1_below_res(
         price,
         t_list[0],
-        (res_eff if 'res_eff' in locals() else None),
-        buf_pct=0.0015
+        (res_eff if ('res_eff' in locals()) else None),
+        buf_pct=0.0015,
     )
     t_list[0] = t1
 
+    # التحقق من الفجوة الدنيا بين الدخول و T1
     if (t_list[0] - price) / max(price, 1e-9) < min_t1_pct:
         _log_reject(symbol, f"t1_entry_gap<{min_t1_pct:.3%}")
         return None
 
+    # ضمان الحدود الصحيحة
     if not (sl < price < t_list[0] <= t_list[-1]):
         _log_reject(symbol, "bounds_invalid(sl<price<t1<=tN)")
         return None
