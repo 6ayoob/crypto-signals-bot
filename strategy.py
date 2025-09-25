@@ -1076,23 +1076,28 @@ def check_signal(
     if mtf_has_frames and not d1_ok:  # توسعة طفيفة إذا D1 غير مُرضٍ
         lo_dyn *= 0.95; hi_dyn *= 1.07
 
-      eps_abs = 0.00018; eps_rel = 0.05
+        # --- ATR acceptance band (softened) ---
+    eps_abs = 0.00018
+    eps_rel = 0.05
     lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
-    hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
-    if is_major: hi_eff *= 1.08
-    if regime == "trend": 
+    hi_eff = hi_dyn * (1 + eps_rel) + eps_abs
+
+    if is_major:
+        hi_eff *= 1.08
+
+    if regime == "trend":
         hi_eff *= (1.08 if is_major else 1.05)
-    elif regime == "range": 
+    elif regime == "range":
         lo_eff *= 0.94
 
-    # إذا صمت>36h اسمح بهامش إضافي بسيط
-    if hours_since_last_signal() >= 36:
+    # هامش إضافي بسيط إذا الصمت > 9 ساعات
+    if hours_since_last_signal() >= 9:
         lo_eff *= 0.98
         hi_eff *= 1.02
- == "range": lo_eff *= 0.95
 
     if not (lo_eff <= atr_pct <= hi_eff):
-        _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
+        _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
+        return None
 
     # RVOL & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
