@@ -1080,7 +1080,7 @@ def check_signal(
         lo_dyn *= 0.95; hi_dyn *= 1.07
 
         # --- ATR acceptance band (softened) ---
-    # حد أدنى T1 + قصّ تحت المقاومة
+     # حد أدنى T1 + قصّ تحت المقاومة
     if atr_pct <= 0.008:
         min_t1_pct = 0.0075
     elif atr_pct <= 0.020:
@@ -1110,6 +1110,11 @@ def check_signal(
     if not (sl < price < t_list[0] <= t_list[-1]):
         _log_reject(symbol, "bounds_invalid(sl<price<t1<=tN)")
         return None
+
+    # مسافة المقاومة بـ R
+    R_val = max(price - sl, 1e-9)
+    srdist_R = ((res_eff - price) / R_val) if ('res_eff' in locals() and res_eff is not None and res_eff > price) else 10.0
+
 
 
     # RVOL & Spike
