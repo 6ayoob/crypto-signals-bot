@@ -1081,7 +1081,7 @@ def check_signal(
     vbr_min_dev = float(prof["vbr_min_dev_atr"])
     if (setup is None and (atr_pct <= 0.015) and nr_recent):
         dev_atr = (vwap_now - price) / max(atr, 1e-9)  # موجب إذا تحت VWAP
-        if dev_atr >= vbr_min_dev and (rev_hammer أو rev_engulf أو candle_quality(closed, rvol)):
+        if dev_atr >= vbr_min_dev and (rev_hammer or rev_engulf or candle_quality(closed, rvol)):
             setup = "VBR"
             struct_ok = True
             reasons += ["VWAP Band Reversion"]
