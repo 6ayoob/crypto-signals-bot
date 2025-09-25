@@ -532,27 +532,37 @@ def _qv_gate(
         elif 9 <= hr_riyadh <= 12:
             win = max(win, 11)
 
-    window = qv_series.tail(win)
+      window = qv_series.tail(win)
 
     dyn_thr = _dynamic_qv_threshold(sym_min_qv, qv_series, pct_of_median=0.12)
     lvl = relax_level()
-    if lvl == 1: dyn_thr *= 0.90
-    elif lvl >= 2: dyn_thr *= 0.80
-    if low_vol_env: dyn_thr *= 0.95
+    if lvl == 1: dyn_thr *= 0.92
+    elif lvl >= 2: dyn_thr *= 0.84
 
+    # تليين اضافي للألتات ليلًا + عند صمت>24h
+    hours_silence = hours_since_last_signal()
     if (not is_major) and hr_riyadh is not None and 1 <= hr_riyadh <= 8:
         dyn_thr *= 0.90
+    if hours_silence >= 24:
+        dyn_thr *= 0.92
+    if hours_silence >= 36:
+        dyn_thr *= 0.88
 
     qv_sum = float(window.sum())
     qv_min = float(window.min())
 
-    minbar_req = max(700.0, 0.015 * dyn_thr)
+    # متطلبات minbar أخف قليلًا مع التخفيف
+    minbar_req = max(600.0, 0.012 * dyn_thr)
+    if lvl >= 1:  minbar_req *= 0.92
+    if lvl >= 2:  minbar_req *= 0.86
+
     below = int((window < minbar_req).sum())
     soft_floor = 0.60 * minbar_req
     too_low = int((window < soft_floor).sum())
 
-    if qv_sum >= 1.05 * dyn_thr and below <= 2 and too_low == 0:
-        return True, f"sum={qv_sum:.0f}≥{1.10*dyn_thr:.0f} minbar_soft({below}<=2)"
+    # قبول سريع إذا المجموع جيد وعدد القضبان الضعيفة قليل
+    if qv_sum >= 1.04 * dyn_thr and below <= 2 and too_low == 0:
+        return True, f"sum={qv_sum:.0f}≥{1.04*dyn_thr:.0f} minbar_ok"
 
     ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
     return ok, f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
@@ -936,6 +946,18 @@ def build_payload(symbol: str, setup: str, price: float, sl: float, t_list: list
 def _log_reject(symbol: str, msg: str):
     if LOG_REJECTS:
         print(f"[strategy][reject] {symbol}: {msg}")
+    # سجّل السبب يوميًا في STATE_FILE
+    try:
+        s = _load_state()
+        _reset_daily_counters(s)
+        rc = s.get("reject_counters", {})
+        rc[msg] = int(rc.get(msg, 0)) + 1
+        s["reject_counters"] = rc
+        s["last_reject_ts"] = _now()
+        _save_state(s)
+    except Exception:
+        pass
+
 # ========= المولّد الرئيسي للإشارة (Merged+) =========
 def check_signal(
     symbol: str,
@@ -1043,12 +1065,21 @@ def check_signal(
     if mtf_has_frames and not d1_ok:  # توسعة طفيفة إذا D1 غير مُرضٍ
         lo_dyn *= 0.95; hi_dyn *= 1.07
 
-    eps_abs = 0.00015; eps_rel = 0.04
+      eps_abs = 0.00018; eps_rel = 0.05
     lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
     hi_eff = (hi_dyn * (1 + eps_rel) + eps_abs)
-    if is_major: hi_eff *= 1.06
-    if regime == "trend": hi_eff *= (1.06 if is_major else 1.03)
-    elif regime == "range": lo_eff *= 0.95
+    if is_major: hi_eff *= 1.08
+    if regime == "trend": 
+        hi_eff *= (1.08 if is_major else 1.05)
+    elif regime == "range": 
+        lo_eff *= 0.94
+
+    # إذا صمت>36h اسمح بهامش إضافي بسيط
+    if hours_since_last_signal() >= 36:
+        lo_eff *= 0.98
+        hi_eff *= 1.02
+ == "range": lo_eff *= 0.95
+
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]"); return None
 
@@ -1058,15 +1089,17 @@ def check_signal(
     rvol = float(closed["volume"]) / max(base_vol, 1e-9)
     z20 = float(df["vol_z20"].iloc[-2])
     spike_z = 1.2 - min(0.3, (atr_pct / 0.02) * 0.2)
-    vol_ema5  = df["volume"].ewm(span=5, adjust=False).mean().iloc[-2]
-    vol_ema20 = df["volume"].ewm(span=20, adjust=False).mean().iloc[-2]
-    accel_vol = (vol_ema5 > vol_ema20*1.05)
-    spike_ok = (z20 >= (spike_z - 0.15))
-    thr["RVOL_MIN"] = max(0.85 if is_major else 0.72, float(thr["RVOL_MIN"]))
+    # تليين إضافي مع الصمت
+    if hours_since_last_signal() >= 24:
+        thr["RVOL_MIN"] = max(0.80 if is_major else 0.70, float(thr["RVOL_MIN"]) - 0.05)
+        spike_z -= 0.10
+
     if rvol < thr["RVOL_MIN"] and not spike_ok:
-        if not (accel_vol and z20 >= (spike_z - 0.25)):
+        # اسمح بتسارع أقوى حتى لو z20 دون العتبة قليلًا
+        if not (accel_vol and z20 >= (spike_z - 0.35)):
             _log_reject(symbol, f"rvol<{thr['RVOL_MIN']:.2f} and no spike/accel (rv={rvol:.2f}, z={z20:.2f})")
             return None
+
 
     # حارس السوق
     if not market_guard_ok(prof, feats):
@@ -1263,10 +1296,14 @@ def check_signal(
     t_list = sorted(t_list)
 
     # حد أدنى T1 + قصّ تحت المقاومة
-    if atr_pct <= 0.008:   min_t1_pct = 0.008
-    elif atr_pct <= 0.020: min_t1_pct = 0.010
-    else:                  min_t1_pct = 0.012
+      if atr_pct <= 0.008:   min_t1_pct = 0.0075
+    elif atr_pct <= 0.020: min_t1_pct = 0.0095
+    else:                  min_t1_pct = 0.0115
     min_t1_pct = max(min_t1_pct, MIN_T1_ABOVE_ENTRY)
+    # اسمح بخفض 5% إضافية إذا صمت>36h
+    if hours_since_last_signal() >= 36:
+        min_t1_pct *= 0.95
+
 
     def _clamp_t1_below_res(entry: float, t1: float, res_: Optional[float], buf_pct: float = 0.0015) -> tuple[float, bool]:
         if res_ is None: return t1, False
