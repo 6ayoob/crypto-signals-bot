@@ -1086,7 +1086,7 @@ def check_signal(
             struct_ok = True
             reasons += ["VWAP Band Reversion"]
 
-    if (setup is None) and had_sweep and (rev_engulf أو candle_quality(closed, rvol) أو price > float(closed["ema21"])):
+    if (setup is None) and had_sweep and (rev_engulf or candle_quality(closed, rvol) or price > float(closed["ema21"])):
         setup = "SWEEP"
         struct_ok = True
         reasons += ["Liquidity Sweep"]
