@@ -32,6 +32,9 @@ APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = os.getenv("STRATEGY_STATE_FILE", str(APP_DATA_DIR / "strategy_state.json"))
 
 # ========= إعدادات عامة =========
+# --- Silence softening threshold (was 36h) ---
+SILENCE_SOFTEN_HOURS = int(os.getenv("SILENCE_SOFTEN_HOURS", "9"))
+
 VOL_MA = 20
 ATR_PERIOD = 14
 EMA_FAST, EMA_SLOW, EMA_TREND, EMA_LONG = 9, 21, 50, 200
@@ -549,10 +552,11 @@ def _qv_gate(
     # تليين إضافي للألتات ليلًا + مع الصمت
     if (not is_major) and hr_riyadh is not None and 1 <= hr_riyadh <= 8:
         dyn_thr *= 0.90
-    if hours_silence >= 24:
+        if hours_silence >= SILENCE_SOFTEN_HOURS:
         dyn_thr *= 0.92
-    if hours_silence >= 36:
+    if hours_silence >= SILENCE_SOFTEN_HOURS + 6:  # مثلاً مرحلة ثانية بعد 6 ساعات إضافية
         dyn_thr *= 0.88
+
 
     # جمع النافذة وأصغر عمود
     qv_sum = float(window.sum())
@@ -1077,27 +1081,36 @@ def check_signal(
         lo_dyn *= 0.95; hi_dyn *= 1.07
 
         # --- ATR acceptance band (softened) ---
-    eps_abs = 0.00018
-    eps_rel = 0.05
-    lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
-    hi_eff = hi_dyn * (1 + eps_rel) + eps_abs
+      # حد أدنى T1 + قصّ تحت المقاومة
+    if atr_pct <= 0.008:
+        min_t1_pct = 0.0075
+    elif atr_pct <= 0.020:
+        min_t1_pct = 0.0095
+    else:
+        min_t1_pct = 0.0115
 
-    if is_major:
-        hi_eff *= 1.08
+    min_t1_pct = max(min_t1_pct, MIN_T1_ABOVE_ENTRY)
 
-    if regime == "trend":
-        hi_eff *= (1.08 if is_major else 1.05)
-    elif regime == "range":
-        lo_eff *= 0.94
+    # اسمح بخفض بسيط إذا الصمت > 36 ساعة
+if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
+        min_t1_pct *= 0.95
 
-    # هامش إضافي بسيط إذا الصمت > 9 ساعات
-    if hours_since_last_signal() >= 9:
-        lo_eff *= 0.98
-        hi_eff *= 1.02
+    t1, _ = _clamp_t1_below_res(
+        price,
+        t_list[0],
+        (res_eff if 'res_eff' in locals() else None),
+        buf_pct=0.0015
+    )
+    t_list[0] = t1
 
-    if not (lo_eff <= atr_pct <= hi_eff):
-        _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
+    if (t_list[0] - price) / max(price, 1e-9) < min_t1_pct:
+        _log_reject(symbol, f"t1_entry_gap<{min_t1_pct:.3%}")
         return None
+
+    if not (sl < price < t_list[0] <= t_list[-1]):
+        _log_reject(symbol, "bounds_invalid(sl<price<t1<=tN)")
+        return None
+
 
     # RVOL & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
@@ -1106,9 +1119,10 @@ def check_signal(
     z20 = float(df["vol_z20"].iloc[-2])
     spike_z = 1.2 - min(0.3, (atr_pct / 0.02) * 0.2)
     # تليين إضافي مع الصمت
-    if hours_since_last_signal() >= 24:
+      if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
         thr["RVOL_MIN"] = max(0.80 if is_major else 0.70, float(thr["RVOL_MIN"]) - 0.05)
         spike_z -= 0.10
+
 
     if rvol < thr["RVOL_MIN"] and not spike_ok:
         # اسمح بتسارع أقوى حتى لو z20 دون العتبة قليلًا
@@ -1317,8 +1331,9 @@ def check_signal(
     else:                  min_t1_pct = 0.0115
     min_t1_pct = max(min_t1_pct, MIN_T1_ABOVE_ENTRY)
     # اسمح بخفض 5% إضافية إذا صمت>36h
-    if hours_since_last_signal() >= 36:
+      if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
         min_t1_pct *= 0.95
+
 
 
     def _clamp_t1_below_res(entry: float, t1: float, res_: Optional[float], buf_pct: float = 0.0015) -> tuple[float, bool]:
