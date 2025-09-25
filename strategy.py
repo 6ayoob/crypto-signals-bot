@@ -1181,17 +1181,15 @@ def check_signal(
         _log_reject(symbol, f"score<{thr['SCORE_MIN']} (got {score})")
         return None
 
-   # منطقة دخول ديناميكية
-if score >= 88 or rvol >= 1.50:
-    width_r = 0.14 * R_val
-elif score >= 84 or rvol >= 1.40:
-    width_r = 0.15 * R_val
-elif score >= 76 or rvol >= 1.15:
-    width_r = 0.25 * R_val
-else:
-    width_r = 0.35 * R_val
-
-
+      # منطقة دخول ديناميكية
+    if score >= 88 or rvol >= 1.50:
+        width_r = 0.14 * R_val
+    elif score >= 84 or rvol >= 1.40:
+        width_r = 0.15 * R_val
+    elif score >= 76 or rvol >= 1.15:
+        width_r = 0.25 * R_val
+    else:
+        width_r = 0.35 * R_val
     width_r = max(width_r, price * 0.003)
     width_r = min(width_r, ENTRY_MAX_R * R_val)
     entry_low = max(sl + 1e-6, price - width_r)
