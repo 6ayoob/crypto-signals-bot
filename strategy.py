@@ -1203,7 +1203,7 @@ def check_signal(
                 if t_list and USE_VWAP:
                     t_list[0] = max(t_list[0], vwap_now)  # T1≈VWAP
             else:
-                t_list, pct_vals = _build_targets_pct_from_atر(price, atr, ATR_MULT_RANGE)
+                t_list, pct_vals = _build_targets_pct_from_atr(price, atr, ATR_MULT_RANGE)
         else:
             t_list = _build_targets_r(price, sl, TARGETS_R5)
     else:
