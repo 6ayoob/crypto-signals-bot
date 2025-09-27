@@ -40,6 +40,18 @@ def _ensure_data(symbol: str, ohlcv: Optional[list], ohlcv_htf: Optional[object]
 # إن أردت اختبارًا يدويًا، استخدم سكربت منفصل (مثلاً test_strategy.py) أو:
 # if __name__ == "__main__":
 #     ... جلب بيانات وتجربة check_signal يدويًا ...
+# ---- Optional OKX fetch hook (safe if missing) ----
+try:
+    from okx_api import fetch_ohlcv as _okx_fetch_ohlcv
+except Exception:
+    _okx_fetch_ohlcv = None
+
+# ✅ غلاف عام ليستعمله bot.py عبر: from strategy import fetch_ohlcv
+def fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200):
+    if _okx_fetch_ohlcv is None:
+        # سيقع bot.py في except ويسجّل التحذير بدلاً من التعطّل
+        raise RuntimeError("okx_api.fetch_ohlcv is not available in this deployment")
+    return _okx_fetch_ohlcv(symbol, timeframe, limit)
 
 # ========= مسارات =========
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
