@@ -1128,8 +1128,8 @@ def check_signal(
             if sw and sw[0] is not None and sw[1] is not None:
                 fib_ok = near_any_fib(price, sw[0], sw[1], FIB_TOL)[0]
         pull_near = (abs(price - float(closed["ema21"])) / max(price, 1e-9) <= 0.005) or fib_ok
-        if pull_near and (rev_hammer or rev_engulf أو rev_insideb):
-            if ((regime == "trend" and trend_guard) أو (regime != "trend" and mixed_guard)):
+        if pull_near and (rev_hammer or rev_engulf or rev_insideb):
+            if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
                 if (price >= vwap_now * (1 - vw_tol)) and avwap_confluence_ok:
                     setup = "PULL"
                     struct_ok = True
