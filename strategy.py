@@ -11,6 +11,36 @@ from typing import Dict, List, Optional, Tuple
 import os, json, math, time, csv
 import pandas as pd
 import numpy as np
+from okx_api import fetch_ohlcv
+from strategy import strategy_entry
+
+symbols = ["BTC/USDT","ETH/USDT"]  # أو قائمتك
+for sym in symbols:
+    ltf = fetch_ohlcv(sym, "15m", 200)
+    htf = {
+        "H1": fetch_ohlcv(sym, "1h", 200),
+        "H4": fetch_ohlcv(sym, "4h", 200),
+        "D1": fetch_ohlcv(sym, "1d", 200),
+    }
+    sig = strategy_entry(sym, ltf, htf)
+    if sig:
+        print("[signal]", sym, sig)
+# أعلى الملف:
+try:
+    from okx_api import fetch_ohlcv as _fetch
+except Exception:
+    _fetch = None
+
+def _ensure_data(symbol, ohlcv, ohlcv_htf):
+    if (ohlcv is None or len(ohlcv) < 80) and _fetch:
+        ohlcv = _fetch(symbol, os.getenv("LTF_TF","15m"), 200)
+    if (ohlcv_htf is None) and _fetch:
+        ohlcv_htf = {
+            "H1": _fetch(symbol, "1h", 200),
+            "H4": _fetch(symbol, "4h", 200),
+            "D1": _fetch(symbol, "1d", 200),
+        }
+    return ohlcv, ohlcv_htf
 
 # ========= مسارات =========
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
