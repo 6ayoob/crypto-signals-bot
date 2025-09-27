@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 import os, json, math, time, csv
 import pandas as pd
 import numpy as np
-from okx_api import fetch_ohlcv
 from strategy import strategy_entry
 
 symbols = ["BTC/USDT","ETH/USDT"]  # أو قائمتك
@@ -41,6 +40,11 @@ def _ensure_data(symbol, ohlcv, ohlcv_htf):
             "D1": _fetch(symbol, "1d", 200),
         }
     return ohlcv, ohlcv_htf
+# ---- Optional OKX fetch hook (safe if missing) ----
+try:
+    from okx_api import fetch_ohlcv  # متوفر في بعض المشاريع
+except Exception:
+    fetch_ohlcv = None               # غير متوفر → سنعمل بالمدخلات فقط
 
 # ========= مسارات =========
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
@@ -785,15 +789,41 @@ def _log_reject(symbol: str, msg: str):
         _save_state(s)
     except Exception:
         pass
+def _ensure_data(symbol: str, ohlcv: list | None, ohlcv_htf: object | None):
+    """
+    يحاول جلب البيانات إذا لم تُمرَّر من الخارج وكان okx_api متاحًا.
+    يعيد (ohlcv, ohlcv_htf) مكتملين قدر الإمكان.
+    """
+    try:
+        need_ltf = (ohlcv is None) or (len(ohlcv) < 80)
+    except Exception:
+        need_ltf = True
 
+    if fetch_ohlcv:
+        if need_ltf:
+            try:
+                ohlcv = fetch_ohlcv(symbol, "15m", 240)
+            except Exception:
+                pass
+        if (ohlcv_htf is None) or (not isinstance(ohlcv_htf, dict)):
+            try:
+                ohlcv_htf = {
+                    "H1": fetch_ohlcv(symbol, "1h", 240),
+                    "H4": fetch_ohlcv(symbol, "4h", 240),
+                    "D1": fetch_ohlcv(symbol, "1d", 240),
+                }
+            except Exception:
+                pass
+    return ohlcv, ohlcv_htf
 # ========= المولّد الرئيسي للإشارة (Merged+) =========
-ohlcv, ohlcv_htf = _ensure_data(symbol, ohlcv, ohlcv_htf)
-
 def check_signal(
     symbol: str,
     ohlcv: list[list],
     ohlcv_htf: Optional[object] = None
 ) -> Optional[dict]:
+    # اجلب/أكمل البيانات إن احتجنا (بدون الاعتماد الإجباري على okx_api)
+    ohlcv, ohlcv_htf = _ensure_data(symbol, ohlcv, ohlcv_htf)
+
     # تحقق بيانات
     if not ohlcv or len(ohlcv) < 80:
         _log_reject(symbol, "insufficient_bars")
@@ -994,7 +1024,7 @@ def check_signal(
     if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
         avwap_confluence_ok = True
     above_vwap = (price >= vwap_now * (1 - vw_tol))
-    ema_align = two_of_three and above_vwap and (avwap_confluence_ok or not USE_ANCHORED_VWAP)
+    ema_align = two_of_three و above_vwap و (avwap_confluence_ok or not USE_ANCHORED_VWAP)
     if regime == "range" and not ema_align:
         near_vwap_soft = (price >= vwap_now * (1 - vw_tol * 1.35))
         two_of_three_soft = sum([price > float(closed["ema21"]), macd_pos, near_vwap_soft]) >= 2
@@ -1098,8 +1128,8 @@ def check_signal(
             if sw and sw[0] is not None and sw[1] is not None:
                 fib_ok = near_any_fib(price, sw[0], sw[1], FIB_TOL)[0]
         pull_near = (abs(price - float(closed["ema21"])) / max(price, 1e-9) <= 0.005) or fib_ok
-        if pull_near and (rev_hammer or rev_engulf or rev_insideb):
-            if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
+        if pull_near and (rev_hammer or rev_engulf أو rev_insideb):
+            if ((regime == "trend" and trend_guard) أو (regime != "trend" and mixed_guard)):
                 if (price >= vwap_now * (1 - vw_tol)) and avwap_confluence_ok:
                     setup = "PULL"
                     struct_ok = True
@@ -1166,7 +1196,7 @@ def check_signal(
                 if t_list and USE_VWAP:
                     t_list[0] = max(t_list[0], vwap_now)  # T1≈VWAP
             else:
-                t_list, pct_vals = _build_targets_pct_from_atr(price, atr, ATR_MULT_RANGE)
+                t_list, pct_vals = _build_targets_pct_from_atر(price, atr, ATR_MULT_RANGE)
         else:
             t_list = _build_targets_r(price, sl, TARGETS_R5)
     else:
@@ -1213,7 +1243,7 @@ def check_signal(
         _log_reject(symbol, f"score<{thr['SCORE_MIN']} (got {score})")
         return None
 
-      # منطقة دخول ديناميكية
+    # منطقة دخول ديناميكية
     if score >= 88 or rvol >= 1.50:
         width_r = 0.14 * R_val
     elif score >= 84 or rvol >= 1.40:
