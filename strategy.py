@@ -1024,7 +1024,7 @@ def check_signal(
     if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
         avwap_confluence_ok = True
     above_vwap = (price >= vwap_now * (1 - vw_tol))
-    ema_align = two_of_three و above_vwap و (avwap_confluence_ok or not USE_ANCHORED_VWAP)
+    ema_align = two_of_three and above_vwap and (avwap_confluence_ok or not USE_ANCHORED_VWAP)
     if regime == "range" and not ema_align:
         near_vwap_soft = (price >= vwap_now * (1 - vw_tol * 1.35))
         two_of_three_soft = sum([price > float(closed["ema21"]), macd_pos, near_vwap_soft]) >= 2
