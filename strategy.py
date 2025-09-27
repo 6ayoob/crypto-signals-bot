@@ -787,6 +787,8 @@ def _log_reject(symbol: str, msg: str):
         pass
 
 # ========= المولّد الرئيسي للإشارة (Merged+) =========
+ohlcv, ohlcv_htf = _ensure_data(symbol, ohlcv, ohlcv_htf)
+
 def check_signal(
     symbol: str,
     ohlcv: list[list],
