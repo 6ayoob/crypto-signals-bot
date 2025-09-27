@@ -466,8 +466,8 @@ def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_media
     return float(dyn)
 
 def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040, is_major: bool = False) -> float:
-    cap_eff = 0.0050 if is_major else cap
-    return min(cap_eff, max(base_low, 0.60 * atr_pct))
+    cap_eff = 0.0060 if is_major else 0.0050   # كان 0.005/0.004
+    return min(cap_eff, max(base_low, 0.80 * atr_pct))  # كان 0.60 * atr_pct
 
 def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10, low_vol_env: bool = False, is_major: bool = False, hr_riyadh: int | None = None) -> tuple[bool, str]:
     if len(qv_series) < win:
