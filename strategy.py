@@ -1027,7 +1027,7 @@ def check_signal(
 
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
     av_ok_count = sum([1 for v in av_list if _above(v)])
-    avwap_confluence_ok = (av_ok_count >= 2)
+    avwap_confluence_ok = (av_ok_count >= 1)
     if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
         avwap_confluence_ok = True
     above_vwap = (price >= vwap_now * (1 - vw_tol))
