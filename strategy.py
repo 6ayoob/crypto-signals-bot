@@ -574,7 +574,8 @@ def adapt_atr_band(atr_pct_series: pd.Series, base_band: tuple[float, float]) ->
     sm = _ema_smooth(atr_pct_series.tail(240), span=5)
     q_lo, q_hi = quantile_atr_band(sm)
     lvl = relax_level()
-    expand = 0.05 if lvl == 1 else (0.10 if lvl >= 2 else 0.0)
+    ATR_EXTRA_EXPAND = float(os.getenv("ATR_EXTRA_EXPAND", "0.02"))  # افتراضي +2%
+    expand = (0.05 if lvl == 1 else (0.10 if lvl >= 2 else 0.0)) + ATR_EXTRA_EXPAND
     lo = q_lo * (1 - expand)
     hi = q_hi * (1 + expand)
     return (max(1e-5, lo), max(hi, lo + 5e-5))
@@ -955,9 +956,8 @@ def check_signal(
         hi_dyn *= 1.07
 
     eps_abs = 0.00018
-    eps_rel = 0.05
-    lo_eff = max(1e-5, lo_dyn * (1 - eps_rel) - eps_abs)
-    hi_eff = hi_dyn * (1 + eps_rel) + eps_abs
+    ATR_EPS_REL_ADD = float(os.getenv("ATR_EPS_REL_ADD", "0.02"))  # افتراضي +2%
+    eps_rel = 0.05 + ATR_EPS_REL_ADD
     if is_major:
         hi_eff *= 1.08
     if regime == "trend":
