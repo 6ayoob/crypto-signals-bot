@@ -829,6 +829,7 @@ def check_signal(
     ohlcv: list[list],
     ohlcv_htf: Optional[object] = None
 ) -> Optional[dict]:
+    import math  # للتأكد موجود
     # اجلب/أكمل البيانات إن احتجنا (بدون الاعتماد الإجباري على okx_api)
     ohlcv, ohlcv_htf = _ensure_data(symbol, ohlcv, ohlcv_htf)
 
@@ -955,9 +956,20 @@ def check_signal(
         lo_dyn *= 0.95
         hi_dyn *= 1.07
 
+    # ==== FIX: تهيئة/اشتقاق lo_eff و hi_eff قبل أي استعمال ====
     eps_abs = 0.00018
     ATR_EPS_REL_ADD = float(os.getenv("ATR_EPS_REL_ADD", "0.02"))  # افتراضي +2%
     eps_rel = 0.05 + ATR_EPS_REL_ADD
+
+    # ابدأ من الديناميكي
+    lo_eff = float(lo_dyn)
+    hi_eff = float(hi_dyn)
+
+    # وسّع النطاق قليلاً (اختياري: مطلق + نسبي)
+    lo_eff = max(lo_eff - eps_abs, lo_eff * (1 - eps_rel))
+    hi_eff = min(hi_eff + eps_abs, hi_eff * (1 + eps_rel))
+
+    # تعديلات بحسب الـ regime والرمز وسكون الإشارات
     if is_major:
         hi_eff *= 1.08
     if regime == "trend":
@@ -967,9 +979,21 @@ def check_signal(
     if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
         lo_eff *= 0.98
         hi_eff *= 1.02
+
+    # حراسة صلاحية الحزمة
+    try:
+        if not (math.isfinite(lo_eff) and math.isfinite(hi_eff) and lo_eff > 0 and hi_eff > 0 and hi_eff > lo_eff):
+            _log_reject(symbol, "atr_band_invalid")
+            return None
+    except Exception:
+        _log_reject(symbol, "atr_band_invalid")
+        return None
+
+    # تحقق من أن ATR% داخل الحزمة
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
         return None
+    # ==== END FIX ====
 
     # RVOL & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
