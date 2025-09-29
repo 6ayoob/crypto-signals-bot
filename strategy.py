@@ -28,7 +28,7 @@ def fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200):
         raise RuntimeError("okx_api.fetch_ohlcv is not available in this deployment")
     return _okx_fetch_ohlcv(symbol, timeframe, limit)
 
-# ✅ نسخة موحَّدة من _ensure_data
+# ✅ نسخة موحَّدة من _ensure_data (واحدة فقط)
 def _ensure_data(symbol: str, ohlcv: Optional[list], ohlcv_htf: Optional[object]):
     """
     يُستخدم فقط إذا أرسلت None إلى check_signal/strategy_entry.
@@ -443,6 +443,7 @@ def nearest_resistance_above(df: pd.DataFrame, price: float, lookback: int = 60)
     piv = _pivot_highs(df.tail(lookback+5))
     above = [v for (_, v) in piv if v > price]
     return min(above) if above else None
+
 # ========= حارس السيولة / QV v2 =========
 def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> pd.Series:
     return df["close"] * df["volume"] * float(contract_size)
@@ -457,8 +458,8 @@ def _dynamic_qv_threshold(symbol_min_qv: float, qv_hist: pd.Series, pct_of_media
     return float(dyn)
 
 def _vwap_tol_pct(atr_pct: float, base_low: float = 0.0015, cap: float = 0.0040, is_major: bool = False) -> float:
-    cap_eff = 0.0060 if is_major else 0.0050   # كان 0.005/0.004
-    return min(cap_eff, max(base_low, 0.80 * atr_pct))  # كان 0.60 * atr_pct
+    cap_eff = 0.0060 if is_major else 0.0050
+    return min(cap_eff, max(base_low, 0.80 * atr_pct))
 
 def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10, low_vol_env: bool = False, is_major: bool = False, hr_riyadh: int | None = None) -> tuple[bool, str]:
     if len(qv_series) < win:
@@ -678,8 +679,6 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
     votes = sum([bool(breadth_ok), bool(funding_ok), bool(oi_ok)])
     return votes >= 2
 
-# --- الجزء 4/6 ---
-
 # ========= Score مع عقوبات ديناميكية =========
 def score_signal(
     struct_ok: bool,
@@ -732,51 +731,6 @@ def score_signal(
 
     return int(round(score)), bd
 
-# --- الجزء 5/6 ---
-
-# ========= وقف محمي لـ SWEEP =========
-def _compute_protected_sl(df_: pd.DataFrame, entry_price: float, atr_: float, setup_: str) -> float:
-    atr_leg = atr_ * (SWEEP_STOP_K if setup_ == "SWEEP" else 0.9)
-    try:
-        swing_low = float(df_.iloc[:-1]["low"].rolling(6, min_periods=3).min().iloc[-1])
-    except Exception:
-        swing_low = entry_price
-    struct_leg = swing_low - max(entry_price * SWEEP_BUFFER_PCT, 1e-6)
-    base_sl = entry_price - max(atr_leg, entry_price * 0.002)
-    sl_val = min(base_sl, struct_leg) if setup_ == "SWEEP" else base_sl
-    return float(sl_val)
-
-# ========= ضبط T1 تحت المقاومة =========
-def _clamp_t1_below_res(price: float, t1: float, res: Optional[float], buf_pct: float = 0.0015) -> tuple[float, bool]:
-    if res is None: return t1, False
-    if t1 >= res * (1 - buf_pct):
-        return res * (1 - buf_pct), True
-    return t1, False
-
-# ========= Payload =========
-def build_payload(symbol: str, setup: str, price: float, sl: float, t_list: list[float], score: int, regime: str) -> dict:
-    R_unit = max(price - sl, 1e-9)
-    tp1_R  = (t_list[0] - price) / R_unit if len(t_list) > 0 else None
-    tp2_R  = (t_list[1] - price) / R_unit if len(t_list) > 1 else None
-
-    return {
-        "symbol": symbol,
-        "setup": setup,
-        "price": price,
-        "sl": round(sl, 6),
-        "targets": [round(x, 6) for x in t_list],
-        "score": score,
-        "regime": regime,
-        "soft_stop": {"enabled": True, "seconds": SOFT_STOP_SECONDS, "max_mae_R": SOFT_MAX_MAE_R},
-        "r_unit": round(R_unit, 8),
-        "tp1_R": round(tp1_R, 3) if tp1_R else None,
-        "tp2_R": round(tp2_R, 3) if tp2_R else None,
-        "trail_after_tp1": TRAIL_AFTER_TP1,
-        "trail_atr_mult_tp1": TRAIL_ATR_MULT_TP1 if TRAIL_AFTER_TP1 else None,
-    }
-
-# --- الجزء 6/6 ---
-
 # ========= سجل الرفض =========
 def _log_reject(symbol: str, msg: str):
     if LOG_REJECTS:
@@ -792,33 +746,6 @@ def _log_reject(symbol: str, msg: str):
         _save_state(s)
     except Exception:
         pass
-
-def _ensure_data(symbol: str, ohlcv: list | None, ohlcv_htf: object | None):
-    """
-    يحاول جلب البيانات إذا لم تُمرَّر من الخارج وكان okx_api متاحًا.
-    يعيد (ohlcv, ohlcv_htf) مكتملين قدر الإمكان.
-    """
-    try:
-        need_ltf = (ohlcv is None) or (len(ohlcv) < 80)
-    except Exception:
-        need_ltf = True
-
-    if fetch_ohlcv:
-        if need_ltf:
-            try:
-                ohlcv = fetch_ohlcv(symbol, "15m", 240)
-            except Exception:
-                pass
-        if (ohlcv_htf is None) or (not isinstance(ohlcv_htf, dict)):
-            try:
-                ohlcv_htf = {
-                    "H1": fetch_ohlcv(symbol, "1h", 240),
-                    "H4": fetch_ohlcv(symbol, "4h", 240),
-                    "D1": fetch_ohlcv(symbol, "1d", 240),
-                }
-            except Exception:
-                pass
-    return ohlcv, ohlcv_htf
 
 # ========= المولّد الرئيسي للإشارة (Merged+) =========
 def check_signal(
@@ -899,7 +826,7 @@ def check_signal(
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
-    # ضبط RVول_MIN وفق breadth/relax + أرضية لكل فئة
+    # ضبط RVOL_MIN وفق breadth/relax + أرضية لكل فئة
     if breadth_pct is not None:
         if breadth_pct >= 0.70:
             thr["RVOL_MIN"] = max(0.75, float(thr.get("RVOL_MIN", 1.0)) - 0.08)
@@ -991,7 +918,7 @@ def check_signal(
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
         return None
 
-   # ==== END FIX ====
+    # ==== END FIX ====
 
     # RVOL & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
@@ -1057,7 +984,7 @@ def check_signal(
     if regime == "range" and not ema_align:
         near_vwap_soft = (price >= vwap_now * (1 - vw_tol * 1.35))
         two_of_three_soft = sum([price > float(closed["ema21"]), macd_pos, near_vwap_soft]) >= 2
-        if (two_of_three_soft and (av_ok_count >= 1 or bool(df["nr7"].iloc[-2] or df["nr4"].iloc[-2]))):
+        if (two_of_three_soft and (av_ok_count>=1 or bool(df["nr7"].iloc[-2] or df["nr4"].iloc[-2]))):
             ema_align = True
 
     # شرط الإغلاق فوق الافتتاح (مع استثناء pin-hammer الأحمر)
@@ -1260,9 +1187,9 @@ def check_signal(
         _log_reject(symbol, f"near_resistance_R={srdist_R:.2f}<0.70")
         return None
 
-    # سكور شامل
+    # سكور شامل — نمرّر ema_align بدل True
     score, bd = score_signal(
-        struct_ok, rvol, atr_pct, True, mtf_pass, srdist_R, mtf_has_frames,
+        struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
         thr["RVOL_MIN"], (lo_dyn, hi_dyn),
         oi_trend=None, breadth_pct=breadth_pct,
         avwap_confluence=avwap_confluence_ok if USE_ANCHORED_VWAP else None,
@@ -1338,13 +1265,6 @@ def check_signal(
         return base_[:n_]
     partials = _partials_for(score, len(t_list))
 
-    # قاعدة وقف — متوافقة مع الأساس القديم (meta فقط)
-    stop_rule = {
-        "type": "breakeven_after",
-        "at_idx": 0,
-        "meta": {"intended": "htf_close_below", "tf": os.getenv("STOP_RULE_TF", "H4").upper(), "htf_level": round(sl, 6)},
-    }
-
     messages = {
         "entry": MOTIVATION["entry"].format(symbol=symbol),
         "tp1": MOTIVATION["tp1"].format(symbol=symbol),
@@ -1360,7 +1280,7 @@ def check_signal(
         "symbol": symbol, "side": "buy",
         "entry": round(entry_out, 6), "entries": entries,
         "sl": round(sl, 6), "targets": [round(x, 6) for x in t_list],
-        "tp1": round(tp1, 6), "tp2": round(tp2, 6), "tp3": round(tp3, 6) if tp3 is not None else None,
+        "tp1": round(t1, 6), "tp2": round(tp2, 6), "tp3": round(tp3, 6) if tp3 is not None else None,
         "tp_final": round(tp_final, 6),
         "atr": round(atr, 6), "r": round(entry_out - sl, 6),
         "score": int(score), "regime": regime, "reasons": reasons,
