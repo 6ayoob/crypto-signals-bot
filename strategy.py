@@ -21,6 +21,14 @@ try:
 except Exception:
     _okx_fetch_ohlcv = None  # غير متوفر → سنعمل بالمدخلات فقط
 
+# ✅ غلاف عام ليستعمله bot.py عبر: from strategy import fetch_ohlcv
+def fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200):
+    if _okx_fetch_ohlcv is None:
+        # سيقع bot.py في except ويسجّل التحذير بدلاً من التعطّل
+        raise RuntimeError("okx_api.fetch_ohlcv is not available in this deployment")
+    return _okx_fetch_ohlcv(symbol, timeframe, limit)
+
+# ✅ نسخة موحَّدة من _ensure_data
 def _ensure_data(symbol: str, ohlcv: Optional[list], ohlcv_htf: Optional[object]):
     """
     يُستخدم فقط إذا أرسلت None إلى check_signal/strategy_entry.
@@ -35,23 +43,6 @@ def _ensure_data(symbol: str, ohlcv: Optional[list], ohlcv_htf: Optional[object]
             "D1": _okx_fetch_ohlcv(symbol, "1d", 200),
         }
     return ohlcv, ohlcv_htf
-
-# ⚠️ مهم: لا تضع أي كود تشغيل وقت الاستيراد هنا.
-# إن أردت اختبارًا يدويًا، استخدم سكربت منفصل (مثلاً test_strategy.py) أو:
-# if __name__ == "__main__":
-#     ... جلب بيانات وتجربة check_signal يدويًا ...
-# ---- Optional OKX fetch hook (safe if missing) ----
-try:
-    from okx_api import fetch_ohlcv as _okx_fetch_ohlcv
-except Exception:
-    _okx_fetch_ohlcv = None
-
-# ✅ غلاف عام ليستعمله bot.py عبر: from strategy import fetch_ohlcv
-def fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200):
-    if _okx_fetch_ohlcv is None:
-        # سيقع bot.py في except ويسجّل التحذير بدلاً من التعطّل
-        raise RuntimeError("okx_api.fetch_ohlcv is not available in this deployment")
-    return _okx_fetch_ohlcv(symbol, timeframe, limit)
 
 # ========= مسارات =========
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
@@ -579,6 +570,7 @@ def adapt_atr_band(atr_pct_series: pd.Series, base_band: tuple[float, float]) ->
     lo = q_lo * (1 - expand)
     hi = q_hi * (1 + expand)
     return (max(1e-5, lo), max(hi, lo + 5e-5))
+
 # ========= بوابة MTF خفيفة (H1/H4/D1) =========
 def _df_from_ohlcv(ohlcv: List[list]) -> Optional[pd.DataFrame]:
     try:
@@ -685,6 +677,7 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
 
     votes = sum([bool(breadth_ok), bool(funding_ok), bool(oi_ok)])
     return votes >= 2
+
 # --- الجزء 4/6 ---
 
 # ========= Score مع عقوبات ديناميكية =========
@@ -738,6 +731,7 @@ def score_signal(
     elif srdist_R < 1.0: score -= 2
 
     return int(round(score)), bd
+
 # --- الجزء 5/6 ---
 
 # ========= وقف محمي لـ SWEEP =========
@@ -780,6 +774,7 @@ def build_payload(symbol: str, setup: str, price: float, sl: float, t_list: list
         "trail_after_tp1": TRAIL_AFTER_TP1,
         "trail_atr_mult_tp1": TRAIL_ATR_MULT_TP1 if TRAIL_AFTER_TP1 else None,
     }
+
 # --- الجزء 6/6 ---
 
 # ========= سجل الرفض =========
@@ -797,6 +792,7 @@ def _log_reject(symbol: str, msg: str):
         _save_state(s)
     except Exception:
         pass
+
 def _ensure_data(symbol: str, ohlcv: list | None, ohlcv_htf: object | None):
     """
     يحاول جلب البيانات إذا لم تُمرَّر من الخارج وكان okx_api متاحًا.
@@ -823,6 +819,7 @@ def _ensure_data(symbol: str, ohlcv: list | None, ohlcv_htf: object | None):
             except Exception:
                 pass
     return ohlcv, ohlcv_htf
+
 # ========= المولّد الرئيسي للإشارة (Merged+) =========
 def check_signal(
     symbol: str,
@@ -902,7 +899,7 @@ def check_signal(
     MIN_T1_ABOVE_ENTRY = thr.get("MIN_T1_ABOVE_ENTRY", 0.010)
     holdout_eff = thr.get("HOLDOUT_BARS_EFF", base_cfg.get("HOLDOUT_BARS", 2))
 
-    # ضبط RVOL_MIN وفق breadth/relax + أرضية لكل فئة
+    # ضبط RVول_MIN وفق breadth/relax + أرضية لكل فئة
     if breadth_pct is not None:
         if breadth_pct >= 0.70:
             thr["RVOL_MIN"] = max(0.75, float(thr.get("RVOL_MIN", 1.0)) - 0.08)
@@ -993,7 +990,8 @@ def check_signal(
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
         return None
-    # ==== END FIX ====
+
+   # ==== END FIX ====
 
     # RVOL & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
