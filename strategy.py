@@ -443,6 +443,19 @@ def nearest_resistance_above(df: pd.DataFrame, price: float, lookback: int = 60)
     piv = _pivot_highs(df.tail(lookback+5))
     above = [v for (_, v) in piv if v > price]
     return min(above) if above else None
+def _clamp_t1_below_res(entry_price: float, t1: float, res_level: float | None, buf_pct: float = 0.0015):
+    """
+    يعيد T1 مقصوصًا تحت المقاومة (إن وُجدت) بهامش أمان buf_pct.
+    يرجع (t1_new, was_clamped: bool)
+    """
+    if res_level is None or res_level <= 0:
+        return float(t1), False
+    max_t1 = res_level * (1.0 - buf_pct)
+    if max_t1 <= entry_price:   # المقاومة قريبة جدًا
+        return float(t1), False  # اتركها كما هي ليمر شرط الرفض لاحقًا
+    if t1 > max_t1:
+        return float(max_t1), True
+    return float(t1), False
 
 # ========= حارس السيولة / QV v2 =========
 def _compute_quote_vol_series(df: pd.DataFrame, contract_size: float = 1.0) -> pd.Series:
