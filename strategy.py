@@ -985,7 +985,9 @@ def check_signal(
         avwap_day = None
 
     def _above(x: Optional[float], tol: float = vw_tol) -> bool:
-        return True if x is None else (price >= x * (1 - tol))
+         if x is None:
+             return False
+             return price >= x * (1 - tol)
 
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
     av_ok_count = sum([1 for v in av_list if _above(v)])
