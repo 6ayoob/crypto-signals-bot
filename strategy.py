@@ -35,7 +35,7 @@ def _ensure_data(symbol: str, ohlcv: Optional[list], ohlcv_htf: Optional[object]
     لا يعمل أي استدعاء خارجي إن لم تتوفر okx_api.
     """
     if (ohlcv is None or len(ohlcv) < 80) and _okx_fetch_ohlcv:
-        ohlcv = _okx_fetch_ohlcv(symbol, os.getenv("LTF_TF","15m"), 200)
+        ohlcv = _okx_fetch_ohlcv(symbol, LTF_TF, 200)
     if (ohlcv_htf is None) and _okx_fetch_ohlcv:
         ohlcv_htf = {
             "H1": _okx_fetch_ohlcv(symbol, "1h", 200),
