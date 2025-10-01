@@ -68,8 +68,7 @@ _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "soft").lower()  # soft|balanced|strict|auto
 TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "3"))
 
-USE_VWAP, USE_ANCHORED_VWAP = True, True
-VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.003, 0.010
+
 
 USE_FUNDING_GUARD, USE_OI_TREND, USE_BREADTH_ADJUST = True, True, True
 USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 4
@@ -111,14 +110,33 @@ SWEEP_STOP_K = float(os.getenv("SWEEP_STOP_K", "1.4"))           # 1.2..1.6
 SWEEP_BUFFER_PCT = float(os.getenv("SWEEP_BUFFER_PCT", "0.0012")) # 12 bps
 SOFT_STOP_SECONDS = int(os.getenv("SOFT_STOP_SECONDS", "120"))    # 60..180
 SOFT_MAX_MAE_R    = float(os.getenv("SOFT_MAX_MAE_R", "1.25"))    # market exit if MAE>limit during soft window
-SPREAD_MAX_BPS_MAJOR = int(os.getenv("SPREAD_MAX_BPS_MAJOR", "25"))
-SPREAD_MAX_BPS_ALT   = int(os.getenv("SPREAD_MAX_BPS_ALT", "35"))
-SLIPPAGE_MAX_BPS     = int(os.getenv("SLIPPAGE_MAX_BPS", "20"))
+
 TRAIL_AFTER_TP1 = os.getenv("TRAIL_AFTER_TP1", "0").lower() in ("1","true","yes","on")
 TRAIL_ATR_MULT_TP1 = float(os.getenv("TRAIL_ATR_MULT_TP1", "1.4"))
 
 _LAST_ENTRY_BAR_TS: Dict[str, int] = {}
 _LAST_SIGNAL_BAR_IDX: Dict[str, int] = {}
+# ---- ENV helpers & flags (مرنة مع أسماء مختلفة في اللوحة) ----
+def _as_bool(name, default="1"):
+    try:
+        return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
+    except Exception:
+        return default.strip().lower() in ("1","true","yes","on")
+
+# لوحّدنا اسم الإطار الزمني بين LTF_TF و TIMEFRAME
+LTF_TF = os.getenv("LTF_TF") or os.getenv("TIMEFRAME", "15m")
+
+# تفعيل VWAP/AVWAP من الـENV بدل التثبيت الصلب
+USE_VWAP = _as_bool("USE_VWAP", "1")                # 1=تشغيل (افتراضي)
+USE_ANCHORED_VWAP = _as_bool("USE_ANCHORED_VWAP", "1")
+
+# السماح باسمين مختلفين للانزلاق/السبريد (BP/BPS)
+SLIPPAGE_MAX_BPS = int(os.getenv("SLIPPAGE_MAX_BPS") or os.getenv("SLIPPAGE_MAX_BP", "20"))
+SPREAD_MAX_BPS_MAJOR = int(os.getenv("SPREAD_MAX_BPS_MAJOR") or os.getenv("SPREAD_MAX_BP", "25"))
+SPREAD_MAX_BPS_ALT   = int(os.getenv("SPREAD_MAX_BPS_ALT")   or os.getenv("SPREAD_MAX_BP", "35"))
+
+# باقي الثوابت كما هي:
+VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.003, 0.010
 
 # ========= أدوات الحالة (State) =========
 def _now() -> int:
