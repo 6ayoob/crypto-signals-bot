@@ -911,20 +911,17 @@ def check_signal(
         lo_dyn *= 0.95
         hi_dyn *= 1.07
 
-    # ==== FIX: تهيئة/اشتقاق lo_eff و hi_eff قبل أي استعمال ====
+    # ==== FIX (step 4): توسيع/تحقق نطاق ATR بأمان ====
     eps_abs = 0.00018
-    ATR_EPS_REL_ADD = float(os.getenv("ATR_EPS_REL_ADD", "0.02"))  # افتراضي +2%
+    ATR_EPS_REL_ADD = float(os.getenv("ATR_EPS_REL_ADD", "0.02"))
     eps_rel = 0.05 + ATR_EPS_REL_ADD
 
-    # ابدأ من الديناميكي
     lo_eff = float(lo_dyn)
     hi_eff = float(hi_dyn)
 
-    # وسّع النطاق قليلاً (اختياري: مطلق + نسبي)
     lo_eff = max(lo_eff - eps_abs, lo_eff * (1 - eps_rel))
     hi_eff = min(hi_eff + eps_abs, hi_eff * (1 + eps_rel))
 
-    # تعديلات بحسب الـ regime والرمز وسكون الإشارات
     if is_major:
         hi_eff *= 1.08
     if regime == "trend":
@@ -935,7 +932,6 @@ def check_signal(
         lo_eff *= 0.98
         hi_eff *= 1.02
 
-    # حراسة صلاحية الحزمة
     try:
         if not (math.isfinite(lo_eff) and math.isfinite(hi_eff) and lo_eff > 0 and hi_eff > 0 and hi_eff > lo_eff):
             _log_reject(symbol, "atr_band_invalid")
@@ -944,11 +940,9 @@ def check_signal(
         _log_reject(symbol, "atr_band_invalid")
         return None
 
-    # تحقق من أن ATR% داخل الحزمة
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
         return None
-
     # ==== END FIX ====
 
     # RVOL & Spike
@@ -1002,16 +996,16 @@ def check_signal(
     except Exception:
         avwap_day = None
 
+    # ==== FIX (step 5): لا تُحسب كونفلونس إذا AVWAP مفقود ====
     def _above(x: Optional[float], tol: float = vw_tol) -> bool:
-         if x is None:
-             return False
-             return price >= x * (1 - tol)
+        # نعتبرها "فوق" فقط إذا كان AVWAP موجودًا فعلاً
+        return (x is not None) and (price >= x * (1 - tol))
 
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
-    av_ok_count = sum([1 for v in av_list if _above(v)])
+    av_ok_count = sum(1 for v in av_list if _above(v))
     avwap_confluence_ok = (av_ok_count >= 1)
-    if regime == "range" and not avwap_confluence_ok and av_ok_count >= 1:
-        avwap_confluence_ok = True
+    # ==== END FIX ====
+
     above_vwap = (price >= vwap_now * (1 - vw_tol))
     ema_align = two_of_three and above_vwap and (avwap_confluence_ok or not USE_ANCHORED_VWAP)
     if regime == "range" and not ema_align:
