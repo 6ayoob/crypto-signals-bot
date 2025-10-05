@@ -14,6 +14,7 @@ import numpy as np
 
 # ⚠️ مهم: لا تستورد strategy من داخل strategy.py لتفادي الدائرة
 # (أزل: from strategy import strategy_entry)
+# --- Soften thresholds (env-tunable) ---
 
 # ---- Optional OKX fetch hook (safe if missing) ----
 try:
@@ -68,6 +69,12 @@ _cfg = RISK_PROFILES.get(RISK_MODE, RISK_PROFILES["balanced"])
 SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "soft").lower()  # soft|balanced|strict|auto
 TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "3"))
 
+# --- Soften thresholds (env-tunable) ---
+RVOL_MIN_FLOOR   = float(os.getenv("RVOL_MIN_FLOOR", "0.70"))   # لا نطلب RVOL أعلى من 0.70
+QV_THR_SCALE     = float(os.getenv("QV_THR_SCALE", "0.50"))     # خفّض عتبة السيولة للنصف
+ATR_WIDEN_LO     = float(os.getenv("ATR_WIDEN_LO", "0.90"))     # وسّع ATR لأسفل 10%
+ATR_WIDEN_HI     = float(os.getenv("ATR_WIDEN_HI", "1.12"))     # … ولأعلى 12%
+MIN_T1_GAP_FLOOR = float(os.getenv("MIN_T1_GAP_FLOOR", "0.003"))# 0.3% أرضية للفجوة
 
 
 USE_FUNDING_GUARD, USE_OI_TREND, USE_BREADTH_ADJUST = True, True, True
@@ -1096,7 +1103,7 @@ def check_signal(
     struct_ok = False
     reasons: list[str] = []
     brk_far = (price - hhv_prev) / max(atr, 1e-9) > MAX_BRK_DIST_ATR
-
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
     if breakout_ok and retest_ok and not brk_far and (rvol >= thr["RVOL_MIN"] or spike_ok) and brk_in_session:
         if ((regime == "trend" and trend_guard) or (regime != "trend" and mixed_guard)):
             if (rev_insideb or rev_engulf or candle_quality(closed, rvol)):
