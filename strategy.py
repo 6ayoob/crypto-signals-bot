@@ -1201,7 +1201,7 @@ def check_signal(
         min_t1_pct = 0.0095
     else:
         min_t1_pct = 0.0115
-    min_t1_pct = max(min_t1_pct, MIN_T1_ABOVE_ENTRY)
+    min_t1_pct = max(min_t1_pct, MIN_T1_GAP_FLOOR)
     if hours_since_last_signal() >= SILENCE_SOFTEN_HOURS:
         min_t1_pct *= 0.95
 
