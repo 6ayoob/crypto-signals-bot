@@ -1,83 +1,91 @@
 # config.py — تهيئة عبر متغيرات البيئة (Render) مع قيم افتراضية معقولة
-# ملاحظة: أي قيمة حساسة (مثل التوكن) يجب ضبطها في Environment وليس هنا.
+# ملاحظة: أي قيمة حساسة (مثل TELEGRAM_BOT_TOKEN) يجب ضبطها في Environment وليس هنا.
 
-import os
-
-def _as_bool(v: str | None, default: bool = True) -> bool:
-    if v is None: return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-# config.py — مسارات تشغيل موحّدة
 from pathlib import Path
 import os
 
-# مجلد تشغيل قابل للكتابة على Render (افتراضي /tmp؛ ويمكن تغييره بمتغير بيئة)
+# ===== أدوات مساعدة =====
+def _as_bool(v: str | None, default: bool = True) -> bool:
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _as_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+def _as_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+# ===== مسارات تشغيل موحّدة =====
 APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ملف الرموز الذي كان يُكتب داخل /mnt/data
+# ملف الرموز (قابل للكتابة داخل APP_DATA_DIR)
 STRATEGY_SYMBOLS_FILENAME = os.getenv("STRATEGY_SYMBOLS_FILENAME", "strategy_crypto_v2_5_symbols.py")
 STRATEGY_SYMBOLS_PATH = APP_DATA_DIR / STRATEGY_SYMBOLS_FILENAME
 
-# ========= تلغرام أساسي =========
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # ضعها في Render (إلزامي)
-# مثال لقنوات تيليجرام: -100xxxxxxxxxx
-TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "-1002800980577"))
+# ===== تيليجرام =====
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # إلزامي عبر البيئة
+TELEGRAM_CHANNEL_ID = _as_int("TELEGRAM_CHANNEL_ID", -1002800980577)
+ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "658712542").split(",") if x.strip()]
 
-# عدة مدراء مفصولين بفواصل: "111,222,333"
-ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "658712542").split(",")]
+# قناة/يوزر دعم (اختياري)
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")      # بدون @
+SUPPORT_CHAT_ID = _as_int("SUPPORT_CHAT_ID", 0)           # tg://user?id=...
 
-# ========= تواصل خاص مع الأدمن (لا يوجد دعم داخل البوت) =========
-# استخدم واحدًا منها أو كليهما:
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "")     # بدون @ (مثال: tayyib_pro)
-SUPPORT_CHAT_ID = int(os.getenv("SUPPORT_CHAT_ID", "0")) # معرّف الأدمن (لرابط tg://user?id=...)
+# ===== الدفع/الصورة =====
+USDT_TRC20_WALLET = os.getenv("USDT_TRC20_WALLET", "")
 
-# ========= إعدادات الدفع/الصورة =========
-USDT_TRC20_WALLET = os.getenv("USDT_TRC20_WALLET", "")   # عنوان محفظة TRC20
+# أولوية: ملف محلي ← file_id ← URL
+PAY_GUIDE_LOCAL_PATH = os.getenv("PAY_GUIDE_LOCAL_PATH", "")
+PAY_GUIDE_FILE_ID    = os.getenv("PAY_GUIDE_FILE_ID", "")
+PAY_GUIDE_URL        = os.getenv("PAY_GUIDE_URL", "")
 
-# أولوية الإرسال في البوت: ملف محلي ← file_id ← URL
-PAY_GUIDE_LOCAL_PATH = os.getenv("PAY_GUIDE_LOCAL_PATH", "")  # مثال: assets/payment_guide.jpg
-PAY_GUIDE_FILE_ID   = os.getenv("PAY_GUIDE_FILE_ID", "")      # ضع file_id الذي استخرجناه
-PAY_GUIDE_URL       = os.getenv("PAY_GUIDE_URL", "")          # رابط مباشر للصورة (اختياري)
-
-# ========= الإشارات والتقارير =========
+# ===== الإشارات والتقارير =====
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Riyadh")
-DAILY_REPORT_HOUR_LOCAL = int(os.getenv("DAILY_REPORT_HOUR_LOCAL", "9"))  # 9 صباحاً
+DAILY_REPORT_HOUR_LOCAL = _as_int("DAILY_REPORT_HOUR_LOCAL", 9)
 
-# ========= خطط الاشتراك =========
-PRICE_2_WEEKS_USD = int(os.getenv("PRICE_2_WEEKS_USD", "30"))
-PRICE_4_WEEKS_USD = int(os.getenv("PRICE_4_WEEKS_USD", "60"))
-SUB_DURATION_2W   = int(os.getenv("SUB_DURATION_2W", "14"))
-SUB_DURATION_4W   = int(os.getenv("SUB_DURATION_4W", "28"))
+# ===== الخطط والأسعار =====
+PRICE_2_WEEKS_USD = _as_int("PRICE_2_WEEKS_USD", 30)
+PRICE_4_WEEKS_USD = _as_int("PRICE_4_WEEKS_USD", 60)
+SUB_DURATION_2W   = _as_int("SUB_DURATION_2W", 14)
+SUB_DURATION_4W   = _as_int("SUB_DURATION_4W", 28)
 
-# ========= ضبط مسح الإشارات/المتابعة =========
-SIGNAL_SCAN_INTERVAL_SEC = int(os.getenv("SIGNAL_SCAN_INTERVAL_SEC", "300"))  # كل 5 دقائق
-MONITOR_INTERVAL_SEC     = int(os.getenv("MONITOR_INTERVAL_SEC", "15"))       # متابعة الصفقات
+# ===== مسح الإشارات/المتابعة =====
+SIGNAL_SCAN_INTERVAL_SEC = _as_int("SIGNAL_SCAN_INTERVAL_SEC", 300)  # كل 5 دقائق
+MONITOR_INTERVAL_SEC     = _as_int("MONITOR_INTERVAL_SEC", 15)       # متابعة الصفقات
 TIMEFRAME                = os.getenv("TIMEFRAME", "5m")
-SCAN_BATCH_SIZE          = int(os.getenv("SCAN_BATCH_SIZE", "10"))
-MAX_CONCURRENCY          = int(os.getenv("MAX_CONCURRENCY", "5"))
+SCAN_BATCH_SIZE          = _as_int("SCAN_BATCH_SIZE", 10)
+MAX_CONCURRENCY          = _as_int("MAX_CONCURRENCY", 5)
 
-# ========= حدود ومنع تكرار =========
-MAX_OPEN_TRADES   = int(os.getenv("MAX_OPEN_TRADES", "8"))
-DEDUPE_WINDOW_MIN = int(os.getenv("DEDUPE_WINDOW_MIN", "90"))  # منع تكرار إشارة لنفس الرمز خلال 90 دقيقة
+# ===== حدود ومنع تكرار =====
+MAX_OPEN_TRADES   = _as_int("MAX_OPEN_TRADES", 8)
+DEDUPE_WINDOW_MIN = _as_int("DEDUPE_WINDOW_MIN", 90)
 
-# ========= إدارة المخاطر V2 =========
-MAX_DAILY_LOSS_R   = float(os.getenv("MAX_DAILY_LOSS_R", "2.0"))  # حد خسارة يومي (R-)
-MAX_LOSSES_STREAK  = int(os.getenv("MAX_LOSSES_STREAK", "3"))     # خسائر متتالية قبل التهدئة
-COOLDOWN_HOURS     = int(os.getenv("COOLDOWN_HOURS", "6"))        # مدة التهدئة بالساعات
+# ===== إدارة المخاطر V2 =====
+MAX_DAILY_LOSS_R  = _as_float("MAX_DAILY_LOSS_R", 2.0)
+MAX_LOSSES_STREAK = _as_int("MAX_LOSSES_STREAK", 3)
+COOLDOWN_HOURS    = _as_int("COOLDOWN_HOURS", 6)
 
-# ========= OKX Rate Limiter =========
-OKX_PUBLIC_RATE_MAX   = int(os.getenv("OKX_PUBLIC_RATE_MAX", "18"))    # طلبات لكل نافذة
-OKX_PUBLIC_RATE_WINDOW= float(os.getenv("OKX_PUBLIC_RATE_WINDOW", "2"))# مدة النافذة بالثواني
+# ===== OKX Rate Limiter =====
+OKX_PUBLIC_RATE_MAX    = _as_int("OKX_PUBLIC_RATE_MAX", 18)
+OKX_PUBLIC_RATE_WINDOW = _as_float("OKX_PUBLIC_RATE_WINDOW", 2.0)
 
-# ========= قفل/قيادة (لمنع ازدواج العمال) =========
+# ===== Leader/Locks =====
 ENABLE_DB_LOCK   = _as_bool(os.getenv("ENABLE_DB_LOCK", "1"), True)
 LEADER_LOCK_NAME = os.getenv("LEADER_LOCK_NAME", "telebot_poller")
 SERVICE_NAME     = os.getenv("SERVICE_NAME", "svc")
-LEADER_TTL       = int(os.getenv("LEADER_TTL", "300"))  # ثوانٍ
+LEADER_TTL       = _as_int("LEADER_TTL", 300)
 
-# ========= قفل ملف محلي (اختياري) =========
-BOT_INSTANCE_LOCK = os.getenv("BOT_INSTANCE_LOCK", "/tmp/mk1_ai_bot.lock")  # على ويندوز يُنشئ mk1_ai_bot.lock بالمجلد
+# ===== قفل ملف محلي (اختياري) =====
+BOT_INSTANCE_LOCK = os.getenv("BOT_INSTANCE_LOCK", "/tmp/mk1_ai_bot.lock")
 
-# ========= فحوصات بسيطة =========
+# ===== فحص أساسي =====
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN مفقود! ضعه في متغيرات البيئة على Render.")
