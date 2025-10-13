@@ -2,7 +2,7 @@
 from __future__ import annotations
 """
 strategy.py — Router (BRK/PULL/RANGE/SWEEP/VBR) + MTF + S/R + VWAP/AVWAP
-Balanced+ v3.4.1 — نسخة مُحسّنة بثبات أعلى في AVWAP/QV/ATR وتخفيف ديناميكي أدق
+Balanced+ v3.4 — نسخة مُراجَعة سطر-بسطر مع إصلاحات الخروج السريع وR والتنفيذ
 """
 
 from datetime import datetime
@@ -14,13 +14,14 @@ import numpy as np
 
 # ---- Optional OKX fetch hook (safe if missing) ----
 try:
-    from okx_api import fetch_ohlcv as _okx_fetch_ohlcv
+    from okx_api import fetch_ohlcv as _okx_fetch_ohlcv  # متوفر في بعض المشاريع
 except Exception:
-    _okx_fetch_ohlcv = None
+    _okx_fetch_ohlcv = None  # غير متوفر → سنعمل بالمدخلات فقط
 
 # ✅ غلاف عام ليستعمله bot.py عبر: from strategy import fetch_ohlcv
 def fetch_ohlcv(symbol: str, timeframe: str = "15m", limit: int = 200):
     if _okx_fetch_ohlcv is None:
+        # سيقع bot.py في except ويسجّل التحذير بدلاً من التعطّل
         raise RuntimeError("okx_api.fetch_ohlcv is not available in this deployment")
     return _okx_fetch_ohlcv(symbol, timeframe, limit)
 
@@ -65,18 +66,19 @@ SELECTIVITY_MODE = os.getenv("SELECTIVITY_MODE", "soft").lower()  # soft|balance
 TARGET_SIGNALS_PER_DAY = float(os.getenv("TARGET_SIGNALS_PER_DAY", "3"))
 
 # --- Soften thresholds (env-tunable) ---
-RVOL_MIN_FLOOR   = float(os.getenv("RVOL_MIN_FLOOR", "0.70"))
-QV_THR_SCALE     = float(os.getenv("QV_THR_SCALE", "0.50"))
-ATR_WIDEN_LO     = float(os.getenv("ATR_WIDEN_LO", "0.90"))
-ATR_WIDEN_HI     = float(os.getenv("ATR_WIDEN_HI", "1.12"))
-MIN_T1_GAP_FLOOR = float(os.getenv("MIN_T1_GAP_FLOOR", "0.003"))
+RVOL_MIN_FLOOR   = float(os.getenv("RVOL_MIN_FLOOR", "0.70"))   # لا نطلب RVOL أعلى من 0.70
+QV_THR_SCALE     = float(os.getenv("QV_THR_SCALE", "0.50"))     # خفّض عتبة السيولة للنصف
+ATR_WIDEN_LO     = float(os.getenv("ATR_WIDEN_LO", "0.90"))     # وسّع ATR لأسفل 10%
+ATR_WIDEN_HI     = float(os.getenv("ATR_WIDEN_HI", "1.12"))     # … ولأعلى 12%
+MIN_T1_GAP_FLOOR = float(os.getenv("MIN_T1_GAP_FLOOR", "0.003"))# 0.3% أرضية للفجوة
 
 USE_FUNDING_GUARD, USE_OI_TREND, USE_BREADTH_ADJUST = True, True, True
 USE_PARABOLIC_GUARD, MAX_SEQ_BULL = True, 4
 MAX_BRK_DIST_ATR, BREAKOUT_BUFFER = 0.90, 0.0015
 RSI_EXHAUSTION, DIST_EMA50_EXHAUST_ATR = 80.0, 2.8
 
-TRAIL_AFTER_TP2 = True
+# (أُزيل التعريف القديم الثابت لـ TRAIL_AFTER_TP2 من هنا)
+
 USE_MAX_BARS_TO_TP1, MAX_BARS_TO_TP1_BASE = True, 8
 ENTRY_ZONE_WIDTH_R, ENTRY_MIN_PCT, ENTRY_MAX_R = 0.25, 0.005, 0.60
 ENABLE_MULTI_TARGETS = True
@@ -107,37 +109,40 @@ MOTIVATION = {
 }
 
 # === باتشات الخروج السريع (Config) ===
-SWEEP_STOP_K = float(os.getenv("SWEEP_STOP_K", "1.4"))
-SWEEP_BUFFER_PCT = float(os.getenv("SWEEP_BUFFER_PCT", "0.0012"))
-SOFT_STOP_SECONDS = int(os.getenv("SOFT_STOP_SECONDS", "120"))
-SOFT_MAX_MAE_R    = float(os.getenv("SOFT_MAX_MAE_R", "1.25"))
-
-TRAIL_AFTER_TP1 = os.getenv("TRAIL_AFTER_TP1", "0").lower() in ("1","true","yes","on")
-TRAIL_ATR_MULT_TP1 = float(os.getenv("TRAIL_ATR_MULT_TP1", "1.4"))
+SWEEP_STOP_K = float(os.getenv("SWEEP_STOP_K", "1.4"))           # 1.2..1.6
+SWEEP_BUFFER_PCT = float(os.getenv("SWEEP_BUFFER_PCT", "0.0012")) # 12 bps
+SOFT_STOP_SECONDS = int(os.getenv("SOFT_STOP_SECONDS", "120"))    # 60..180
+SOFT_MAX_MAE_R    = float(os.getenv("SOFT_MAX_MAE_R", "1.25"))    # market exit if MAE>limit during soft window
 
 _LAST_ENTRY_BAR_TS: Dict[str, int] = {}
 _LAST_SIGNAL_BAR_IDX: Dict[str, int] = {}
 
-# ---- ENV helpers & flags ----
+# ---- ENV helpers & flags (مرنة مع أسماء مختلفة في اللوحة) ----
 def _as_bool(name, default="1"):
     try:
         return os.getenv(name, default).strip().lower() in ("1","true","yes","on")
     except Exception:
         return default.strip().lower() in ("1","true","yes","on")
 
-# توحيد اسم الإطار الزمني
+# لوحّدنا اسم الإطار الزمني بين LTF_TF و TIMEFRAME
 LTF_TF = os.getenv("LTF_TF") or os.getenv("TIMEFRAME", "15m")
 
-# تفعيل VWAP/AVWAP من ENV
-USE_VWAP = _as_bool("USE_VWAP", "1")
+# تفعيل VWAP/AVWAP من الـENV بدل التثبيت الصلب
+USE_VWAP = _as_bool("USE_VWAP", "1")                # 1=تشغيل (افتراضي)
 USE_ANCHORED_VWAP = _as_bool("USE_ANCHORED_VWAP", "1")
 
-# انزلاق/سبريد
+# السماح باسمين مختلفين للانزلاق/السبريد (BP/BPS)
 SLIPPAGE_MAX_BPS = int(os.getenv("SLIPPAGE_MAX_BPS") or os.getenv("SLIPPAGE_MAX_BP", "20"))
 SPREAD_MAX_BPS_MAJOR = int(os.getenv("SPREAD_MAX_BPS_MAJOR") or os.getenv("SPREAD_MAX_BP", "25"))
 SPREAD_MAX_BPS_ALT   = int(os.getenv("SPREAD_MAX_BPS_ALT")   or os.getenv("SPREAD_MAX_BP", "35"))
 
+# باقي الثوابت كما هي:
 VWAP_TOL_BELOW, VWAP_MAX_DIST_PCT = 0.003, 0.010
+
+# ==== Trailing settings (موحّدة) ====
+# تفعيل/تعطيل التريلينغ بعد T2 من متغير بيئة (افتراضي: يعمل)
+TRAIL_AFTER_TP2 = _as_bool("TRAIL_AFTER_TP2", "1")
+# يمكن ضبط مضاعف ATR لاحقًا عبر البيئة (TRAIL_ATR_MULT_TP2)، وإلا نستخدم الذكي حسب السكور.
 
 # ========= أدوات الحالة (State) =========
 def _now() -> int:
@@ -464,11 +469,15 @@ def nearest_resistance_above(df: pd.DataFrame, price: float, lookback: int = 60)
     return min(above) if above else None
 
 def _clamp_t1_below_res(entry_price: float, t1: float, res_level: float | None, buf_pct: float = 0.0015):
+    """
+    يعيد T1 مقصوصًا تحت المقاومة (إن وُجدت) بهامش أمان buf_pct.
+    يرجع (t1_new, was_clamped: bool)
+    """
     if res_level is None or res_level <= 0:
         return float(t1), False
     max_t1 = res_level * (1.0 - buf_pct)
-    if max_t1 <= entry_price:
-        return float(t1), False
+    if max_t1 <= entry_price:   # المقاومة قريبة جدًا
+        return float(t1), False  # اتركها كما هي ليمر شرط الرفض لاحقًا
     if t1 > max_t1:
         return float(max_t1), True
     return float(t1), False
@@ -595,7 +604,7 @@ def adapt_atr_band(atr_pct_series: pd.Series, base_band: tuple[float, float]) ->
     sm = _ema_smooth(atr_pct_series.tail(240), span=5)
     q_lo, q_hi = quantile_atr_band(sm)
     lvl = relax_level()
-    ATR_EXTRA_EXPAND = float(os.getenv("ATR_EXTRA_EXPAND", "0.02"))
+    ATR_EXTRA_EXPAND = float(os.getenv("ATR_EXTRA_EXPAND", "0.02"))  # افتراضي +2%
     expand = (0.05 if lvl == 1 else (0.10 if lvl >= 2 else 0.0)) + ATR_EXTRA_EXPAND
     lo = q_lo * (1 - expand)
     hi = q_hi * (1 + expand)
@@ -708,7 +717,7 @@ def market_guard_ok(symbol_profile: dict, feats: dict) -> bool:
     votes = sum([bool(breadth_ok), bool(funding_ok), bool(oi_ok)])
     return votes >= 2
 
-# ========= Score =========
+# ========= Score مع عقوبات ديناميكية =========
 def score_signal(
     struct_ok: bool,
     rvol: float,
@@ -764,6 +773,7 @@ def score_signal(
 def _log_reject(symbol: str, msg: str):
     if LOG_REJECTS:
         print(f"[strategy][reject] {symbol}: {msg}")
+    # سجّل السبب يوميًا في STATE_FILE
     try:
         s = _load_state()
         _reset_daily_counters(s)
@@ -775,10 +785,14 @@ def _log_reject(symbol: str, msg: str):
     except Exception:
         pass
 
-# ========= المولّد الرئيسي للإشارة =========
-def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = None) -> Optional[dict]:
-    import math
-    # اجلب/أكمل البيانات
+# ========= المولّد الرئيسي للإشارة (Merged+) =========
+def check_signal(
+    symbol: str,
+    ohlcv: list[list],
+    ohlcv_htf: Optional[object] = None
+) -> Optional[dict]:
+    import math  # للتأكد موجود
+    # اجلب/أكمل البيانات إن احتجنا (بدون الاعتماد الإجباري على okx_api)
     ohlcv, ohlcv_htf = _ensure_data(symbol, ohlcv, ohlcv_htf)
 
     # تحقق بيانات
@@ -826,7 +840,7 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
     mtf_has_frames, mtf_pass, d1_ok, mtf_detail = pass_mtf_filter_any(ohlcv_htf)
     feats = extract_features(ohlcv_htf)
 
-    # Breadth hint
+    # Breadth hint من majors_state
     breadth_pct = None
     majors_state = feats.get("majors_state", [])
     try:
@@ -904,7 +918,7 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
         lo_dyn *= 0.95
         hi_dyn *= 1.07
 
-    # توسيع/تحقق نطاق ATR بأمان
+    # ==== FIX (step 4): توسيع/تحقق نطاق ATR بأمان ====
     eps_abs = 0.00018
     ATR_EPS_REL_ADD = float(os.getenv("ATR_EPS_REL_ADD", "0.02"))
     eps_rel = 0.05 + ATR_EPS_REL_ADD
@@ -936,6 +950,7 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
     if not (lo_eff <= atr_pct <= hi_eff):
         _log_reject(symbol, f"atr_pct_outside[{atr_pct:.4f}] not in [{lo_eff:.4f},{hi_eff:.4f}]")
         return None
+    # ==== END FIX ====
 
     # RVOL & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
@@ -969,7 +984,7 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
     price_above_ema50 = price > float(closed["ema50"])
     two_of_three = sum([ema50_slope_pos, macd_pos, price_above_ema50]) >= 2
 
-    # AVWAPs — لا نُحتسب الكونفلونس إن كانت القيمة None
+    # AVWAPs
     avwap_swing_low = avwap_swing_high = avwap_day = None
     hhv, llv, hi_idx, lo_idx = recent_swing(df, SWING_LOOKBACK)
     if lo_idx is not None:
@@ -983,19 +998,20 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
             utc=True,
         )
         last_day = ts.dt.date.iloc[-2]
-        # إذا لم يوجد أي بار في ذلك اليوم نتجاهل AVWAP اليومي
-        if (ts.dt.date == last_day).any():
-            day_start_idx = ts[ts.dt.date == last_day].index[0]
-            avwap_day = avwap_from_index(df, int(day_start_idx))
+        day_start_idx = ts[ts.dt.date == last_day].index[0]
+        avwap_day = avwap_from_index(df, int(day_start_idx))
     except Exception:
         avwap_day = None
 
+    # ==== FIX (step 5): لا تُحسب كونفلونس إذا AVWAP مفقود ====
     def _above(x: Optional[float], tol: float = vw_tol) -> bool:
+        # نعتبرها "فوق" فقط إذا كان AVWAP موجودًا فعلاً
         return (x is not None) and (price >= x * (1 - tol))
 
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
     av_ok_count = sum(1 for v in av_list if _above(v))
     avwap_confluence_ok = (av_ok_count >= 1)
+    # ==== END FIX ====
 
     above_vwap = (price >= vwap_now * (1 - vw_tol))
     ema_align = two_of_three and above_vwap and (avwap_confluence_ok or not USE_ANCHORED_VWAP)
@@ -1205,7 +1221,7 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
         _log_reject(symbol, f"near_resistance_R={srdist_R:.2f}<0.70")
         return None
 
-    # سكور شامل
+    # سكور شامل — نمرّر ema_align بدل True
     score, bd = score_signal(
         struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
         thr["RVOL_MIN"], (lo_dyn, hi_dyn),
@@ -1238,15 +1254,17 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
     tp3 = t_list[2] if len(t_list) > 2 else None
     tp_final = t_list[-1]
 
-    # Trailing متكيّف بالسكور
+    # Trailing متكيّف بالسكور + قابل للتهيئة من البيئة
     if score >= 88:
-        trail_mult = 0.9
+        trail_mult_auto = 0.9
     elif score >= 84:
-        trail_mult = 1.0
+        trail_mult_auto = 1.0
     elif score >= 76:
-        trail_mult = 1.2
+        trail_mult_auto = 1.2
     else:
-        trail_mult = 1.4
+        trail_mult_auto = 1.4
+
+    trail_mult_effective = float(os.getenv("TRAIL_ATR_MULT_TP2", str(trail_mult_auto)))
 
     # تحديث بصمة البار + عدّاد الانتقائية
     _LAST_ENTRY_BAR_TS[symbol] = cur_ts
@@ -1304,7 +1322,7 @@ def check_signal(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] = N
         "score": int(score), "regime": regime, "reasons": reasons,
         "partials": partials,
         "trail_after_tp2": TRAIL_AFTER_TP2,
-        "trail_atr_mult": trail_mult if TRAIL_AFTER_TP2 else None,
+        "trail_atr_mult": trail_mult_effective if TRAIL_AFTER_TP2 else None,
         "max_bars_to_tp1": max_bars_to_tp1,
         "profile": RISK_MODE, "strategy_code": setup, "messages": messages,
     }
@@ -1320,3 +1338,5 @@ def strategy_entry(symbol: str, ohlcv: list[list], ohlcv_htf: Optional[object] =
     except Exception as e:
         print(f"[strategy][error] {symbol}: {e}")
         return None
+
+# ========= نهاية الملف =========
