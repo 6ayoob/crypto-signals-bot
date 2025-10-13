@@ -3,22 +3,31 @@
 symbols.py
 بناء قائمة الرموز التي يتعامل معها البوت.
 
-- دائمًا نعيد "BASE/USDT" (سبوت). يقوم bot.py بتحويلها إلى عقود SWAP بإضافة ":USDT" إن لزم.
-- لا نعتمد على أي API خارجي بشكل حتمي؛ إن فشل الجلب من OKX نرجع لقائمة fallback ثابتة.
-- نوفر _prepare_symbols() التي تُعيد (list, meta) حيث meta تحمل {'source': 'SPOT' أو 'SWAP'} للإرشاد فقط.
+نُرجع دائمًا رموزًا بصيغة "BASE/USDT" (سبوت). يقوم bot.py لاحقًا بتكييفها لعقود
+USDT-M SWAP (بإضافة ":USDT") إن لزم. لا نعتمد على أي API خارجي بشكل حتمي:
+إن فشل الجلب من OKX نعود إلى قائمة fallback واسعة.
+
+واجهة الاستخدام:
+    from symbols import list_symbols, SYMBOLS, SYMBOLS_META
 """
 
 from __future__ import annotations
 import os
 import re
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
-# ============== إعدادات عامة قابلة للتهيئة ==============
+# ============== إعدادات عامة عبر البيئة ==============
+
+# نوع الأداة المستهدف (لأغراض meta فقط)
 INST_TYPE: str = os.getenv("INST_TYPE", "SWAP").strip().upper()  # "SPOT" أو "SWAP"
+
+# العدد المستهدف للرموز (نقصّ القائمة إلى هذا العدد؛ 0 أو سالب = بدون قصّ)
 TARGET_SYMBOLS_COUNT: int = int(os.getenv("TARGET_SYMBOLS_COUNT", "120"))
+
+# حد أدنى لحجم 24 ساعة بالدولار (غير مُطبَّق هنا؛ يطبّقه bot.py عند التحقق)
 MIN_24H_USD_VOL: float = float(os.getenv("MIN_24H_USD_VOL", "0"))
 
-# استثناء رموز الرافعة (Spot Leveraged Tokens)
+# استثناء رموز الرافعة (Spot Leveraged Tokens) باللاحقة التالية
 _DEF_LEV = {"3L", "3S", "5L", "5S", "UP", "DOWN"}
 
 def _env_set(name: str, default: List[str] | set[str]) -> set[str]:
@@ -30,16 +39,26 @@ def _env_set(name: str, default: List[str] | set[str]) -> set[str]:
 
 LEVERAGED_SUFFIXES: set[str] = _env_set("EXCLUDE_LEVERAGED_SUFFIXES", _DEF_LEV)
 
-# قوائم إدراج/استبعاد يدوية
+# قوائم الإدراج/الاستبعاد اليدوية
+# أمثلة:
+#   INCLUDE_BASES="RNDR,TAO,ENA"
+#   EXCLUDE_BASES="PEPE,WIF"
 _INCLUDE_BASES: set[str] = _env_set("INCLUDE_BASES", [])
 _EXCLUDE_BASES: set[str] = _env_set("EXCLUDE_BASES", [])
+# استبعاد أزواج كاملة بصيغة BASE/QUOTE لو لزم
 _EXCLUDE_SYMBOLS: set[str] = {s.strip().upper() for s in (os.getenv("EXCLUDE_SYMBOLS") or "").split(",") if s.strip()}
+# يمكنك إجبار القائمة بالكامل عبر MANUAL_SYMBOLS (تفصل بفواصل)
 _MANUAL_SYMBOLS_RAW = [s.strip().upper() for s in (os.getenv("MANUAL_SYMBOLS") or "").split(",") if s.strip()]
 
 # ============== أدوات مساعدة ==============
+
 def _is_leveraged_base(base: str) -> bool:
-    base = base.upper()
-    return any(base.endswith(suf) for suf in LEVERAGED_SUFFIXES)
+    """True إذا كان BASE ينتهي بلاحقة رافعة (3L/3S/5L/5S/UP/DOWN)."""
+    b = base.upper()
+    for suf in LEVERAGED_SUFFIXES:
+        if b.endswith(suf):
+            return True
+    return False
 
 def _mk(base: str, quote: str = "USDT") -> str:
     return f"{base.upper()}/{quote.upper()}"
@@ -48,7 +67,7 @@ def _clean_and_dedupe(symbols: List[str]) -> List[str]:
     """
     - توحيد الصيغة إلى BASE/USDT
     - إسقاط الرموز غير الصالحة
-    - إزالة المكررات
+    - إزالة المكررات مع الحفاظ على الترتيب
     - تطبيق قوائم الاستبعاد
     - استبعاد رموز الرافعة
     """
@@ -69,11 +88,8 @@ def _clean_and_dedupe(symbols: List[str]) -> List[str]:
         else:
             base, quote = s, "USDT"
 
-        # تطبيع سريع لبعض صيغ البورصات (مثلاً BASE-USDT → BASE/USDT)
-        base = base.replace("-", "")
         if not re.fullmatch(r"[A-Z0-9\-]+", base):
             continue
-
         if _is_leveraged_base(base):
             continue
 
@@ -84,11 +100,13 @@ def _clean_and_dedupe(symbols: List[str]) -> List[str]:
         if sym not in seen:
             seen.add(sym)
             out.append(sym)
+
     return out
 
 # ============== قائمة افتراضية كبيرة (Fallback) ==============
+# قائمة واسعة لأشهر الرموز (سبوت) — تُختصر لاحقًا حسب TARGET_SYMBOLS_COUNT
 _FALLBACK_BASES = [
-    # Top majors
+    # Majors
     "BTC","ETH","SOL","BNB","XRP","DOGE","ADA","TRX","TON","AVAX",
     "DOT","LINK","MATIC","NEAR","APT","ARB","OP","ATOM","ETC","XLM",
     "FIL","ICP","LTC","BCH","INJ","SUI","HBAR","TIA","SEI","AAVE",
@@ -106,8 +124,6 @@ _FALLBACK_BASES = [
     "CELO","GMT","WOO","HOT","ILV","KNC","MASK","POLYX","RIF","RSR",
     "SXP","TOMO","VET","XEM",
 ]
-# إزالة تكرارات محتملة في القائمة اليدوية (إن وجدت)
-_FALLBACK_BASES = list(dict.fromkeys(_FALLBACK_BASES))
 
 # إدراج يدوي إن وُجد
 if _INCLUDE_BASES:
@@ -116,17 +132,18 @@ if _INCLUDE_BASES:
             _FALLBACK_BASES.append(b)
 
 # ============== محاولة الجلب التلقائي من OKX (اختياري) ==============
-_AUTO_FETCH_OKX = os.getenv("AUTO_FETCH_OKX", "1") == "1"
+# إذا أردت تعطيله: اضبط AUTO_FETCH_OKX=0
+_AUTO_FETCH_OKX = os.getenv("AUTO_FETCH_OKX", "1").strip() == "1"
 
 def _try_fetch_okx_universe() -> List[str]:
     """
-    يحاول استخراج قائمة قواعد BASE من أسواق OKX.
-    - في وضع SWAP: نأخذ قواعد العقود الدائمة USDT-M (linear).
-    - في وضع SPOT: نأخذ أزواج BASE/USDT.
-    إن فشل الاتصال أو حدث خطأ، نرجع قائمة فارغة ليُستخدم fallback.
+    يحاول استخراج قائمة قواعد BASE من أسواق OKX:
+      • SWAP: قواعد العقود الدائمة USDT-M (linear)
+      • SPOT: أزواج BASE/USDT
+    إن فشل الاتصال نرجع قائمة فارغة ليُستخدم الـ fallback.
     """
     try:
-        import ccxt  # optional dep
+        import ccxt  # import داخلي كي لا يصبح اعتمادًا إجباريًا
         ex = ccxt.okx({"enableRateLimit": True})
         markets = ex.load_markets()
 
@@ -141,10 +158,11 @@ def _try_fetch_okx_universe() -> List[str]:
                             bases.append(base)
         else:  # SPOT
             for m in markets.values():
-                if m.get("spot") and (m.get("quote") or "").upper() == "USDT":
+                if m.get("spot"):
                     base = (m.get("base") or "").upper()
-                    if base and not _is_leveraged_base(base):
-                        sym = _mk(base, "USDT")
+                    quote = (m.get("quote") or "").upper()
+                    if quote == "USDT" and base and not _is_leveraged_base(base):
+                        sym = _mk(base, quote)
                         if sym not in _EXCLUDE_SYMBOLS and base not in _EXCLUDE_BASES:
                             bases.append(base)
 
@@ -156,13 +174,14 @@ def _try_fetch_okx_universe() -> List[str]:
         return []
 
 # ============== API العامة التي يستخدمها البوت ==============
+
 def _prepare_symbols() -> Tuple[List[str], Dict[str, dict]]:
     """
-    تُرجع (symbols_list, meta)
-    symbols_list: قائمة "BASE/USDT"
-    meta: dict لكل symbol → {"source": "SPOT" أو "SWAP"}
+    • تُرجع (symbols_list, meta)
+    • symbols_list: قائمة "BASE/USDT"
+    • meta: dict لكل symbol → {"source": "SPOT" أو "SWAP"}
     """
-    # 1) قائمة إجبارية عبر MANUAL_SYMBOLS (تُستخدم كما هي بعد التنظيف)
+    # 1) إن كانت MANUAL_SYMBOLS محددة، استخدمها مباشرة
     if _MANUAL_SYMBOLS_RAW:
         manual = _clean_and_dedupe(_MANUAL_SYMBOLS_RAW)
         manual = manual[:TARGET_SYMBOLS_COUNT] if TARGET_SYMBOLS_COUNT > 0 else manual
@@ -193,15 +212,16 @@ def list_symbols(inst_type: str = INST_TYPE,
                  min_24h_usd_vol: float = MIN_24H_USD_VOL) -> List[str]:
     """
     دالة التوافق التي يستدعيها bot.py عند الإقلاع.
-    نعيد فقط القائمة (بدون meta). التحقق من الفوليوم يتم في مكان آخر إن لزم.
+    نعيد فقط القائمة (بدون meta). التحقق من الفوليوم/التكييف يتم لاحقًا في bot.py.
     """
     syms, _meta = _prepare_symbols()
     return syms
 
-# قيم جاهزة عند الاستيراد
+# ============== قيم جاهزة عند الاستيراد ==============
+
 SYMBOLS, SYMBOLS_META = _prepare_symbols()
 
-# طباعة تشخيصية مفيدة في اللوج (اختيارية)
+# طباعة تشخيصية مفيدة في اللوج
 try:
     first = ", ".join(SYMBOLS[:10])
     print(f"[symbols] ready({INST_TYPE}): {len(SYMBOLS)} | first 10: {first}")
