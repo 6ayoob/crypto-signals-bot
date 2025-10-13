@@ -102,7 +102,7 @@ class Trade(Base):
 
     # حالة
     status = Column(String(8), default="open", index=True, nullable=False)  # open | closed
-    result = Column(String(8), nullable=True)  # tp1 | tp2 | tp3 | tp4 | tp5 | sl
+    result = Column(String(8), nullable=True)  # tp1 | tp2 | tp3 | tp4 | tp5 | sl | time
 
     opened_at = Column(DateTime, default=_utcnow, nullable=False)
     closed_at = Column(DateTime, nullable=True)
@@ -191,6 +191,7 @@ def _ensure_indexes_generic(dialect: str):
 
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_status ON "trades" (status);')
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON "trades" (opened_at);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_closed_at ON "trades" (closed_at);')
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON "trades" (audit_id);')
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON "trades" (symbol, status);')
     else:
@@ -200,6 +201,7 @@ def _ensure_indexes_generic(dialect: str):
 
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_status ON trades (status);')
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_opened_at ON trades (opened_at);')
+        _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_closed_at ON trades (closed_at);')
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_audit_id ON trades (audit_id);')
         _exec_begin('CREATE INDEX IF NOT EXISTS ix_trades_symbol_status ON trades (symbol, status);')
 
@@ -240,26 +242,31 @@ def _ensure_unique_users_tg_user_id(dialect: str):
 
 def _dedupe_trades_audit_id(dialect: str):
     """يجعل قيَم audit_id المكررة فريدة بإضافة _<id> للصفوف الزائدة."""
-    if dialect in ("postgresql", "sqlite"):
+    if dialect == "postgresql":
         sql = """
             WITH d AS (
               SELECT id, audit_id,
                      ROW_NUMBER() OVER (PARTITION BY audit_id ORDER BY id) AS rn
-              FROM {tbl}
+              FROM "trades"
               WHERE audit_id IS NOT NULL
             )
-            UPDATE {tbl2} t
+            UPDATE "trades" t
             SET audit_id = t.audit_id || '_' || t.id
             FROM d
             WHERE t.id = d.id AND d.rn > 1;
         """
-        if dialect == "postgresql":
-            sql = sql.format(tbl='"trades"', tbl2='"trades"')
-        else:
-            sql = sql.format(tbl="trades", tbl2="trades")
         _exec_begin(sql, warn="dedupe trades.audit_id failed")
+    elif dialect == "sqlite":
+        # SQLite لا يدعم UPDATE ... FROM — ننفّذها يدوياً
+        rows = _fetchall_begin(
+            'SELECT audit_id FROM trades WHERE audit_id IS NOT NULL GROUP BY audit_id HAVING COUNT(*) > 1;'
+        )
+        dups = [r[0] for r in rows if r[0] is not None]
+        for aid in dups:
+            ids = _fetchall_begin('SELECT id FROM trades WHERE audit_id = :aid ORDER BY id ASC;', {"aid": aid})
+            for (tid,) in ids[1:]:
+                _exec_begin('UPDATE trades SET audit_id = audit_id || "_" || :tid WHERE id = :tid;', {"tid": tid})
     else:
-        # fallback بسيط: لا شيء
         pass
 
 
@@ -275,14 +282,12 @@ def _ensure_unique_trades_audit_id_not_null(dialect: str):
         except Exception as e:
             logger.warning(f"ux_trades_audit_id_not_null failed: {e} — trying to dedupe…")
             _dedupe_trades_audit_id(dialect)
-            # retry
             _exec_begin(
                 'CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null '
                 'ON "trades" (audit_id) WHERE audit_id IS NOT NULL;',
                 warn="unique index retry failed"
             )
     else:
-        # SQLite يدعم partial indexes منذ 3.8+
         _exec_begin(
             'CREATE UNIQUE INDEX IF NOT EXISTS ux_trades_audit_id_not_null '
             'ON trades (audit_id) WHERE audit_id IS NOT NULL;',
@@ -653,14 +658,31 @@ def _period_stats(s, since: datetime) -> dict:
             r_sum += float(t.r_multiple)
             continue
         try:
-            risk = max(float(t.entry) - float(t.sl), 1e-9)
-            if t.result in ("tp1","tp2","tp3","tp4","tp5"):
-                tgt = trade_targets_list(t)
-                hit = {"tp1":0,"tp2":1,"tp3":2,"tp4":3,"tp5":4}.get(t.result, 0)
-                hit = min(hit, len(tgt)-1)
-                r_sum += (float(tgt[hit]) - float(t.entry)) / risk
-            elif t.result == "sl":
-                r_sum += -1.0
+            side = (t.side or "buy").lower()
+            if side == "sell":
+                # SHORT: R = SL - Entry ; gain = Entry - Target
+                risk = max(float(t.sl) - float(t.entry), 1e-9)
+                if t.result in ("tp1","tp2","tp3","tp4","tp5"):
+                    tgt = trade_targets_list(t)
+                    hit = {"tp1":0,"tp2":1,"tp3":2,"tp4":3,"tp5":4}.get(t.result, 0)
+                    hit = min(hit, len(tgt)-1)
+                    r_sum += (float(t.entry) - float(tgt[hit])) / risk
+                elif t.result == "sl":
+                    r_sum += -1.0
+                elif t.exit_price is not None:
+                    r_sum += (float(t.entry) - float(t.exit_price)) / risk
+            else:
+                # LONG: R = Entry - SL ; gain = Target - Entry
+                risk = max(float(t.entry) - float(t.sl), 1e-9)
+                if t.result in ("tp1","tp2","tp3","tp4","tp5"):
+                    tgt = trade_targets_list(t)
+                    hit = {"tp1":0,"tp2":1,"tp3":2,"tp4":3,"tp5":4}.get(t.result, 0)
+                    hit = min(hit, len(tgt)-1)
+                    r_sum += (float(tgt[hit]) - float(t.entry)) / risk
+                elif t.result == "sl":
+                    r_sum += -1.0
+                elif t.exit_price is not None:
+                    r_sum += (float(t.exit_price) - float(t.entry)) / risk
         except Exception:
             pass
 
