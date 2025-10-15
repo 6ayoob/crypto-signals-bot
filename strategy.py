@@ -534,7 +534,18 @@ def _qv_gate(qv_series: pd.Series, sym_min_qv: float, win: int = 10, low_vol_env
         return True, f"sum={qv_sum:.0f}≥{1.04*dyn_thr:.0f} minbar_ok"
 
     ok = (qv_sum >= dyn_thr) and (qv_min >= minbar_req)
-    return ok, f"sum={qv_sum:.0f} thr={dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
+    if ok:
+        return True, f"sum={qv_sum:.0f}≥{dyn_thr:.0f} minbar={qv_min:.0f}≥{minbar_req:.0f}"
+    parts = []
+    if qv_sum < dyn_thr:
+        parts.append(f"sum={qv_sum:.0f}<{dyn_thr:.0f}")
+    else:
+        parts.append(f"sum={qv_sum:.0f}≥{dyn_thr:.0f}")
+    if qv_min < minbar_req:
+        parts.append(f"minbar={qv_min:.0f}<{minbar_req:.0f}")
+    else:
+        parts.append(f"minbar={qv_min:.0f}≥{minbar_req:.0f}")
+    return False, " ".join(parts)
 
 # ========= نظام السوق (Regime) =========
 def detect_regime(df: pd.DataFrame) -> str:
@@ -573,7 +584,7 @@ def is_hammer(cur: pd.Series) -> bool:
 
 def is_inside_break(pprev: pd.Series, prev: pd.Series, cur: pd.Series) -> bool:
     cond_inside = (float(prev["high"]) <= float(pprev["high"]) and float(prev["low"]) >= float(pprev["low"]))
-    return cond_inside and (float(cur["high"]) > float(prev["high"]) and float(cur["close"]) > float(prev["high"]))
+    return cond_inside و (float(cur["high"]) > float(prev["high"]) and float(cur["close"]) > float(prev["high"]))
 
 def swept_liquidity(prev: pd.Series, cur: pd.Series) -> bool:
     return (float(cur["low"]) < float(prev["low"]) and (float(cur["close"]) > float(prev["close"]) ))
@@ -869,7 +880,7 @@ def check_signal(
         if breadth_pct >= 0.70:
             thr["RVOL_MIN"] = max(0.75, float(thr.get("RVOL_MIN", 1.0)) - 0.08)
         elif breadth_pct <= 0.35:
-            thr["RVOL_MIN"] = min(1.25, float(thr.get("RVOL_MIN", 1.0)) + 0.03)
+            thr["RVOL_MIN"] = min(1.25, float(thr["RVOL_MIN"]) + 0.03)
     if thr.get("RELAX_LEVEL", 0) >= 1:
         thr["RVOL_MIN"] = max(0.72 if prof.get("class") != "major" else 0.85, float(thr["RVOL_MIN"]) - 0.03)
 
@@ -1003,18 +1014,16 @@ def check_signal(
     except Exception:
         avwap_day = None
 
-    # ==== FIX (step 5): لا تُحسب كونفلونس إذا AVWAP مفقود ====
+    # لا تُحسب كونفلونس إذا AVWAP مفقود
     def _above(x: Optional[float], tol: float = vw_tol) -> bool:
-        # نعتبرها "فوق" فقط إذا كان AVWAP موجودًا فعلاً
         return (x is not None) and (price >= x * (1 - tol))
 
     av_list = [avwap_swing_low, avwap_swing_high, avwap_day]
     av_ok_count = sum(1 for v in av_list if _above(v))
     avwap_confluence_ok = (av_ok_count >= 1)
-    # ==== END FIX ====
 
     above_vwap = (price >= vwap_now * (1 - vw_tol))
-    ema_align = two_of_three and above_vwap and (avwap_confluence_ok or not USE_ANCHORED_VWAP)
+    ema_align = two_of_three and above_vwap and (avwap_confluence_ok أو not USE_ANCHORED_VWAP)
     if regime == "range" and not ema_align:
         near_vwap_soft = (price >= vwap_now * (1 - vw_tol * 1.35))
         two_of_three_soft = sum([price > float(closed["ema21"]), macd_pos, near_vwap_soft]) >= 2
@@ -1038,16 +1047,25 @@ def check_signal(
             _log_reject(symbol, "close<=open")
             return None
 
+    # تليين فشل EMA/VWAP/AVWAP في وضع soft بدل الرفض الفوري
+    ema_align_final = ema_align
+    soft_ema_penalty = 0
     if not ema_align:
-        _log_reject(symbol, "ema/vwap/avwap_align_false")
-        return None
+        mode = thr.get("SELECTIVITY_MODE", "balanced")
+        ema_align_soft_ok = (two_of_three or above_vwap) and (av_ok_count >= 1 or regime != "trend")
+        if mode == "soft" and ema_align_soft_ok:
+            ema_align_final = False
+            soft_ema_penalty = 5
+        else:
+            _log_reject(symbol, "ema/vwap/avwap_align_false")
+            return None
 
     # S/R + برايس أكشن
     sup = res = None
     if USE_SR:
         sup, res = get_sr_on_closed(df, SR_WINDOW)
     pivot_res = nearest_resistance_above(df, price, lookback=SR_WINDOW)
-    res_eff = min(x for x in [res, pivot_res] if x is not None) if (res is not None or pivot_res is not None) else None
+    res_eff = min(x for x in [res, pivot_res] if x is not None) if (res is not None أو pivot_res is not None) else None
 
     rev_hammer = is_hammer(closed)
     rev_engulf = is_bull_engulf(prev, closed)
@@ -1111,7 +1129,7 @@ def check_signal(
                 struct_ok = True
                 reasons += ["Breakout+Retest", "SessionOK"]
 
-    if (setup is None) and ((regime == "trend") or (regime != "trend" and mixed_guard)):
+    if (setup is None) and ((regime == "trend") أو (regime != "trend" and mixed_guard)):
         fib_ok = False
         if USE_FIB:
             sw = recent_swing(df, SWING_LOOKBACK)
@@ -1221,24 +1239,29 @@ def check_signal(
         _log_reject(symbol, f"near_resistance_R={srdist_R:.2f}<0.70")
         return None
 
-    # سكور شامل — نمرّر ema_align بدل True
+    # سكور شامل — نمرّر ema_align_final بدل True/ema_align
     score, bd = score_signal(
-        struct_ok, rvol, atr_pct, ema_align, mtf_pass, srdist_R, mtf_has_frames,
+        struct_ok, rvol, atr_pct, ema_align_final, mtf_pass, srdist_R, mtf_has_frames,
         thr["RVOL_MIN"], (lo_dyn, hi_dyn),
         oi_trend=None, breadth_pct=breadth_pct,
         avwap_confluence=avwap_confluence_ok if USE_ANCHORED_VWAP else None,
         d1_ok=d1_ok, mtf_detail=mtf_detail
     )
+
+    # تطبيق خصم ناعم لو مرّت إشارة الـEMA/VWAP بالعفو في وضع soft
+    if soft_ema_penalty:
+        score = max(0, score - soft_ema_penalty)
+
     if score < thr["SCORE_MIN"]:
         _log_reject(symbol, f"score<{thr['SCORE_MIN']} (got {score})")
         return None
 
     # منطقة دخول ديناميكية
-    if score >= 88 or rvol >= 1.50:
+    if score >= 88 أو rvol >= 1.50:
         width_r = 0.14 * R_val
-    elif score >= 84 or rvol >= 1.40:
+    elif score >= 84 أو rvol >= 1.40:
         width_r = 0.15 * R_val
-    elif score >= 76 or rvol >= 1.15:
+    elif score >= 76 أو rvol >= 1.15:
         width_r = 0.25 * R_val
     else:
         width_r = 0.35 * R_val
