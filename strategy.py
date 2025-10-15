@@ -1023,7 +1023,7 @@ def check_signal(
     avwap_confluence_ok = (av_ok_count >= 1)
 
     above_vwap = (price >= vwap_now * (1 - vw_tol))
-    ema_align = two_of_three and above_vwap and (avwap_confluence_ok أو not USE_ANCHORED_VWAP)
+    ema_align = two_of_three and above_vwap and (avwap_confluence_ok or not USE_ANCHORED_VWAP)
     if regime == "range" and not ema_align:
         near_vwap_soft = (price >= vwap_now * (1 - vw_tol * 1.35))
         two_of_three_soft = sum([price > float(closed["ema21"]), macd_pos, near_vwap_soft]) >= 2
@@ -1065,7 +1065,7 @@ def check_signal(
     if USE_SR:
         sup, res = get_sr_on_closed(df, SR_WINDOW)
     pivot_res = nearest_resistance_above(df, price, lookback=SR_WINDOW)
-    res_eff = min(x for x in [res, pivot_res] if x is not None) if (res is not None أو pivot_res is not None) else None
+    res_eff = min(x for x in [res, pivot_res] if x is not None) if (res is not None or pivot_res is not None) else None
 
     rev_hammer = is_hammer(closed)
     rev_engulf = is_bull_engulf(prev, closed)
@@ -1129,7 +1129,7 @@ def check_signal(
                 struct_ok = True
                 reasons += ["Breakout+Retest", "SessionOK"]
 
-    if (setup is None) and ((regime == "trend") أو (regime != "trend" and mixed_guard)):
+    if (setup is None) and ((regime == "trend") or (regime != "trend" and mixed_guard)):
         fib_ok = False
         if USE_FIB:
             sw = recent_swing(df, SWING_LOOKBACK)
@@ -1257,11 +1257,11 @@ def check_signal(
         return None
 
     # منطقة دخول ديناميكية
-    if score >= 88 أو rvol >= 1.50:
+    if score >= 88 or rvol >= 1.50:
         width_r = 0.14 * R_val
-    elif score >= 84 أو rvol >= 1.40:
+    elif score >= 84 or rvol >= 1.40:
         width_r = 0.15 * R_val
-    elif score >= 76 أو rvol >= 1.15:
+    elif score >= 76 or rvol >= 1.15:
         width_r = 0.25 * R_val
     else:
         width_r = 0.35 * R_val
