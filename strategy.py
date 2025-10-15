@@ -584,7 +584,7 @@ def is_hammer(cur: pd.Series) -> bool:
 
 def is_inside_break(pprev: pd.Series, prev: pd.Series, cur: pd.Series) -> bool:
     cond_inside = (float(prev["high"]) <= float(pprev["high"]) and float(prev["low"]) >= float(pprev["low"]))
-    return cond_inside و (float(cur["high"]) > float(prev["high"]) and float(cur["close"]) > float(prev["high"]))
+    return cond_inside and (float(cur["high"]) > float(prev["high"]) and float(cur["close"]) > float(prev["high"]))
 
 def swept_liquidity(prev: pd.Series, cur: pd.Series) -> bool:
     return (float(cur["low"]) < float(prev["low"]) and (float(cur["close"]) > float(prev["close"]) ))
