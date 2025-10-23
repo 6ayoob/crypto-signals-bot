@@ -18,6 +18,59 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from regime import detect_regime, regime_thresholds
+from scoring import base_score, apply_strat_bonus, hard_guards_ok, size_multiplier_for_exceptions
+
+def scan_once(symbols, market_ctx, bars):
+    regime = detect_regime(market_ctx.btc_rvol, market_ctx.breadth)
+    rvol_min, min_bar_quote, score_cut = regime_thresholds(regime)
+
+    strats = [s.strip() for s in os.getenv("STRATS","ema_breakout").split(",") if s.strip()]
+    max_signals = int(os.getenv("MAX_SIGNALS_PER_SCAN","1"))
+    shadow = os.getenv("SHADOW_MODE","0") in ("1","true","yes")
+
+    candidates = []
+    for s in symbols:
+        bar = bars[s]
+        if bar.quote_vol_sum_usd < min_bar_quote:
+            continue  # قاطع سيولة
+        feats = extract_features(s, bar, market_ctx)  # من strategies.py
+        if feats["rvol"] < rvol_min:
+            # ليس قاطعًا قاسيًا، لكن لن نمنح سكور كافٍ على الأغلب
+            pass
+        if not hard_guards_ok(feats, regime):
+            continue
+
+        base = base_score(feats, regime)
+        best = base
+        best_strat = None
+        for st in strats:
+            sc = base + apply_strat_bonus(st, feats)
+            if sc > best:
+                best = sc
+                best_strat = st
+        if best_strat is not None:
+            candidates.append((s, best_strat, best, feats))
+
+    # اختَر أفضل مرشح إن تعدّى العتبة
+    if not candidates:
+        log.info(f"[mux][{regime}] no candidates")
+        return
+
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    top = candidates[0]
+    s, st, sc, feats = top
+    log.info(f"[mux][{regime}] top={s} strat={st} score={sc:.1f} cut={score_cut} rv={feats.get('rvol'):.2f} z={feats.get('z_rvol'):.2f}")
+
+    if sc < score_cut:
+        return
+
+    size_mult = size_multiplier_for_exceptions(feats)
+    if shadow:
+        log.info(f"[shadow] would place order {s} via {st} size_mult={size_mult:.2f}")
+        return
+
+    place_order(symbol=s, strat=st, size_multiplier=size_mult)  # استدعِ تنفيذك المعتاد
 
 # ====== Single-instance local lock ======
 LOCKFILE_PATH = os.getenv("BOT_INSTANCE_LOCK") or ("/tmp/mk1_ai_bot.lock" if os.name != "nt" else "mk1_ai_bot.lock")
