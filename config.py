@@ -8,6 +8,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR") or "/tmp/market-watchdog").resolve()
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+STATE_FILE = os.getenv("STRATEGY_STATE_FILE") or str(APP_DATA_DIR / "strategy_state.json")
+
 # ========= Helpers =========
 def _as_bool(v: str | None, default: bool = True) -> bool:
     if v is None:
