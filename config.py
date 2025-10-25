@@ -6,12 +6,8 @@ config.py — تهيئة عبر متغيرات البيئة (متوافق مع R
 
 from __future__ import annotations
 import os
+import tempfile
 from pathlib import Path
-
-APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR") or "/tmp/market-watchdog").resolve()
-APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-STATE_FILE = os.getenv("STRATEGY_STATE_FILE") or str(APP_DATA_DIR / "strategy_state.json")
 
 # ========= Helpers =========
 def _as_bool(v: str | None, default: bool = True) -> bool:
@@ -45,9 +41,46 @@ def _as_list_int(csv_: str | None, default_csv: str = "") -> list[int]:
             continue
     return out
 
-# ========= مسارات تشغيل موحّدة =========
-APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
-APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ========= مسارات تشغيل موحّدة (مضمونة الكتابة) =========
+def _ensure_writable_dir(cand: Path) -> Path | None:
+    try:
+        cand.mkdir(parents=True, exist_ok=True)
+        t = cand / ".rw_test"
+        t.write_text("ok", encoding="utf-8")
+        t.unlink(missing_ok=True)
+        return cand
+    except Exception:
+        return None
+
+# ترتيب المرشحين: بيئة → /tmp/market-watchdog → tempdir العام
+_env_dir = os.getenv("APP_DATA_DIR", "").strip()
+_candidates: list[Path] = []
+if _env_dir:
+    _candidate = Path(_env_dir)
+    _c_ok = _ensure_writable_dir(_candidate)
+    if _c_ok is not None:
+        APP_DATA_DIR = _c_ok
+    else:
+        # لو قيمة البيئة غير قابلة للكتابة، تجاهلها
+        APP_DATA_DIR = None
+else:
+    APP_DATA_DIR = None
+
+if APP_DATA_DIR is None:
+    for c in (Path("/tmp/market-watchdog"),
+              Path(tempfile.gettempdir()) / "market-watchdog"):
+        ok = _ensure_writable_dir(c)
+        if ok:
+            APP_DATA_DIR = ok
+            break
+
+# ضمان قيمة نهائية
+if APP_DATA_DIR is None:
+    APP_DATA_DIR = Path("/tmp/market-watchdog")
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ملف الحالة/الكاش
+STATE_FILE = os.getenv("STRATEGY_STATE_FILE") or str(APP_DATA_DIR / "strategy_state.json")
 
 # ملف الرموز: يُخزَّن داخل مجلد البيانات لضمان الكتابة على Render
 STRATEGY_SYMBOLS_FILENAME = os.getenv("STRATEGY_SYMBOLS_FILENAME", "strategy_crypto_v2_5_symbols.py")
@@ -119,6 +152,6 @@ if not TELEGRAM_BOT_TOKEN:
 
 # تشخيصات خفيفة (اختيارية)
 try:
-    print(f"[config] DATA_DIR={APP_DATA_DIR}  | CHANNEL_ID={TELEGRAM_CHANNEL_ID} | ADMINS={ADMIN_USER_IDS}")
+    print(f"[config] DATA_DIR={APP_DATA_DIR}  | STATE_FILE={STATE_FILE} | CHANNEL_ID={TELEGRAM_CHANNEL_ID} | ADMINS={ADMIN_USER_IDS}")
 except Exception:
     pass
