@@ -131,7 +131,7 @@ LTF_TF = os.getenv("LTF_TF") or os.getenv("TIMEFRAME", "15m")
 USE_VWAP = _as_bool("USE_VWAP", "1")                # 1=تشغيل (افتراضي)
 USE_ANCHORED_VWAP = _as_bool("USE_ANCHORED_VWAP", "1")
 
-# السماح باسمين مختلفين للانزلاق/السبريد (BP/BPS)
+# السماح باسمين المختلفين للانزلاق/السبريد (BP/BPS)
 SLIPPAGE_MAX_BPS = int(os.getenv("SLIPPAGE_MAX_BPS") or os.getenv("SLIPPAGE_MAX_BP", "20"))
 SPREAD_MAX_BPS_MAJOR = int(os.getenv("SPREAD_MAX_BPS_MAJOR") or os.getenv("SPREAD_MAX_BP", "25"))
 SPREAD_MAX_BPS_ALT   = int(os.getenv("SPREAD_MAX_BPS_ALT")   or os.getenv("SPREAD_MAX_BP", "35"))
@@ -963,7 +963,7 @@ def check_signal(
         return None
     # ==== END FIX ====
 
-    # RVOL & Spike
+    # RVول & Spike
     v_med60 = float(df["volume"].iloc[-61:-1].median()) if len(df) >= 61 else float(closed.get("vol_ma20") or 1e-9)
     base_vol = v_med60 if v_med60 > 0 else (float(closed.get("vol_ma20") or 1e-9))
     rvol = float(closed["volume"]) / max(base_vol, 1e-9)
