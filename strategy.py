@@ -41,10 +41,62 @@ def _ensure_data(symbol: str, ohlcv: Optional[list], ohlcv_htf: Optional[object]
         }
     return ohlcv, ohlcv_htf
 
-# ========= مسارات =========
-APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", "/tmp/market-watchdog")).resolve()
-APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = os.getenv("STRATEGY_STATE_FILE", str(APP_DATA_DIR / "strategy_state.json"))
+# ========= مسارات (آمنة للكتابة ومتوافقة مع Render) =========
+import tempfile
+from pathlib import Path
+import os
+
+def _ensure_writable_dir(p: Path) -> Path | None:
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        t = p / ".rw_test"
+        t.write_text("ok", encoding="utf-8")
+        t.unlink(missing_ok=True)
+        return p
+    except Exception:
+        return None
+
+# حاول استخدام config.py إن وُجد لضمان الاتساق
+APP_DATA_DIR = None
+STATE_FILE = None
+try:
+    from config import APP_DATA_DIR as _CFG_DIR, STATE_FILE as _CFG_STATE
+    APP_DATA_DIR = Path(_CFG_DIR)
+    STATE_FILE = _CFG_STATE
+except Exception:
+    pass
+
+# لو لم ننجح أو المسار غير قابل للكتابة، طبّق منطق السقوط التلقائي
+if APP_DATA_DIR is None or _ensure_writable_dir(APP_DATA_DIR) is None:
+    env_dir = os.getenv("APP_DATA_DIR", "").strip()
+    cand = []
+    if env_dir:
+        cand.append(Path(env_dir))
+    cand.append(Path("/tmp/market-watchdog"))
+    cand.append(Path(tempfile.gettempdir()) / "market-watchdog")
+
+    APP_DATA_DIR = None
+    for c in cand:
+        ok = _ensure_writable_dir(c)
+        if ok:
+            APP_DATA_DIR = ok
+            break
+
+    if APP_DATA_DIR is None:
+        APP_DATA_DIR = Path("/tmp/market-watchdog")
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# STATE_FILE من البيئة أولاً، لكن تحقّق أن مجلده قابل للكتابة، وإلا ارجع إلى APP_DATA_DIR
+env_state = os.getenv("STRATEGY_STATE_FILE", "").strip()
+if env_state:
+    _state_path = Path(env_state)
+    _parent = _state_path.parent
+    if _ensure_writable_dir(_parent) is not None:
+        STATE_FILE = str(_state_path)
+    else:
+        STATE_FILE = str(APP_DATA_DIR / "strategy_state.json")
+else:
+    STATE_FILE = str(APP_DATA_DIR / "strategy_state.json")
 
 # ========= إعدادات عامة =========
 SILENCE_SOFTEN_HOURS = int(os.getenv("SILENCE_SOFTEN_HOURS", "9"))
